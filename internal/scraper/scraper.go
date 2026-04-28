@@ -105,6 +105,71 @@ var webSeeds = []string{
 	"https://www.thelocal.se/jobs",            // Sweden expat/English jobs
 	"https://www.finn.no/job/fulltime/search.html", // Norway
 	"https://www.jobindex.dk/jobsoegning",     // Denmark
+	// ── DACH (Germany, Austria, Switzerland) NEW ──────────────────────────────
+	"https://www.jobs.de",                        // general German job board
+	"https://www.monster.de/jobs/q-it",           // Monster DE tech focus
+	"https://www.indeed.de/Jobs?q=software",      // Indeed DE
+	"https://www.swissdevjobs.ch/jobs",           // Switzerland dev jobs (English)
+	"https://www.jobs.ch/en/tech",                // Switzerland general (tech filter)
+	"https://www.workflowjobs.com",               // Berlin/remote tech
+	"https://www.berlinstartupjobs.com/companies", // direct company list (emails)
+	"https://jobs.munichstartup.com",             // Munich startup ecosystem
+	"https://www.hamburg-startups.de/jobs",       // Hamburg startups
+	// ── Benelux (NL, BE, LU) NEW ─────────────────────────────────────────────
+	"https://www.nationalevacaturebank.nl/it-banen", // Netherlands IT
+	"https://www.techpays.eu/jobs",               // Benelux tech salaries + jobs
+	"https://www.vdab.be/jobs",                   // Belgium Flemish job board
+	"https://www.ictjob.be/en",                   // Belgium ICT jobs (English)
+	"https://jobs.lu/en",                         // Luxembourg jobs (English)
+	"https://www.startupjobs.lu",                 // Luxembourg startup scene
+	// ── Nordics (DK, SE, NO, FI, IS) NEW ─────────────────────────────────────
+	"https://www.thehub.io/jobs",                 // Nordic startups (DK/SE/NO)
+	"https://www.jobylon.com/jobs",               // Nordic & EU remote
+	"https://www.academicwork.se/jobs/tech",      // Sweden (students & grads)
+	"https://www.engineer.no/jobb",               // Norway engineering/tech
+	"https://www.duunitori.fi/tyopaikat/ohjelmointi", // Finland programming
+	"https://www.ictuutiset.fi/tyopaikat",        // Finland ICT
+	"https://www.vinnur.is/jobs/technology",      // Iceland tech jobs
+	// ── Southern Europe (ES, PT, IT, GR, MT) NEW ──────────────────────────────
+	"https://www.itjobs.pt",                      // Portugal IT jobs (emails in descriptions)
+	"https://www.landing.jobs/jobs",              // already listed, but strong for PT
+	"https://www.infojobs.it/offerta-lavoro/informatica", // Italy IT
+	"https://www.trovolavoro.it/annunci/informatica", // Italy tech
+	"https://www.kariera.gr/jobs/technology",     // Greece technology jobs
+	"https://www.jobsinmalta.com/sectors/it",     // Malta IT
+	"https://www.linkedin.com/jobs/search/?geoId=101282230", // Spain (LinkedIn geo ES)
+	"https://www.linkedin.com/jobs/search/?geoId=101620260", // Italy geo
+	// ── Central & Eastern Europe (PL, CZ, HU, RO, BG, HR, SI, SK) NEW ────────
+	"https://justjoin.it",                        // Poland IT (emails in job posts)
+	"https://pracuj.it",                          // Poland tech (pracuj.pl subdomain)
+	"https://www.startupjobs.cz",                 // Czech startup jobs
+	"https://www.jobs.cz/it",                     // Czech general IT
+	"https://www.profession.hu/allasok/informatika", // Hungary IT
+	"https://www.bestjobs.eu/ro/locuri-de-munca/it", // Romania tech
+	"https://www.dev.bg/jobs",                    // Bulgaria dev jobs
+	"https://www.moj-posao.net/Poslovi/IT/",      // Croatia IT
+	"https://www.sloveniajobs.si/jobs/technology", // Slovenia
+	"https://www.profesia.sk/praca/informacne-technologie", // Slovakia
+
+	// ── France (additional beyond Welcome to the Jungle) ──────────────────────
+	"https://www.apec.fr/candidat/recherche-offre.html?domaine=Informatique", // France cadres IT
+	"https://www.remixjobs.com",                  // French tech jobs
+	"https://www.francejobs.com/en/jobs/technology", // expat-focused
+
+	// ── UK & Ireland (additional) ────────────────────────────────────────────
+	"https://www.itjobswatch.co.uk",              // UK IT jobs (good for contacts)
+	"https://www.jobserve.com/gb/en/IT-Jobs",     // UK contract + perm IT
+	"https://www.irishjobs.ie/tech",              // Ireland tech
+	"https://www.engineerjobs.ie/it-jobs",        // Ireland IT
+
+	// ── Aggregators & company email harvesters (high-value for emails) ───────
+	"https://www.linkedin.com/jobs/collections/recommended/", // LinkedIn (geo-target via cookie)
+	"https://www.glassdoor.co.uk/Job/uk-software-engineer-jobs", // UK Glassdoor
+	"https://www.glassdoor.de/Job/deutschland-software-entwickler-jobs", // DE Glassdoor
+	"https://www.glassdoor.fr/Emploi/france-developpeur-logiciel", // FR Glassdoor
+	"https://www.welcometothejungle.com/companies", // company directory (emails often visible)
+	"https://www.ouishare.net/jobs",               // collaborative economy EU jobs
+	"https://www.producthunt.com/jobs",            // global but EU startups post here	
 }
 
 // domainBlocker tracks consecutive per-FQDN failures and blocks a domain once
@@ -252,9 +317,13 @@ func (e *Engine) runWeb() {
 		log.Printf("[web] rate limit setup: %v", err)
 	}
 
-	// Reset the failure counter for a host whenever a response arrives cleanly.
+	// Reset the failure counter only on clean 2xx responses.
+	// 429 and other error codes must not clear the strike count — OnError
+	// will record the failure immediately after.
 	c.OnResponse(func(r *colly.Response) {
-		blocker.recordSuccess(r.Request.URL.Hostname())
+		if r.StatusCode >= 200 && r.StatusCode < 300 {
+			blocker.recordSuccess(r.Request.URL.Hostname())
+		}
 	})
 
 	// mailto links are the most reliable signal — often carry a real name too.
@@ -304,7 +373,11 @@ func (e *Engine) runWeb() {
 
 	c.OnError(func(r *colly.Response, err error) {
 		host := r.Request.URL.Hostname()
-		log.Printf("[web] %s: %v", r.Request.URL, err)
+		if r.StatusCode == http.StatusTooManyRequests {
+			log.Printf("[web] %s: rate-limited (429)", host)
+		} else {
+			log.Printf("[web] %s: %v", r.Request.URL, err)
+		}
 		blocker.recordFailure(host)
 	})
 
@@ -355,13 +428,19 @@ type hnSearchResult struct {
 // from blocking the goroutine indefinitely.
 const hnBodyLimit = 512 * 1024 // 512 KB
 
-// hnDecode reads at most hnBodyLimit bytes from resp.Body into dst via a
-// buffered reader, then drains and closes the body regardless of outcome.
+// hnDecode checks the response status, then reads at most hnBodyLimit bytes
+// into dst via a buffered reader. Always drains and closes the body.
 func hnDecode(resp *http.Response, dst any) error {
 	defer func() {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("rate-limited (429)")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
 	lr := io.LimitReader(resp.Body, hnBodyLimit)
 	return json.NewDecoder(bufio.NewReaderSize(lr, 32*1024)).Decode(dst)
 }

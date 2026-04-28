@@ -2,6 +2,7 @@ package scraper
 
 import (
 	"log"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -110,10 +111,13 @@ func (s *AppScanner) Run() error {
 	}
 
 	// Safety net: if a redirect lands us on an application page, emit it.
+	// Only reset the failure counter on clean 2xx — 429s must not clear strikes.
 	c.OnResponse(func(r *colly.Response) {
-		blocker.recordSuccess(r.Request.URL.Hostname())
-		if isAppPageURL(r.Request.URL.String()) {
-			s.on(r.Request.URL.String())
+		if r.StatusCode >= 200 && r.StatusCode < 300 {
+			blocker.recordSuccess(r.Request.URL.Hostname())
+			if isAppPageURL(r.Request.URL.String()) {
+				s.on(r.Request.URL.String())
+			}
 		}
 	})
 
@@ -138,8 +142,13 @@ func (s *AppScanner) Run() error {
 	})
 
 	c.OnError(func(r *colly.Response, err error) {
-		log.Printf("[app] %s: %v", r.Request.URL, err)
-		blocker.recordFailure(r.Request.URL.Hostname())
+		host := r.Request.URL.Hostname()
+		if r.StatusCode == http.StatusTooManyRequests {
+			log.Printf("[app] %s: rate-limited (429)", host)
+		} else {
+			log.Printf("[app] %s: %v", r.Request.URL, err)
+		}
+		blocker.recordFailure(host)
 	})
 
 	for _, seed := range webSeeds {
