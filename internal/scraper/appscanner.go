@@ -151,7 +151,7 @@ func (s *AppScanner) Run() error {
 		blocker.recordFailure(host)
 	})
 
-	for _, seed := range webSeeds {
+	for _, seed := range s.cfg.buildSeeds() {
 		u, err := url.Parse(seed)
 		if err != nil || blocker.isBlocked(u.Hostname()) {
 			continue

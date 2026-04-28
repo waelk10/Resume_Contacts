@@ -11,12 +11,14 @@ import (
 
 const outputDir = "contacts"
 
-func startup(concurrency int) {
+func startup(f runFlags) {
 	cfg := scraper.DefaultConfig
-	cfg.Parallelism = concurrency
+	cfg.Parallelism = f.concurrency
+	cfg.ExtraSeeds = mustLoadSeeds(f.seedsFile)
 
 	fmt.Println("Starting Resume Contacts Scraper...")
-	fmt.Printf("Concurrency: %d  |  Output: %s/\n\n", concurrency, outputDir)
+	fmt.Printf("Concurrency: %d  |  Extra seeds: %d  |  Output: %s/\n\n",
+		f.concurrency, len(cfg.ExtraSeeds), outputDir)
 
 	writer, err := output.NewVCFWriter(outputDir)
 	if err != nil {

@@ -10,12 +10,14 @@ import (
 
 const appOutputFile = "application_pages.txt"
 
-func appscan(concurrency int) {
+func appscan(f runFlags) {
 	cfg := scraper.DefaultConfig
-	cfg.Parallelism = concurrency
+	cfg.Parallelism = f.concurrency
+	cfg.ExtraSeeds = mustLoadSeeds(f.seedsFile)
 
 	fmt.Println("Starting Application Page Scanner...")
-	fmt.Printf("Concurrency: %d  |  Output: %s\n\n", concurrency, appOutputFile)
+	fmt.Printf("Concurrency: %d  |  Extra seeds: %d  |  Output: %s\n\n",
+		f.concurrency, len(cfg.ExtraSeeds), appOutputFile)
 
 	writer, err := output.NewURLWriter(appOutputFile)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,6 +30,25 @@ type Config struct {
 	Delay          time.Duration // base random delay between requests to the same domain
 	RequestTimeout time.Duration // per-request wall-clock timeout (connect + headers + body)
 	MaxBodyBytes   int           // maximum response body bytes read; excess is discarded
+	ExtraSeeds     []string      // additional seed URLs merged with the built-in list
+}
+
+// BuiltInSeeds returns a copy of the built-in webSeeds slice.
+// Used by the source-discovery command to deduplicate against known hosts.
+func BuiltInSeeds() []string {
+	out := make([]string, len(webSeeds))
+	copy(out, webSeeds)
+	return out
+}
+
+// buildSeeds returns the built-in webSeeds merged with cfg.ExtraSeeds, shuffled
+// into a new random order so every run hits targets in a different sequence.
+func (cfg Config) buildSeeds() []string {
+	all := make([]string, len(webSeeds)+len(cfg.ExtraSeeds))
+	copy(all, webSeeds)
+	copy(all[len(webSeeds):], cfg.ExtraSeeds)
+	rand.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
+	return all
 }
 
 var DefaultConfig = Config{
@@ -381,7 +401,7 @@ func (e *Engine) runWeb() {
 		blocker.recordFailure(host)
 	})
 
-	for _, seed := range webSeeds {
+	for _, seed := range e.cfg.buildSeeds() {
 		u, err := url.Parse(seed)
 		if err != nil || blocker.isBlocked(u.Hostname()) {
 			continue
