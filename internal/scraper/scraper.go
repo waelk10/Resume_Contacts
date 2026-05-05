@@ -2,6 +2,7 @@ package scraper
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,12 @@ import (
 
 const maxParallelism = 8
 
+// reseedDelay is how long runWeb waits between crawl cycles once the queue drains.
+const reseedDelay = 30 * time.Minute
+
+// hnRecheckInterval is how long runHN waits between polls for new HN threads.
+const hnRecheckInterval = 1 * time.Hour
+
 // Config controls scraper behaviour.
 type Config struct {
 	MaxDepth       int
@@ -31,22 +38,30 @@ type Config struct {
 	RequestTimeout time.Duration // per-request wall-clock timeout (connect + headers + body)
 	MaxBodyBytes   int           // maximum response body bytes read; excess is discarded
 	ExtraSeeds     []string      // additional seed URLs merged with the built-in list
+	Countries      []string      // ISO 3166-1 alpha-2 codes / region aliases to filter built-in seeds; nil = all
 }
 
-// BuiltInSeeds returns a copy of the built-in webSeeds slice.
+// BuiltInSeeds returns the URLs of all built-in seeds regardless of country filter.
 // Used by the source-discovery command to deduplicate against known hosts.
 func BuiltInSeeds() []string {
 	out := make([]string, len(webSeeds))
-	copy(out, webSeeds)
+	for i, s := range webSeeds {
+		out[i] = s.URL
+	}
 	return out
 }
 
-// buildSeeds returns the built-in webSeeds merged with cfg.ExtraSeeds, shuffled
-// into a new random order so every run hits targets in a different sequence.
+// buildSeeds returns built-in seeds (filtered by cfg.Countries when set) merged
+// with cfg.ExtraSeeds, shuffled so every run hits targets in a different sequence.
 func (cfg Config) buildSeeds() []string {
-	all := make([]string, len(webSeeds)+len(cfg.ExtraSeeds))
-	copy(all, webSeeds)
-	copy(all[len(webSeeds):], cfg.ExtraSeeds)
+	filter := expandCountries(cfg.Countries)
+	var all []string
+	for _, s := range webSeeds {
+		if filter == nil || seedMatchesFilter(s.Countries, filter) {
+			all = append(all, s.URL)
+		}
+	}
+	all = append(all, cfg.ExtraSeeds...)
 	rand.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
 	return all
 }
@@ -85,111 +100,6 @@ func (c Config) parallelism() int {
 		return maxParallelism
 	}
 	return c.Parallelism
-}
-
-// webSeeds are autonomous entry points for the general web scraper.
-// Focus on job boards and directories that expose contact emails.
-var webSeeds = []string{
-	// ── Global ───────────────────────────────────────────────────────────────
-	"https://remoteok.com",
-	"https://weworkremotely.com/listings",
-	"https://startup.jobs",
-	"https://wellfound.com/jobs",
-	"https://www.workatastartup.com/jobs",
-	"https://remotive.com/remote-jobs",
-
-	// ── EU / Pan-European ─────────────────────────────────────────────────────
-	"https://eu-startups.com/jobs",            // EU startup job board
-	"https://otta.com/jobs",                   // UK/Europe growth-stage startups
-	"https://www.honeypot.io/pages/jobs",      // developer-focused, DE/NL/AT/SE
-	"https://landing.jobs/jobs",               // Portugal + broader EU tech
-	"https://relocate.me/jobs",               // relocation-friendly EU roles
-	"https://www.jobgether.com/en/jobs",       // hybrid/remote EU
-	"https://nofluffjobs.com/jobs",            // CEE (PL/CZ/SK/RO) tech jobs
-	"https://eurojobs.com/jobs",               // pan-European listings
-	"https://tech.eu/jobs",                    // European tech news + jobs
-	"https://berlinstartupjobs.com",           // Berlin startup ecosystem
-	"https://amsterdamtechjobs.com",           // Netherlands tech scene
-	"https://jobs.techcorridor.eu",            // Central/Eastern Europe tech
-
-	// ── Country-specific ─────────────────────────────────────────────────────
-	"https://www.totaljobs.com/jobs/it-jobs",  // UK (large volume)
-	"https://www.reed.co.uk/jobs/it-jobs",     // UK
-	"https://www.cwjobs.co.uk/jobs",           // UK tech specialist board
-	"https://www.welcometothejungle.com/en/jobs", // France (English listings)
-	"https://www.tecnoempleo.com",             // Spain tech jobs
-	"https://www.jobsinbarcelona.es",          // Spain/Barcelona hub
-	"https://www.stepstone.de/jobs/en",        // Germany (English filter)
-	"https://www.karriere.at/jobs",            // Austria
-	"https://www.jobat.be/en/jobs",            // Belgium
-	"https://www.thelocal.se/jobs",            // Sweden expat/English jobs
-	"https://www.finn.no/job/fulltime/search.html", // Norway
-	"https://www.jobindex.dk/jobsoegning",     // Denmark
-	// ── DACH (Germany, Austria, Switzerland) NEW ──────────────────────────────
-	"https://www.jobs.de",                        // general German job board
-	"https://www.monster.de/jobs/q-it",           // Monster DE tech focus
-	"https://www.indeed.de/Jobs?q=software",      // Indeed DE
-	"https://www.swissdevjobs.ch/jobs",           // Switzerland dev jobs (English)
-	"https://www.jobs.ch/en/tech",                // Switzerland general (tech filter)
-	"https://www.workflowjobs.com",               // Berlin/remote tech
-	"https://www.berlinstartupjobs.com/companies", // direct company list (emails)
-	"https://jobs.munichstartup.com",             // Munich startup ecosystem
-	"https://www.hamburg-startups.de/jobs",       // Hamburg startups
-	// ── Benelux (NL, BE, LU) NEW ─────────────────────────────────────────────
-	"https://www.nationalevacaturebank.nl/it-banen", // Netherlands IT
-	"https://www.techpays.eu/jobs",               // Benelux tech salaries + jobs
-	"https://www.vdab.be/jobs",                   // Belgium Flemish job board
-	"https://www.ictjob.be/en",                   // Belgium ICT jobs (English)
-	"https://jobs.lu/en",                         // Luxembourg jobs (English)
-	"https://www.startupjobs.lu",                 // Luxembourg startup scene
-	// ── Nordics (DK, SE, NO, FI, IS) NEW ─────────────────────────────────────
-	"https://www.thehub.io/jobs",                 // Nordic startups (DK/SE/NO)
-	"https://www.jobylon.com/jobs",               // Nordic & EU remote
-	"https://www.academicwork.se/jobs/tech",      // Sweden (students & grads)
-	"https://www.engineer.no/jobb",               // Norway engineering/tech
-	"https://www.duunitori.fi/tyopaikat/ohjelmointi", // Finland programming
-	"https://www.ictuutiset.fi/tyopaikat",        // Finland ICT
-	"https://www.vinnur.is/jobs/technology",      // Iceland tech jobs
-	// ── Southern Europe (ES, PT, IT, GR, MT) NEW ──────────────────────────────
-	"https://www.itjobs.pt",                      // Portugal IT jobs (emails in descriptions)
-	"https://www.landing.jobs/jobs",              // already listed, but strong for PT
-	"https://www.infojobs.it/offerta-lavoro/informatica", // Italy IT
-	"https://www.trovolavoro.it/annunci/informatica", // Italy tech
-	"https://www.kariera.gr/jobs/technology",     // Greece technology jobs
-	"https://www.jobsinmalta.com/sectors/it",     // Malta IT
-	"https://www.linkedin.com/jobs/search/?geoId=101282230", // Spain (LinkedIn geo ES)
-	"https://www.linkedin.com/jobs/search/?geoId=101620260", // Italy geo
-	// ── Central & Eastern Europe (PL, CZ, HU, RO, BG, HR, SI, SK) NEW ────────
-	"https://justjoin.it",                        // Poland IT (emails in job posts)
-	"https://pracuj.it",                          // Poland tech (pracuj.pl subdomain)
-	"https://www.startupjobs.cz",                 // Czech startup jobs
-	"https://www.jobs.cz/it",                     // Czech general IT
-	"https://www.profession.hu/allasok/informatika", // Hungary IT
-	"https://www.bestjobs.eu/ro/locuri-de-munca/it", // Romania tech
-	"https://www.dev.bg/jobs",                    // Bulgaria dev jobs
-	"https://www.moj-posao.net/Poslovi/IT/",      // Croatia IT
-	"https://www.sloveniajobs.si/jobs/technology", // Slovenia
-	"https://www.profesia.sk/praca/informacne-technologie", // Slovakia
-
-	// ── France (additional beyond Welcome to the Jungle) ──────────────────────
-	"https://www.apec.fr/candidat/recherche-offre.html?domaine=Informatique", // France cadres IT
-	"https://www.remixjobs.com",                  // French tech jobs
-	"https://www.francejobs.com/en/jobs/technology", // expat-focused
-
-	// ── UK & Ireland (additional) ────────────────────────────────────────────
-	"https://www.itjobswatch.co.uk",              // UK IT jobs (good for contacts)
-	"https://www.jobserve.com/gb/en/IT-Jobs",     // UK contract + perm IT
-	"https://www.irishjobs.ie/tech",              // Ireland tech
-	"https://www.engineerjobs.ie/it-jobs",        // Ireland IT
-
-	// ── Aggregators & company email harvesters (high-value for emails) ───────
-	"https://www.linkedin.com/jobs/collections/recommended/", // LinkedIn (geo-target via cookie)
-	"https://www.glassdoor.co.uk/Job/uk-software-engineer-jobs", // UK Glassdoor
-	"https://www.glassdoor.de/Job/deutschland-software-entwickler-jobs", // DE Glassdoor
-	"https://www.glassdoor.fr/Emploi/france-developpeur-logiciel", // FR Glassdoor
-	"https://www.welcometothejungle.com/companies", // company directory (emails often visible)
-	"https://www.ouishare.net/jobs",               // collaborative economy EU jobs
-	"https://www.producthunt.com/jobs",            // global but EU startups post here	
 }
 
 // domainBlocker tracks consecutive per-FQDN failures and blocks a domain once
@@ -248,41 +158,61 @@ func New(cfg Config, onContact func(contact.Contact)) *Engine {
 }
 
 // Run launches the HN source and the general web scraper concurrently.
-func (e *Engine) Run() error {
+// It blocks until ctx is cancelled (e.g. SIGINT / SIGTERM).
+func (e *Engine) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := e.runHN(); err != nil {
-			log.Printf("[hn] %v", err)
-		}
+		e.runHN(ctx)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		e.runWeb()
+		e.runWeb(ctx)
 	}()
 
 	wg.Wait()
 	return nil
 }
 
-// runHN scrapes the latest "Ask HN: Who is Hiring?" thread.
-// HN is the single richest source of recruiter/hiring-manager emails.
-func (e *Engine) runHN() error {
+// runHN periodically fetches "Ask HN: Who is Hiring?" threads and emits
+// contacts. It loops forever, sleeping hnRecheckInterval between polls, and
+// exits when ctx is cancelled.
+func (e *Engine) runHN(ctx context.Context) {
 	client := &http.Client{
 		Timeout:   e.cfg.RequestTimeout,
 		Transport: newTransport(),
 	}
+	seen := make(map[string]bool)
 
-	threadID, err := hnLatestHiringID(client)
-	if err != nil {
-		return fmt.Errorf("finding thread: %w", err)
+	for {
+		threadID, err := hnLatestHiringID(client)
+		if err != nil {
+			log.Printf("[hn] finding thread: %v", err)
+		} else if seen[threadID] {
+			log.Printf("[hn] thread %s already processed — waiting", threadID)
+		} else {
+			seen[threadID] = true
+			log.Printf("[hn] thread id=%s", threadID)
+			if err := e.processHNThread(ctx, client, threadID); err != nil {
+				log.Printf("[hn] processing thread: %v", err)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(hnRecheckInterval):
+		}
 	}
-	log.Printf("[hn] thread id=%s", threadID)
+}
 
+// processHNThread fetches all top-level comments for threadID and emits emails.
+// Returns early when ctx is cancelled.
+func (e *Engine) processHNThread(ctx context.Context, client *http.Client, threadID string) error {
 	thread, err := hnFetchItem(client, threadID)
 	if err != nil {
 		return fmt.Errorf("fetching thread: %w", err)
@@ -292,6 +222,12 @@ func (e *Engine) runHN() error {
 	sem := make(chan struct{}, e.cfg.parallelism())
 	var wg sync.WaitGroup
 	for _, kid := range thread.Kids {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		default:
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(id int) {
@@ -317,10 +253,58 @@ func (e *Engine) runHN() error {
 	return nil
 }
 
-// runWeb crawls job boards and company pages for exposed emails.
-func (e *Engine) runWeb() {
+// runWeb crawls job boards and company pages for exposed emails, running
+// forever until ctx is cancelled. Each cycle creates a fresh colly Collector
+// (resetting its visited-URL cache) and re-seeds from the full seed list.
+// When the queue drains, it sleeps reseedDelay before the next cycle.
+func (e *Engine) runWeb(ctx context.Context) {
 	blocker := newDomainBlocker(3)
 
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		queue := newURLQueue()
+		c := e.newCollector(blocker, queue)
+
+		for _, seed := range e.cfg.buildSeeds() {
+			u, err := url.Parse(seed)
+			if err != nil || blocker.isBlocked(u.Hostname()) {
+				continue
+			}
+			queue.Push(seed)
+		}
+
+		for queue.Len() > 0 {
+			select {
+			case <-ctx.Done():
+				c.Wait()
+				return
+			default:
+			}
+			batch := queue.drain(nil)
+			for _, u := range batch {
+				_ = c.Visit(u)
+			}
+			c.Wait()
+		}
+
+		log.Printf("[web] queue exhausted — re-seeding in %s", reseedDelay)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reseedDelay):
+		}
+	}
+}
+
+// newCollector creates a fresh colly Collector wired to the given blocker and
+// queue. A new Collector resets colly's visited-URL cache so that seeds are
+// re-crawled each cycle without duplicating work within a single cycle.
+func (e *Engine) newCollector(blocker *domainBlocker, queue *urlQueue) *colly.Collector {
 	c := colly.NewCollector(
 		colly.MaxDepth(e.cfg.MaxDepth),
 		colly.Async(true),
@@ -338,8 +322,6 @@ func (e *Engine) runWeb() {
 	}
 
 	// Reset the failure counter only on clean 2xx responses.
-	// 429 and other error codes must not clear the strike count — OnError
-	// will record the failure immediately after.
 	c.OnResponse(func(r *colly.Response) {
 		if r.StatusCode >= 200 && r.StatusCode < 300 {
 			blocker.recordSuccess(r.Request.URL.Hostname())
@@ -378,7 +360,7 @@ func (e *Engine) runWeb() {
 		}
 	})
 
-	// Follow links that look like contact/team/careers pages, skipping blocked FQDNs.
+	// Enqueue links that look like contact/team/careers pages.
 	c.OnHTML("a[href]", func(el *colly.HTMLElement) {
 		abs := el.Request.AbsoluteURL(el.Attr("href"))
 		if !isRelevantURL(abs) {
@@ -388,7 +370,7 @@ func (e *Engine) runWeb() {
 		if err != nil || blocker.isBlocked(u.Hostname()) {
 			return
 		}
-		_ = c.Visit(abs)
+		queue.Push(abs)
 	})
 
 	c.OnError(func(r *colly.Response, err error) {
@@ -401,14 +383,7 @@ func (e *Engine) runWeb() {
 		blocker.recordFailure(host)
 	})
 
-	for _, seed := range e.cfg.buildSeeds() {
-		u, err := url.Parse(seed)
-		if err != nil || blocker.isBlocked(u.Hostname()) {
-			continue
-		}
-		_ = c.Visit(seed)
-	}
-	c.Wait()
+	return c
 }
 
 // isRelevantURL returns true for pages likely to contain contact emails.
