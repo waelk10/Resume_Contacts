@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 
 	"Resume_Contacts_Scraper/internal/scraper"
 	"Resume_Contacts_Scraper/internal/sources"
@@ -14,15 +18,30 @@ const discoveredSeedsFile = "discovered_seeds.txt"
 func discoverSeeds(f runFlags) {
 	cfg := sources.DefaultConfig
 	cfg.Concurrency = f.concurrency
+	cfg.Countries = f.countries
+	cfg.MaxHops = f.hops
 
+	countriesLabel := "all"
+	if len(f.countries) > 0 {
+		countriesLabel = strings.Join(f.countries, ",")
+	}
+	metaSrcs := cfg.ResolvedMetaSources()
 	fmt.Println("Discovering new seed sources...")
-	fmt.Printf("Concurrency: %d  |  Meta-sources: %d\n\n",
-		cfg.Concurrency, len(cfg.MetaSources))
+	fmt.Printf("Concurrency: %d  |  Meta-sources: %d  |  Hops: %d  |  Countries: %s\n\n",
+		cfg.Concurrency, len(metaSrcs), cfg.MaxHops, countriesLabel)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	d := sources.New(cfg)
-	results, err := d.Run(scraper.BuiltInSeeds())
-	if err != nil {
+	results, err := d.Run(ctx, scraper.BuiltInSeeds())
+
+	cancelled := ctx.Err() != nil
+	if err != nil && !cancelled {
 		log.Fatalf("discovery error: %v", err)
+	}
+	if cancelled {
+		fmt.Println("\nInterrupted — saving partial results...")
 	}
 
 	if len(results) == 0 {
@@ -41,7 +60,11 @@ func discoverSeeds(f runFlags) {
 		fmt.Printf("[+] %-60s  (from %s)\n", r.URL, shortSource(r.Source))
 	}
 
-	fmt.Printf("\nDone. %d new sources written to %s\n", len(results), discoveredSeedsFile)
+	label := "Done"
+	if cancelled {
+		label = "Partial"
+	}
+	fmt.Printf("\n%s. %d new sources written to %s\n", label, len(results), discoveredSeedsFile)
 	fmt.Printf("Tip: feed them into the scraper with:  -s %s\n", discoveredSeedsFile)
 }
 

@@ -2,6 +2,7 @@ package sources
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -34,9 +35,268 @@ type Config struct {
 	Concurrency    int
 	RequestTimeout time.Duration
 	MetaSources    []string
+	Countries      []string // ISO 3166-1 alpha-2 codes / region aliases; nil = all
+	MaxHops        int      // extra BFS hops beyond the initial meta-source fetch (0 = single-pass)
 	// Jitter is the upper bound of a random pre-request delay added to each
 	// liveness probe. Zero disables jitter.
 	Jitter time.Duration
+}
+
+// ResolvedMetaSources returns the union of the default meta-sources and any
+// country-specific ones implied by cfg.Countries.  Use this instead of
+// cfg.MetaSources when you need the full list the discoverer will fetch.
+func (cfg Config) ResolvedMetaSources() []string {
+	if len(cfg.Countries) == 0 {
+		return cfg.MetaSources
+	}
+	filter := expandFilterCodes(cfg.Countries)
+	seen := make(map[string]bool, len(cfg.MetaSources)+16)
+	out := make([]string, 0, len(cfg.MetaSources)+16)
+	for _, s := range cfg.MetaSources {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for code := range filter {
+		for _, s := range countryMetaSources[code] {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// euCountryCodes are all European country codes that the "eu" alias expands to.
+var euCountryCodes = []string{
+	"de", "at", "ch", "nl", "be", "lu", "fr",
+	"es", "pt", "it", "gr", "mt",
+	"dk", "se", "no", "fi", "is",
+	"pl", "cz", "hu", "ro", "bg", "hr", "si", "sk",
+	"gb", "ie", "eu",
+}
+
+// expandFilterCodes converts user-supplied country codes (which may include
+// region aliases) into a flat set of canonical codes.
+func expandFilterCodes(codes []string) map[string]bool {
+	out := make(map[string]bool, len(codes)*4)
+	for _, code := range codes {
+		switch code {
+		case "eu":
+			for _, c := range euCountryCodes {
+				out[c] = true
+			}
+		case "dach":
+			out["de"], out["at"], out["ch"] = true, true, true
+		case "benelux":
+			out["nl"], out["be"], out["lu"] = true, true, true
+		case "nordics":
+			out["dk"], out["se"], out["no"], out["fi"], out["is"] = true, true, true, true, true
+		case "cee":
+			out["pl"], out["cz"], out["hu"], out["ro"] = true, true, true, true
+			out["bg"], out["hr"], out["si"], out["sk"] = true, true, true, true
+		case "southern":
+			out["es"], out["pt"], out["it"], out["gr"], out["mt"] = true, true, true, true, true
+		default:
+			out[code] = true
+		}
+	}
+	return out
+}
+
+// countryTLDs maps each country code to the ccTLDs that identify URLs as belonging
+// to that country.  Used for filtering discovered results when Countries is set.
+var countryTLDs = map[string][]string{
+	"de": {".de"},
+	"at": {".at"},
+	"ch": {".ch"},
+	"nl": {".nl"},
+	"be": {".be"},
+	"lu": {".lu"},
+	"fr": {".fr"},
+	"es": {".es"},
+	"pt": {".pt"},
+	"it": {".it"},
+	"gr": {".gr"},
+	"mt": {".mt"},
+	"gb": {".co.uk", ".org.uk", ".me.uk", ".net.uk", ".uk"},
+	"ie": {".ie"},
+	"dk": {".dk"},
+	"se": {".se"},
+	"no": {".no"},
+	"fi": {".fi"},
+	"is": {".is"},
+	"pl": {".pl"},
+	"cz": {".cz"},
+	"hu": {".hu"},
+	"ro": {".ro"},
+	"bg": {".bg"},
+	"hr": {".hr"},
+	"si": {".si"},
+	"sk": {".sk"},
+	"eu": {".eu"},
+}
+
+// urlMatchesCountryFilter reports whether rawURL should be included given filter.
+// A URL is included when its ccTLD belongs to a requested country code, or when
+// its domain has no recognisable ccTLD and "global" is in the filter.
+func urlMatchesCountryFilter(rawURL string, filter map[string]bool) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+
+	for country, tlds := range countryTLDs {
+		if !filter[country] {
+			continue
+		}
+		for _, tld := range tlds {
+			if strings.HasSuffix(host, tld) {
+				return true
+			}
+		}
+	}
+
+	// Domain has no recognised ccTLD — treat as global.
+	if filter["global"] {
+		for _, tlds := range countryTLDs {
+			for _, tld := range tlds {
+				if strings.HasSuffix(host, tld) {
+					return false // it IS a ccTLD, just not one we want
+				}
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// countryMetaSources maps each country code to pages that enumerate job boards
+// focused on that country.  Appended to DefaultMetaSources when Countries is set.
+// GitHub topic pages are used because they surface repos tagged with the topic,
+// some of which are country-specific job boards or curated lists of them.
+var countryMetaSources = map[string][]string{
+	"de": {
+		"https://github.com/topics/job-board-germany",
+		"https://github.com/topics/jobs-germany",
+		"https://github.com/topics/german-jobs",
+		"https://github.com/topics/german-tech-jobs",
+	},
+	"at": {
+		"https://github.com/topics/jobs-austria",
+		"https://github.com/topics/austrian-tech",
+	},
+	"ch": {
+		"https://github.com/topics/swiss-tech-jobs",
+		"https://github.com/topics/jobs-switzerland",
+	},
+	"gb": {
+		"https://github.com/topics/uk-tech-jobs",
+		"https://github.com/topics/uk-jobs",
+		"https://github.com/topics/london-tech-jobs",
+	},
+	"ie": {
+		"https://github.com/topics/ireland-tech",
+		"https://github.com/topics/jobs-ireland",
+	},
+	"fr": {
+		"https://github.com/topics/french-tech",
+		"https://github.com/topics/french-jobs",
+		"https://github.com/topics/emploi-tech",
+	},
+	"nl": {
+		"https://github.com/topics/dutch-tech",
+		"https://github.com/topics/jobs-netherlands",
+		"https://github.com/topics/amsterdam-tech",
+	},
+	"be": {
+		"https://github.com/topics/belgium-tech",
+		"https://github.com/topics/jobs-belgium",
+	},
+	"lu": {
+		"https://github.com/topics/luxembourg-jobs",
+	},
+	"se": {
+		"https://github.com/topics/sweden-tech",
+		"https://github.com/topics/swedish-jobs",
+		"https://github.com/topics/stockholm-tech",
+	},
+	"no": {
+		"https://github.com/topics/norway-tech",
+		"https://github.com/topics/norwegian-jobs",
+	},
+	"dk": {
+		"https://github.com/topics/denmark-tech",
+		"https://github.com/topics/danish-jobs",
+		"https://github.com/topics/copenhagen-tech",
+	},
+	"fi": {
+		"https://github.com/topics/finland-tech",
+		"https://github.com/topics/finnish-jobs",
+	},
+	"is": {
+		"https://github.com/topics/iceland-tech",
+	},
+	"es": {
+		"https://github.com/topics/spain-tech",
+		"https://github.com/topics/spanish-jobs",
+		"https://github.com/topics/barcelona-tech",
+		"https://github.com/topics/madrid-tech",
+	},
+	"pt": {
+		"https://github.com/topics/portugal-tech",
+		"https://github.com/topics/lisbon-tech",
+	},
+	"it": {
+		"https://github.com/topics/italy-tech",
+		"https://github.com/topics/italian-jobs",
+		"https://github.com/topics/milan-tech",
+	},
+	"gr": {
+		"https://github.com/topics/greece-tech",
+	},
+	"mt": {
+		"https://github.com/topics/malta-tech",
+	},
+	"pl": {
+		"https://github.com/topics/polish-developer-jobs",
+		"https://github.com/topics/praca-programista",
+		"https://github.com/topics/poland-tech",
+	},
+	"cz": {
+		"https://github.com/topics/czech-tech",
+		"https://github.com/topics/prague-tech",
+	},
+	"hu": {
+		"https://github.com/topics/hungary-tech",
+		"https://github.com/topics/budapest-tech",
+	},
+	"ro": {
+		"https://github.com/topics/romania-tech",
+	},
+	"bg": {
+		"https://github.com/topics/bulgaria-tech",
+		"https://github.com/topics/sofia-tech",
+	},
+	"hr": {
+		"https://github.com/topics/croatia-tech",
+	},
+	"si": {
+		"https://github.com/topics/slovenia-tech",
+	},
+	"sk": {
+		"https://github.com/topics/slovakia-tech",
+		"https://github.com/topics/bratislava-tech",
+	},
+	"eu": {
+		"https://github.com/topics/european-tech",
+		"https://github.com/topics/eu-tech-jobs",
+		"https://github.com/topics/europe-jobs",
+		"https://github.com/topics/european-startups",
+	},
 }
 
 // DefaultConfig is a ready-to-use configuration.
@@ -44,6 +304,7 @@ var DefaultConfig = Config{
 	Concurrency:    6,
 	RequestTimeout: 20 * time.Second,
 	MetaSources:    DefaultMetaSources,
+	MaxHops:        2,
 	Jitter:         400 * time.Millisecond,
 }
 
@@ -79,9 +340,19 @@ func New(cfg Config) *Discoverer {
 	}
 }
 
-// Run fetches all configured meta-sources, extracts candidate URLs, validates
-// them, and returns de-duplicated results that are absent from existing.
-func (d *Discoverer) Run(existing []string) ([]Result, error) {
+// Run performs a multi-hop BFS over meta-source pages to discover job-board URLs.
+//
+// Hop 0  – fetch ResolvedMetaSources(), collect board candidates and newly
+//           discovered curated-list pages (GitHub repos, awesome-* pages, …).
+// Hop 1…N – fetch those newly discovered pages, repeat.
+//
+// After all hops the full candidate pool is deduplicated, liveness-validated,
+// and country-filtered before being returned.
+//
+// If ctx is cancelled before the run completes, Run returns whatever results
+// were collected up to that point along with ctx.Err(), allowing callers to
+// save a partial result set rather than discarding all progress.
+func (d *Discoverer) Run(ctx context.Context, existing []string) ([]Result, error) {
 	existingHosts := make(map[string]bool, len(existing))
 	for _, u := range existing {
 		if p, err := url.Parse(u); err == nil {
@@ -94,39 +365,76 @@ func (d *Discoverer) Run(existing []string) ([]Result, error) {
 		source string
 	}
 
+	// visitedMeta prevents fetching the same meta-source page twice across hops.
+	visitedMeta := make(map[string]bool)
+
+	// Seed the first frontier from the resolved meta-source list.
+	frontier := d.cfg.ResolvedMetaSources()
+	rand.Shuffle(len(frontier), func(i, j int) { frontier[i], frontier[j] = frontier[j], frontier[i] })
+	for _, s := range frontier {
+		visitedMeta[s] = true
+	}
+
+	maxHops := d.cfg.MaxHops
+	if maxHops < 0 {
+		maxHops = 0
+	}
+
 	var (
 		mu         sync.Mutex
 		candidates []candidate
 	)
 
-	// Shuffle meta-sources so every run fetches them in a different order,
-	// which spreads load and avoids always deduping in favour of the same source.
-	metaSrcs := make([]string, len(d.cfg.MetaSources))
-	copy(metaSrcs, d.cfg.MetaSources)
-	rand.Shuffle(len(metaSrcs), func(i, j int) { metaSrcs[i], metaSrcs[j] = metaSrcs[j], metaSrcs[i] })
+	for hop := 0; len(frontier) > 0; hop++ {
+		var nextFrontier []string
 
-	sem := make(chan struct{}, d.cfg.Concurrency)
-	var wg sync.WaitGroup
-	for _, metaSrc := range metaSrcs {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(src string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			urls, err := d.extractURLs(src)
-			if err != nil {
-				log.Printf("[discover] %s: %v", src, err)
-				return
+		sem := make(chan struct{}, d.cfg.Concurrency)
+		var wg sync.WaitGroup
+	hopLoop:
+		for _, src := range frontier {
+			if ctx.Err() != nil {
+				break
 			}
-			log.Printf("[discover] %s: %d candidates", src, len(urls))
-			mu.Lock()
-			for _, u := range urls {
-				candidates = append(candidates, candidate{rawURL: u, source: src})
+			wg.Add(1)
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				wg.Done()
+				break hopLoop
 			}
-			mu.Unlock()
-		}(metaSrc)
+			go func(src string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				boards, metas, err := d.extractURLs(ctx, src)
+				if err != nil {
+					log.Printf("[discover] hop=%d %s: %v", hop, src, err)
+					return
+				}
+				log.Printf("[discover] hop=%d %s: %d boards, %d meta-sources", hop, src, len(boards), len(metas))
+				mu.Lock()
+				for _, u := range boards {
+					candidates = append(candidates, candidate{rawURL: u, source: src})
+				}
+				// Only enqueue new meta-sources when we have hops left.
+				if hop < maxHops {
+					for _, m := range metas {
+						if !visitedMeta[m] {
+							visitedMeta[m] = true
+							nextFrontier = append(nextFrontier, m)
+						}
+					}
+				}
+				mu.Unlock()
+			}(src)
+		}
+		wg.Wait()
+
+		if ctx.Err() != nil || hop >= maxHops {
+			break
+		}
+		rand.Shuffle(len(nextFrontier), func(i, j int) { nextFrontier[i], nextFrontier[j] = nextFrontier[j], nextFrontier[i] })
+		frontier = nextFrontier
 	}
-	wg.Wait()
 
 	// Shuffle candidates before dedup so which hostname "wins" when two meta-sources
 	// both reference the same host varies across runs.
@@ -155,7 +463,8 @@ func (d *Discoverer) Run(existing []string) ([]Result, error) {
 		unique = append(unique, workItem{rawURL: c.rawURL, source: c.source})
 	}
 
-	log.Printf("[discover] %d unique candidates after dedup (%d already known)", len(unique), len(existingHosts))
+	log.Printf("[discover] %d unique candidates after dedup (%d already known, %d meta-source pages visited)",
+		len(unique), len(existingHosts), len(visitedMeta))
 
 	// Shuffle unique items so validation probes hit different hosts in different
 	// orders on each run, reducing predictable burst patterns per domain.
@@ -165,16 +474,29 @@ func (d *Discoverer) Run(existing []string) ([]Result, error) {
 	resultCh := make(chan Result, len(unique))
 	sem2 := make(chan struct{}, d.cfg.Concurrency)
 	var wg2 sync.WaitGroup
+validLoop:
 	for _, w := range unique {
+		if ctx.Err() != nil {
+			break
+		}
 		wg2.Add(1)
-		sem2 <- struct{}{}
+		select {
+		case sem2 <- struct{}{}:
+		case <-ctx.Done():
+			wg2.Done()
+			break validLoop
+		}
 		go func(w workItem) {
 			defer wg2.Done()
 			defer func() { <-sem2 }()
 			if d.cfg.Jitter > 0 {
-				time.Sleep(time.Duration(rand.Int63n(int64(d.cfg.Jitter))))
+				select {
+				case <-time.After(time.Duration(rand.Int63n(int64(d.cfg.Jitter)))):
+				case <-ctx.Done():
+					return
+				}
 			}
-			if d.isLive(w.rawURL) {
+			if d.isLive(ctx, w.rawURL) {
 				resultCh <- Result{URL: w.rawURL, Source: w.source}
 			}
 		}(w)
@@ -183,8 +505,14 @@ func (d *Discoverer) Run(existing []string) ([]Result, error) {
 	close(resultCh)
 
 	var results []Result
+	filter := expandFilterCodes(d.cfg.Countries)
 	for r := range resultCh {
-		results = append(results, r)
+		if filter == nil || urlMatchesCountryFilter(r.URL, filter) {
+			results = append(results, r)
+		}
+	}
+	if ctx.Err() != nil {
+		return results, ctx.Err()
 	}
 	return results, nil
 }
@@ -210,22 +538,27 @@ var jobBoardKeywords = []string{
 	"tech", "dev", "engineer", "freelance", "gig", "talent",
 }
 
-// extractURLs fetches src and returns candidate job-board URLs found in the page.
-// It normalises trailing punctuation stripped from Markdown and keeps the full
-// URL (not just the root) so scrapers get the right sub-path if needed.
-func (d *Discoverer) extractURLs(src string) ([]string, error) {
+// extractURLs fetches src and returns:
+//   - boards: candidate job-board URLs found in the page
+//   - metas:  curated-list pages found in the page that may themselves enumerate
+//             more job boards (GitHub repos, awesome-* pages, etc.)
+func (d *Discoverer) extractURLs(ctx context.Context, src string) (boards, metas []string, err error) {
 	parsed, err := url.Parse(src)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	host := parsed.Hostname()
 	if d.blocker.isBlocked(host) {
-		return nil, fmt.Errorf("temporarily blocked")
+		return nil, nil, fmt.Errorf("temporarily blocked")
 	}
 
-	resp, err := d.client.Get(src)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, nil, err
 	}
 	defer func() {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, extractDrainLimit)) //nolint:errcheck
@@ -235,20 +568,20 @@ func (d *Discoverer) extractURLs(src string) ([]string, error) {
 	switch resp.StatusCode {
 	case http.StatusForbidden:
 		d.blocker.block(host, time.Now().Add(block403Duration))
-		return nil, fmt.Errorf("HTTP 403")
+		return nil, nil, fmt.Errorf("HTTP 403")
 	case http.StatusTooManyRequests:
 		dur := retryAfterDuration(resp, block429Duration)
 		d.blocker.block(host, time.Now().Add(dur))
-		return nil, fmt.Errorf("HTTP 429")
+		return nil, nil, fmt.Errorf("HTTP 429")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	lr := io.LimitReader(resp.Body, 4*1024*1024)
 	scanner := bufio.NewScanner(lr)
-	seen := make(map[string]bool)
-	var out []string
+	seenBoards := make(map[string]bool)
+	seenMetas := make(map[string]bool)
 	for scanner.Scan() {
 		for _, raw := range urlRe.FindAllString(scanner.Text(), -1) {
 			raw = strings.TrimRight(raw, ".,;:!?)\"'#")
@@ -256,20 +589,89 @@ func (d *Discoverer) extractURLs(src string) ([]string, error) {
 			if err != nil || p.Host == "" {
 				continue
 			}
-			if seen[p.Host] {
-				continue
-			}
-			if !looksLikeJobBoard(p) {
-				continue
-			}
-			seen[p.Host] = true
-			// Keep scheme+host+path, strip query/fragment to avoid session noise.
+			// Strip query/fragment to normalise and avoid session noise.
 			p.RawQuery = ""
 			p.Fragment = ""
-			out = append(out, p.String())
+			normalised := p.String()
+
+			if looksLikeJobBoard(p) && !seenBoards[p.Host] {
+				seenBoards[p.Host] = true
+				boards = append(boards, normalised)
+			}
+			if looksLikeCuratedList(p) && !seenMetas[normalised] {
+				seenMetas[normalised] = true
+				metas = append(metas, normalised)
+			}
 		}
 	}
-	return out, scanner.Err()
+	return boards, metas, scanner.Err()
+}
+
+// curatedListKeywords are terms that appear in repo names or page paths that
+// suggest the page is a curated index of job boards or remote-work resources.
+var curatedListKeywords = []string{
+	"awesome", "curated", "job-board", "jobboard", "remote-job", "remotejob",
+	"hiring", "job-list", "career-resource", "work-resource",
+}
+
+// looksLikeCuratedList returns true for pages that are likely to enumerate job
+// boards, making them good candidates for recursive BFS meta-source following.
+// It deliberately does NOT overlap with looksLikeJobBoard — its job is to find
+// pages that LINK TO job boards, not boards themselves.
+func looksLikeCuratedList(u *url.URL) bool {
+	host := strings.ToLower(u.Host)
+	path := strings.ToLower(u.Path)
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+
+	switch host {
+	case "raw.githubusercontent.com":
+		// Raw GitHub file — always worth following (likely a README of a list repo).
+		return true
+
+	case "github.com":
+		switch {
+		case len(parts) >= 2 && parts[0] == "topics":
+			// github.com/topics/XXX — topic index page.
+			return true
+		case len(parts) == 2:
+			// github.com/user/repo — follow only if repo name suggests curation.
+			repoName := parts[1]
+			for _, kw := range curatedListKeywords {
+				if strings.Contains(repoName, kw) {
+					return true
+				}
+			}
+			// Also accept repos whose name contains job-related words even without
+			// explicit curation keywords (e.g. "remote-jobs", "tech-jobs-europe").
+			for _, kw := range []string{"job", "remote", "career", "work", "hire", "employ"} {
+				if strings.Contains(repoName, kw) {
+					return true
+				}
+			}
+		case len(parts) >= 4 && parts[2] == "blob":
+			// github.com/user/repo/blob/branch/file — rendered file view.
+			return true
+		}
+
+	case "gitlab.com":
+		if len(parts) == 2 {
+			repoName := parts[1]
+			for _, kw := range curatedListKeywords {
+				if strings.Contains(repoName, kw) {
+					return true
+				}
+			}
+		}
+	}
+
+	// Generic fallback: page path contains a strong curation keyword.
+	combined := host + path
+	for _, kw := range curatedListKeywords {
+		if strings.Contains(combined, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // looksLikeJobBoard returns true when the URL host or path suggests a job-related site.
@@ -385,7 +787,7 @@ func retryAfterDuration(resp *http.Response, fallback time.Duration) time.Durati
 // Body reads are capped: HEAD responses must not carry a body per RFC 7231, but
 // some servers send one anyway; reading it without a limit would stall the goroutine.
 // 403 and 429 responses record a temporary block and return false immediately.
-func (d *Discoverer) isLive(rawURL string) bool {
+func (d *Discoverer) isLive(ctx context.Context, rawURL string) bool {
 	ua := "Mozilla/5.0 (compatible; ResumeContactsScraper/0.1)"
 
 	parsed, err := url.Parse(rawURL)
@@ -397,7 +799,7 @@ func (d *Discoverer) isLive(rawURL string) bool {
 		return false
 	}
 
-	req, err := http.NewRequest(http.MethodHead, rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
 	if err != nil {
 		return false
 	}
@@ -421,7 +823,7 @@ func (d *Discoverer) isLive(rawURL string) bool {
 		if d.blocker.isBlocked(host) {
 			return false
 		}
-		req2, err2 := http.NewRequest(http.MethodGet, rawURL, nil)
+		req2, err2 := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err2 != nil {
 			return false
 		}
