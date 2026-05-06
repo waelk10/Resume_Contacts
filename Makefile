@@ -56,6 +56,14 @@ clean:
 	$(GO) clean
 	rm -f $(BINARY) $(BIN_LINUX) $(BIN_WIN)
 
+# ── Clean Contacts ───────────────────────────────────────────────────────────
+
+.PHONY: clean_contacts
+clean_contacts:
+	./Resume_Contacts_Scraper.bin clean --filter-regex '^(hello|noreply|no-reply)@'
+	./Resume_Contacts_Scraper.bin clean --dedup
+
+
 # ── Help ─────────────────────────────────────────────────────────────────────
 
 .PHONY: help
@@ -69,3 +77,4 @@ help:
 	@echo "  test     Run tests with -race"
 	@echo "  lint     Run golangci-lint"
 	@echo "  clean    Remove built binaries"
+	@echo "  clean_contacts  Cleans up all the contacts"

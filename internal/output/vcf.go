@@ -81,7 +81,7 @@ func (w *VCFWriter) Write(c contact.Contact) (bool, error) {
 
 	_, err := fmt.Fprintf(w.file,
 		"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:%s\r\nEMAIL:%s\r\nORG:%s\r\nSOURCE:%s\r\nEND:VCARD\r\n",
-		vcfEscape(c.Name), c.Email, vcfEscape(c.Org), c.Source,
+		vcfEscape(displayName(c)), c.Email, vcfEscape(c.Org), c.Source,
 	)
 	if err != nil {
 		return false, err
@@ -172,6 +172,54 @@ func scanVCF(path string, seen map[string]struct{}) (int, error) {
 		}
 	}
 	return count, scanner.Err()
+}
+
+// displayName returns the best available human-readable name for a contact.
+// Priority: scraped name → local-part parse → org (always non-empty).
+func displayName(c contact.Contact) string {
+	if c.Name != "" {
+		return c.Name
+	}
+	if n := nameFromLocalPart(c.Email); n != "" {
+		return n
+	}
+	return c.Org
+}
+
+// nameFromLocalPart tries to derive a human name from the email's local-part.
+// It only produces output when the local-part contains a separator (. _ -)
+// so that role addresses like "hr" or "recruiting" fall through to the Org
+// fallback rather than being mis-used as names.
+func nameFromLocalPart(email string) string {
+	at := strings.Index(email, "@")
+	if at <= 0 || !strings.ContainsAny(email[:at], "._-") {
+		return ""
+	}
+	parts := strings.FieldsFunc(email[:at], func(r rune) bool {
+		return r == '.' || r == '_' || r == '-'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if len(p) < 2 || !isAlphaOnly(p) {
+			return "" // single initial or digit-mixed segment — not a name
+		}
+		out = append(out, strings.ToUpper(p[:1])+strings.ToLower(p[1:]))
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, " ")
+}
+
+// isAlphaOnly returns true when every byte in s is an ASCII letter.
+func isAlphaOnly(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 func vcfEscape(s string) string {

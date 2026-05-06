@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	"Resume_Contacts_Scraper/internal/output"
 	"Resume_Contacts_Scraper/internal/scraper"
@@ -14,10 +15,15 @@ func appscan(f runFlags) {
 	cfg := scraper.DefaultConfig
 	cfg.Parallelism = f.concurrency
 	cfg.ExtraSeeds = mustLoadSeeds(f.seedsFile)
+	cfg.Countries = f.countries
 
 	fmt.Println("Starting Application Page Scanner...")
-	fmt.Printf("Concurrency: %d  |  Extra seeds: %d  |  Output: %s\n\n",
-		f.concurrency, len(cfg.ExtraSeeds), appOutputFile)
+	countriesLabel := "all"
+	if len(f.countries) > 0 {
+		countriesLabel = strings.Join(f.countries, ",")
+	}
+	fmt.Printf("Concurrency: %d  |  Extra seeds: %d  |  Countries: %s  |  Output: %s\n\n",
+		f.concurrency, len(cfg.ExtraSeeds), countriesLabel, appOutputFile)
 
 	writer, err := output.NewURLWriter(appOutputFile)
 	if err != nil {
