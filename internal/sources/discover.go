@@ -470,6 +470,28 @@ func (d *Discoverer) Run(ctx context.Context, existing []string) ([]Result, erro
 	// orders on each run, reducing predictable burst patterns per domain.
 	rand.Shuffle(len(unique), func(i, j int) { unique[i], unique[j] = unique[j], unique[i] })
 
+	filter := expandFilterCodes(d.cfg.Countries)
+
+	// partialResults returns the deduplicated (but unvalidated) unique set with
+	// the country filter applied. Called on cancellation so the caller always
+	// gets the candidates found so far rather than an empty slice.
+	partialResults := func() []Result {
+		var out []Result
+		for _, u := range unique {
+			if len(filter) == 0 || urlMatchesCountryFilter(u.rawURL, filter) {
+				out = append(out, Result{URL: u.rawURL, Source: u.source})
+			}
+		}
+		return out
+	}
+
+	// If ctx was cancelled during the BFS phase, skip liveness probing entirely:
+	// every HTTP probe would fail immediately with context.Canceled, giving an
+	// empty result set. Return the unvalidated candidates instead.
+	if ctx.Err() != nil {
+		return partialResults(), ctx.Err()
+	}
+
 	// Validate each candidate — only keep reachable hosts.
 	resultCh := make(chan Result, len(unique))
 	sem2 := make(chan struct{}, d.cfg.Concurrency)
@@ -505,14 +527,17 @@ validLoop:
 	close(resultCh)
 
 	var results []Result
-	filter := expandFilterCodes(d.cfg.Countries)
 	for r := range resultCh {
-		if filter == nil || urlMatchesCountryFilter(r.URL, filter) {
+		if len(filter) == 0 || urlMatchesCountryFilter(r.URL, filter) {
 			results = append(results, r)
 		}
 	}
+
+	// If cancellation happened mid-validation, all in-flight probes were aborted
+	// by the cancelled context and returned false, leaving results empty or sparse.
+	// Fall back to the full unvalidated unique set so the caller gets useful output.
 	if ctx.Err() != nil {
-		return results, ctx.Err()
+		return partialResults(), ctx.Err()
 	}
 	return results, nil
 }
