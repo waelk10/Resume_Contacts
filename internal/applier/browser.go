@@ -3,13 +3,13 @@ package applier
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
-
-	"log"
 
 	"github.com/tebeka/selenium"
 	"github.com/tebeka/selenium/firefox"
@@ -25,11 +25,12 @@ type FillFlags struct {
 
 // Browser manages a single geckodriver process and spawns one Firefox
 // WebDriver session per application.  Multiple goroutines may call
-// FillApplication concurrently; each gets its own session.
+// FillApplication concurrently; each gets its own independent session.
 type Browser struct {
-	service *selenium.Service
-	baseURL string
-	caps    selenium.Capabilities
+	service   *selenium.Service
+	baseURL   string
+	caps      selenium.Capabilities
+	sessionMu sync.Mutex // serialises session creation; geckodriver queues internally but concurrent POSTs can race
 }
 
 // NewBrowser locates geckodriver in PATH, starts it on port 4444, and
@@ -97,7 +98,9 @@ func (b *Browser) FillApplication(
 		return ctx.Err()
 	}
 
+	b.sessionMu.Lock()
 	wd, err := selenium.NewRemote(b.caps, b.baseURL)
+	b.sessionMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("open Firefox session: %w", err)
 	}
@@ -204,7 +207,10 @@ func (b *Browser) FillApplication(
 		}
 		return nil
 	}
-	return clickSubmit(wd)
+	if err := clickSubmit(wd); err != nil {
+		return err
+	}
+	return verifySubmission(ctx, wd, flags.Headful || flags.Hold)
 }
 
 // waitForWindowClose blocks until the user closes the Firefox window or ctx is
@@ -891,6 +897,103 @@ func tryUploadFile(wd selenium.WebDriver, selector, path string) bool {
 	}
 	_ = els[0].SendKeys(absPath)
 	return true
+}
+
+// jsVerifySubmission checks whether the page shows signs of a successful
+// submission or a validation error, collecting both in one round-trip.
+const jsVerifySubmission = `
+try {
+    var txt   = ((document.body && document.body.innerText) || '').toLowerCase();
+    var title = (document.title || '').toLowerCase();
+    var combined = title + ' ' + txt.slice(0, 3000);
+
+    var ok = [
+        'thank you for applying','thanks for applying',
+        'application received','application submitted',
+        'successfully submitted','successfully applied',
+        'we will review','we’ll be in touch',"we'll be in touch",
+        'you have applied','application complete',
+        'your application has been','application was submitted',
+        'submission confirmed','we received your application',
+        'your application is complete','application is under review'
+    ];
+    for (var i = 0; i < ok.length; i++) {
+        if (combined.indexOf(ok[i]) !== -1) return {success: true, phrase: ok[i]};
+    }
+
+    // Visible validation-error elements — indicates the form is still open with errors.
+    var errSels = '[class*="error" i]:not([class*="error-page" i]),[class*="invalid" i],[aria-invalid="true"],[data-error],.field-error,.form-error';
+    var errEls  = document.querySelectorAll(errSels);
+    for (var j = 0; j < errEls.length; j++) {
+        var t = (errEls[j].innerText || '').trim();
+        if (t && t.length < 300) return {success: false, error: t};
+    }
+    return {success: false};
+} catch(e) { return {success: false}; }
+`
+
+// successURLSegs are path / query segments that indicate a thank-you or
+// confirmation page after an ATS form submission.
+var successURLSegs = []string{
+	"thank", "thanks", "success", "confirm", "submitted",
+	"complete", "done", "received", "applied",
+}
+
+// verifySubmission waits up to 10 s after submit for a confirmation signal:
+// a URL redirect to a thank-you page, a success phrase in the page text, or
+// absence of validation errors.  On headful mode it keeps the window open an
+// extra 15 s when a form error is detected so the user can see what went wrong.
+// Returns nil when the submission appears successful or when no signal can be
+// detected (some ATS platforms give no visible feedback).
+func verifySubmission(ctx context.Context, wd selenium.WebDriver, headful bool) error {
+	originalURL, _ := wd.CurrentURL()
+	deadline := time.Now().Add(10 * time.Second)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+
+		// URL change is the strongest signal — most ATS platforms redirect to a
+		// thank-you or confirmation page after successful submission.
+		if cur, _ := wd.CurrentURL(); cur != originalURL {
+			low := strings.ToLower(cur)
+			for _, seg := range successURLSegs {
+				if strings.Contains(low, seg) {
+					log.Printf("[apply] submission confirmed via redirect: %s", cur)
+					return nil
+				}
+			}
+			// Any navigation away from the form page counts as acceptance.
+			log.Printf("[apply] form navigated → %s (treating as submitted)", cur)
+			return nil
+		}
+
+		// Page-content check: success phrase or validation error.
+		raw, err := wd.ExecuteScript(jsVerifySubmission, nil)
+		if err != nil {
+			continue
+		}
+		data, _ := raw.(map[string]interface{})
+		if data["success"] == true {
+			phrase, _ := data["phrase"].(string)
+			log.Printf("[apply] submission confirmed (%q)", phrase)
+			return nil
+		}
+		if errMsg, _ := data["error"].(string); errMsg != "" {
+			if headful {
+				log.Printf("[apply] form validation error — keeping window open 15 s: %s", errMsg)
+				time.Sleep(15 * time.Second)
+			}
+			return fmt.Errorf("form validation failed: %s", errMsg)
+		}
+	}
+
+	// No signal in 10 s — warn and proceed; many ATS platforms are silent.
+	log.Printf("[apply] warning: no submission confirmation signal detected")
+	return nil
 }
 
 // submitButtonTexts covers the button labels used across ATS platforms.
