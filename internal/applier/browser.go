@@ -312,18 +312,28 @@ func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 }
 
 func fillBambooHR(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
-	waitForElement(ctx, wd, `input[id*="firstName" i]`, 8*time.Second)
+	waitForElement(ctx, wd,
+		`input[id*="firstName" i], input[name*="first" i], input[type="email"]`,
+		8*time.Second)
 	first, last := splitName(info.Name)
-	if !trySetInput(wd, `input[id*="firstName" i]`, first) {
+	if !trySetInput(wd, `input[id*="firstName" i]`, first) &&
+		!trySetInput(wd, `input[name*="first" i]`, first) &&
+		!trySetInput(wd, `input[placeholder*="first" i]`, first) {
 		tryFillByLabel(wd, "first name", first)
 	}
-	if !trySetInput(wd, `input[id*="lastName" i]`, last) {
+	if !trySetInput(wd, `input[id*="lastName" i]`, last) &&
+		!trySetInput(wd, `input[name*="last" i]`, last) &&
+		!trySetInput(wd, `input[placeholder*="last" i]`, last) {
 		tryFillByLabel(wd, "last name", last)
 	}
-	if !trySetInput(wd, `input[id*="email" i]`, info.Email) {
+	if !trySetInput(wd, `input[id*="email" i]`, info.Email) &&
+		!trySetInput(wd, `input[type="email"]`, info.Email) &&
+		!trySetInput(wd, `input[name*="email" i]`, info.Email) {
 		tryFillByLabel(wd, "email", info.Email)
 	}
-	if !trySetInput(wd, `input[id*="phone" i]`, info.Phone) {
+	if !trySetInput(wd, `input[id*="phone" i]`, info.Phone) &&
+		!trySetInput(wd, `input[type="tel"]`, info.Phone) &&
+		!trySetInput(wd, `input[name*="phone" i]`, info.Phone) {
 		tryFillByLabel(wd, "phone", info.Phone)
 	}
 	uploadFile(wd, `input[type="file"]`, resumePath)
@@ -740,9 +750,27 @@ for (var i = 0; i < labels.length; i++) {
     var l = labels[i];
     if (l.textContent.trim().toLowerCase().indexOf(needle) === -1) continue;
     var inp = null;
+    // 1. Standard HTML: label[for] → getElementById
     var fid = l.getAttribute('for');
     if (fid) inp = document.getElementById(fid);
+    // 2. Input nested inside the label element
     if (!inp) inp = l.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea');
+    // 3. Sibling pattern (BambooHR, many modern forms): label and input share a
+    //    parent container but are not linked via for/id.  Walk following siblings
+    //    until we find an input or hit the next label (= next field boundary).
+    if (!inp) {
+        var sib = l.nextElementSibling;
+        while (sib) {
+            if (sib.tagName === 'LABEL') break;
+            if ((sib.tagName === 'INPUT' || sib.tagName === 'TEXTAREA')
+                    && sib.type !== 'hidden' && sib.type !== 'checkbox' && sib.type !== 'radio') {
+                inp = sib; break;
+            }
+            var inner = sib.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea');
+            if (inner) { inp = inner; break; }
+            sib = sib.nextElementSibling;
+        }
+    }
     if (!inp || inp.disabled || inp.offsetParent === null) continue;
     inp.scrollIntoView({block: 'center'});
     try {
