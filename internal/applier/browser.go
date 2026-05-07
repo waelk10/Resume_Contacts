@@ -149,6 +149,14 @@ func (b *Browser) FillApplication(
 	// Detect this pattern and click through before attempting to fill.
 	clickPreApplyIfNeeded(ctx, wd)
 
+	// After the pre-apply click (or when there was none), verify a form is
+	// actually present.  If nothing rendered, the job is definitively closed,
+	// removed, or on a platform we can't handle — bail now rather than
+	// running the fill routine against an empty page.
+	if fels, _ := wd.FindElements(selenium.ByCSSSelector, formReadySelector); len(fels) == 0 {
+		return fmt.Errorf("no application form found on page (job may be closed or removed)")
+	}
+
 	switch job.ATSPlatform {
 	case "greenhouse":
 		fillGreenhouse(ctx, wd, info, resumePath)
@@ -323,10 +331,22 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // deadPagePhrases is a normalised list of substrings that appear in page
-// titles, headings, or early body text when a job posting is closed, filled,
-// expired, or the URL 404s.  Ordered longest-first so a specific phrase
-// matches before a shorter one could shadow it in debugging output.
+// titles, headings, or body text when a job posting is closed, filled,
+// expired, or the URL 404s.  Ordered longest-first so the most specific
+// phrase surfaces in error messages and shorter sub-strings don't shadow them.
 var deadPagePhrases = []string{
+	// Ashby-specific
+	"this role is not currently open for applications",
+	"this position is not currently open for applications",
+	"not currently open for applications",
+	"role is not currently open",
+	"position is not currently open",
+	"not currently accepting applications",
+	"currently not accepting applications",
+	"not open for applications",
+	"applications are currently closed",
+	"applications are closed",
+	// Lever / Greenhouse
 	"this job is no longer available",
 	"this position is no longer available",
 	"this role is no longer available",
@@ -341,26 +361,35 @@ var deadPagePhrases = []string{
 	"this listing is no longer active",
 	"this requisition is no longer active",
 	"this posting is no longer active",
+	// Expiry / removal
 	"job posting has expired",
 	"this job has expired",
 	"this posting has expired",
 	"this position has been removed",
 	"this job has been removed",
+	// Generic closed
 	"this job has been closed",
 	"this position is closed",
 	"this job is closed",
 	"job closed",
+	"no longer available",
+	// Generic 404 / error
 	"page not found",
 	"404 not found",
 	"page doesn't exist",
 	"page does not exist",
 	"this page no longer exists",
+	"we couldn't find that page",
 }
 
-// jsDeadPage returns a JSON object with the HTTP response status (via the
-// Navigation Timing API, Firefox 125+), the lowercased page title, and a
-// concatenation of lowercased headings + the first 600 chars of body text.
-// All fields degrade gracefully on older browsers.
+// jsDeadPage collects signals used by detectDeadPage in a single round-trip:
+//   - HTTP response status (Navigation Timing API, Firefox 125+; 0 on older browsers)
+//   - Lowercased page title
+//   - Text from headings, prominent status/alert elements, paragraphs inside
+//     <main> or <article>, and the first 2 000 chars of body text
+//
+// The 2 000-char window (up from 600) is important for React SPAs like Ashby
+// where the "job closed" message is rendered deeper in the component tree.
 const jsDeadPage = `
 try {
     var status = 0;
@@ -372,18 +401,24 @@ try {
     var title = (document.title || '').toLowerCase();
 
     var parts = [];
-    ['h1','h2','h3',
-     '[class*="error" i]','[class*="expired" i]','[class*="closed" i]',
-     '[class*="not-found" i]','[class*="unavailable" i]','[class*="filled" i]',
-     '[id*="error" i]','[id*="expired" i]','[id*="not-found" i]'
-    ].forEach(function(s) {
+    var selectors = [
+        'h1','h2','h3','h4',
+        '[role="alert"]','[role="status"]','[aria-live]',
+        'main p','article p',
+        '[class*="error" i]','[class*="expired" i]','[class*="closed" i]',
+        '[class*="not-found" i]','[class*="unavailable" i]','[class*="filled" i]',
+        '[class*="empty-state" i]','[class*="empty_state" i]',
+        '[id*="error" i]','[id*="expired" i]','[id*="not-found" i]'
+    ];
+    selectors.forEach(function(s) {
         try {
             document.querySelectorAll(s).forEach(function(el) {
-                parts.push(el.innerText || '');
+                var t = el.innerText || '';
+                if (t.trim()) parts.push(t);
             });
         } catch(e) {}
     });
-    parts.push((document.body && document.body.innerText || '').slice(0, 600));
+    parts.push((document.body && document.body.innerText || '').slice(0, 2000));
     var content = parts.join(' ').toLowerCase();
 
     return {status: status, title: title, content: content};
