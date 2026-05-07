@@ -138,6 +138,12 @@ func (b *Browser) FillApplication(
 		return ctx.Err()
 	}
 
+	// Bail out early for dead pages (404s, expired postings, filled roles, etc.)
+	// before spending time on captcha solving, pre-apply clicks, and form filling.
+	if err := detectDeadPage(wd); err != nil {
+		return err
+	}
+
 	// Many job-description pages show the posting first and only reveal the
 	// application form after the visitor clicks "Apply to this Job" or similar.
 	// Detect this pattern and click through before attempting to fill.
@@ -315,6 +321,118 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// deadPagePhrases is a normalised list of substrings that appear in page
+// titles, headings, or early body text when a job posting is closed, filled,
+// expired, or the URL 404s.  Ordered longest-first so a specific phrase
+// matches before a shorter one could shadow it in debugging output.
+var deadPagePhrases = []string{
+	"this job is no longer available",
+	"this position is no longer available",
+	"this role is no longer available",
+	"this listing is no longer available",
+	"this requisition is no longer available",
+	"position has been filled",
+	"this job has been filled",
+	"this role has been filled",
+	"this position has been filled",
+	"job is no longer accepting",
+	"no longer accepting applications",
+	"this listing is no longer active",
+	"this requisition is no longer active",
+	"this posting is no longer active",
+	"job posting has expired",
+	"this job has expired",
+	"this posting has expired",
+	"this position has been removed",
+	"this job has been removed",
+	"this job has been closed",
+	"this position is closed",
+	"this job is closed",
+	"job closed",
+	"page not found",
+	"404 not found",
+	"page doesn't exist",
+	"page does not exist",
+	"this page no longer exists",
+}
+
+// jsDeadPage returns a JSON object with the HTTP response status (via the
+// Navigation Timing API, Firefox 125+), the lowercased page title, and a
+// concatenation of lowercased headings + the first 600 chars of body text.
+// All fields degrade gracefully on older browsers.
+const jsDeadPage = `
+try {
+    var status = 0;
+    try {
+        var nav = performance.getEntriesByType('navigation')[0];
+        if (nav && nav.responseStatus) status = nav.responseStatus;
+    } catch(e) {}
+
+    var title = (document.title || '').toLowerCase();
+
+    var parts = [];
+    ['h1','h2','h3',
+     '[class*="error" i]','[class*="expired" i]','[class*="closed" i]',
+     '[class*="not-found" i]','[class*="unavailable" i]','[class*="filled" i]',
+     '[id*="error" i]','[id*="expired" i]','[id*="not-found" i]'
+    ].forEach(function(s) {
+        try {
+            document.querySelectorAll(s).forEach(function(el) {
+                parts.push(el.innerText || '');
+            });
+        } catch(e) {}
+    });
+    parts.push((document.body && document.body.innerText || '').slice(0, 600));
+    var content = parts.join(' ').toLowerCase();
+
+    return {status: status, title: title, content: content};
+} catch(e) { return {status: 0, title: '', content: ''}; }
+`
+
+// detectDeadPage checks the current page for signs that a job posting no
+// longer exists (HTTP 4xx/5xx, URL redirect to an error path, "job closed"
+// headings, or known phrase patterns in the visible text).  Returns a
+// descriptive error so the caller can skip this URL without wasting time on
+// form-filling.
+func detectDeadPage(wd selenium.WebDriver) error {
+	// Fast URL check — some platforms redirect to /404, /not-found, /gone, etc.
+	if u, err := wd.CurrentURL(); err == nil {
+		uLow := strings.ToLower(u)
+		for _, seg := range []string{"/404", "/not-found", "/error", "/gone", "/expired", "/closed"} {
+			if strings.Contains(uLow, seg) {
+				return fmt.Errorf("page redirected to error URL: %s", u)
+			}
+		}
+	}
+
+	// JS check: status + title + prominent-heading/body text in one round-trip.
+	raw, err := wd.ExecuteScript(jsDeadPage, nil)
+	if err != nil {
+		return nil // can't tell — let the fill attempt proceed
+	}
+	data, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	// HTTP status (available on Firefox 125+; 0 on older browsers).
+	if code, ok := data["status"].(float64); ok && code >= 400 {
+		return fmt.Errorf("HTTP %.0f response", code)
+	}
+
+	title, _ := data["title"].(string)
+	content, _ := data["content"].(string)
+	combined := title + " " + content
+
+	for _, phrase := range deadPagePhrases {
+		if strings.Contains(combined, phrase) {
+			return fmt.Errorf("job posting unavailable (%q detected on page)", phrase)
+		}
+	}
+
+	return nil
+}
 
 // formReadySelector matches visible text/email/tel inputs and textareas that
 // signal the application form has rendered.  Deliberately excludes
