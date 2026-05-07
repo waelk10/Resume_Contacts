@@ -8,9 +8,18 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"Resume_Contacts_Scraper/internal/resume"
 )
+
+// platformCooldowns is the minimum pause between consecutive applications on
+// the same ATS platform.  Ashby's spam filters are sensitive to rapid
+// submissions — a per-platform cooldown prevents the account from being flagged
+// and applications silently dropped.
+var platformCooldowns = map[string]time.Duration{
+	"ashby": 90 * time.Second,
+}
 
 // ApplicantInfo holds the personal details typed into application forms.
 type ApplicantInfo struct {
@@ -47,8 +56,10 @@ type Result struct {
 
 // Applicator drives browser-based job applications from a slice of URLs.
 type Applicator struct {
-	cfg     Config
-	browser *Browser
+	cfg        Config
+	browser    *Browser
+	cooldownMu sync.Mutex
+	lastRun    map[string]time.Time // platform → time we last started an application
 }
 
 // New creates an Applicator and launches the underlying browser.
@@ -67,7 +78,7 @@ func New(cfg Config) (*Applicator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("browser init: %w", err)
 	}
-	return &Applicator{cfg: cfg, browser: b}, nil
+	return &Applicator{cfg: cfg, browser: b, lastRun: make(map[string]time.Time)}, nil
 }
 
 // Close releases the browser process.
@@ -118,6 +129,26 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 	res.Company = job.Company
 	res.Title = job.Title
 	log.Printf("[apply] %q @ %s  platform=%s", job.Title, job.Company, job.ATSPlatform)
+
+	// Enforce per-platform cooldown before starting this application.
+	// We hold the lock only for the timestamp check/update; the actual sleep
+	// happens without the lock so other platforms aren't blocked.
+	if cd, ok := platformCooldowns[job.ATSPlatform]; ok {
+		a.cooldownMu.Lock()
+		wait := cd - time.Since(a.lastRun[job.ATSPlatform])
+		if wait > 0 {
+			a.cooldownMu.Unlock()
+			log.Printf("[apply] %s cooldown — waiting %.0fs before next application", job.ATSPlatform, wait.Seconds())
+			select {
+			case <-ctx.Done():
+				return Result{URL: rawURL, Status: "error", Error: ctx.Err()}
+			case <-time.After(wait):
+			}
+			a.cooldownMu.Lock()
+		}
+		a.lastRun[job.ATSPlatform] = time.Now()
+		a.cooldownMu.Unlock()
+	}
 
 	// Determine which resume PDF to upload.
 	resumePath := a.cfg.ResumePath

@@ -141,6 +141,11 @@ func (b *Browser) FillApplication(
 		return ctx.Err()
 	}
 
+	// Dismiss any cookie consent banner before interacting with the page.
+	// Cookie overlays block clicks on forms and Apply buttons; we accept them
+	// unconditionally since we do not need to customise cookie preferences.
+	dismissCookieBanner(wd)
+
 	// Many job-description pages show the posting first and only reveal the
 	// application form after the visitor clicks "Apply to this Job" or similar.
 	// Detect this pattern and click through before attempting to fill.
@@ -253,7 +258,7 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 	if !trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
-	uploadFile(wd, `input[name="resume"]`, resumePath)
+	uploadResume(wd, resumePath)
 }
 
 func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -277,9 +282,7 @@ func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 	if !trySetInput(wd, `input[name="urls[LinkedIn]"]`, info.LinkedInURL) {
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
-	if !tryUploadFile(wd, `input[name="resume"]`, resumePath) {
-		tryUploadFile(wd, `input[type="file"]`, resumePath)
-	}
+	uploadResume(wd, resumePath)
 }
 
 func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -314,7 +317,7 @@ func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 		!trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
-	uploadFile(wd, `input[type="file"]`, resumePath)
+	uploadResume(wd, resumePath)
 }
 
 func fillBambooHR(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -342,7 +345,7 @@ func fillBambooHR(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo
 		!trySetInput(wd, `input[name*="phone" i]`, info.Phone) {
 		tryFillByLabel(wd, "phone", info.Phone)
 	}
-	uploadFile(wd, `input[type="file"]`, resumePath)
+	uploadResume(wd, resumePath)
 }
 
 func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -443,10 +446,125 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
 
-	uploadFile(wd, `input[type="file"]`, resumePath)
+	uploadResume(wd, resumePath)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// jsAcceptCookies dismisses cookie consent banners in two passes:
+//  1. Exact CSS selectors for well-known consent libraries (Cookiebot, OneTrust,
+//     Osano, Didomi, TrustArc, Cookie Script, Usercentrics, Funding Choices, …).
+//  2. Text-based matching inside any element whose class/id contains "cookie",
+//     "consent", "gdpr", "banner", "notice", or "cc-".  Accept-words cover
+//     English, German, Dutch, Finnish, Norwegian, Swedish, French, and Danish.
+//     Buttons whose text also contains a reject-word are skipped.
+//
+// Returns true when a button was clicked so the Go side can wait briefly for
+// the overlay animation to finish before continuing.
+const jsAcceptCookies = `
+(function() {
+    // Pass 1: library-specific selectors.
+    var exact = [
+        '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+        '#CybotCookiebotDialogBodyButtonAccept',
+        '#onetrust-accept-btn-handler',
+        '.onetrust-accept-btn-handler',
+        '.osano-cm-accept-all', '.osano-cm-accept',
+        '#didomi-notice-agree-button',
+        '#truste-consent-button',
+        '#cookiescript_accept_all', '#cookiescript_accept',
+        'button[data-testid="uc-accept-all-button"]',
+        '.fc-button.fc-cta-consent',
+        '#coiConsentBannerFooterButton',
+        '[data-cookiebanner="accept_button"]',
+        '#accept-cookies', '#cookie-accept', '#acceptCookies',
+        '#accept-all-cookies', '#acceptAllCookies',
+        '.js-cookie-accept', '.js-accept-cookies',
+        'button[class*="cookie-consent-accept" i]',
+        'button[class*="accept-cookie" i]',
+        'button[class*="accept-all-cookie" i]',
+        'button[aria-label*="accept all" i]',
+        'button[aria-label*="alle akzeptieren" i]',
+        'button[aria-label*="acceptera alla" i]',
+    ];
+    for (var s = 0; s < exact.length; s++) {
+        try {
+            var el = document.querySelector(exact[s]);
+            if (el && !el.disabled) { el.click(); return true; }
+        } catch(e) {}
+    }
+
+    // Pass 2: multilingual text matching inside consent containers.
+    var ACCEPT = [
+        // English
+        'accept', 'allow all', 'allow cookies', 'agree', 'i agree',
+        'i accept', 'ok', 'got it',
+        // German
+        'akzeptieren', 'zustimmen', 'einverstanden', 'annehmen', 'ich stimme',
+        // Dutch
+        'accepteren', 'akkoord', 'toestaan', 'instemmen',
+        // Finnish
+        'hyväksy',
+        // Norwegian
+        'godta', 'aksepter',
+        // Swedish
+        'acceptera', 'godkänn',
+        // French
+        "j'accepte", 'accepter',
+        // Danish
+        'godkend',
+    ];
+    var REJECT = [
+        'decline', 'reject', 'refuse', 'deny',
+        'necessary only', 'only necessary', 'essential only',
+        'ablehnen', 'nein', 'nur notwendige', 'nur erforderliche',
+        'weigeren', 'alleen noodzakelijke',
+        'avvisa', 'avvis', 'neka',
+        'hylkää',
+    ];
+    function textOf(el) {
+        return (el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').trim().toLowerCase();
+    }
+    function hasWord(t, list) {
+        for (var i = 0; i < list.length; i++) if (t.indexOf(list[i]) !== -1) return true;
+        return false;
+    }
+    var containerSel = [
+        '[class*="cookie" i]', '[id*="cookie" i]',
+        '[class*="consent" i]', '[id*="consent" i]',
+        '[class*="gdpr" i]', '[id*="gdpr" i]',
+        '[class*="banner" i]', '[class*="notice" i]',
+        '[class*="cc-"]', '[id*="cc-"]',
+    ].join(',');
+    var containers = document.querySelectorAll(containerSel);
+    for (var c = 0; c < containers.length; c++) {
+        var btns = containers[c].querySelectorAll('button, [role="button"], a');
+        for (var b = 0; b < btns.length; b++) {
+            var btn = btns[b];
+            if (btn.disabled) continue;
+            var t = textOf(btn);
+            if (t.length === 0 || t.length > 60) continue;
+            if (hasWord(t, REJECT)) continue;
+            if (hasWord(t, ACCEPT)) { btn.click(); return true; }
+        }
+    }
+    return false;
+})();
+`
+
+// dismissCookieBanner attempts to accept any cookie consent banner on the
+// current page.  It loops up to three times with a short pause between
+// iterations to handle two-step banners ("Manage preferences" → "Accept all").
+// The loop stops as soon as no banner button is found.
+func dismissCookieBanner(wd selenium.WebDriver) {
+	for i := 0; i < 3; i++ {
+		res, err := wd.ExecuteScript(jsAcceptCookies, nil)
+		if err != nil || res != true {
+			return
+		}
+		time.Sleep(400 * time.Millisecond) // wait for the overlay animation
+	}
+}
 
 // deadPagePhrases is a normalised list of substrings that appear in page
 // titles, headings, or body text when a job posting is closed, filled,
@@ -617,32 +735,53 @@ const appFormSelector = `input[type="email"],` +
 // appeared — the caller's waitForElement inside the fill function will handle
 // the remaining wait).
 func clickPreApplyIfNeeded(ctx context.Context, wd selenium.WebDriver) bool {
-	// Fast exit: an application-specific form is already in the DOM.
-	// Uses appFormSelector (email / name inputs) rather than formReadySelector
-	// so that search bars, cookie banners, and nav inputs don't cause a false
-	// "form already loaded" result that skips the actual Apply button.
-	els, _ := wd.FindElements(selenium.ByCSSSelector, appFormSelector)
-	if len(els) > 0 {
+	// Fast exit only when application-form inputs are already VISIBLE in the
+	// viewport — not merely present in the DOM.  Many ATS platforms (BambooHR,
+	// Greenhouse) pre-render the application form below the job description or
+	// inside a hidden div; a plain FindElements call would match those hidden
+	// inputs and cause us to skip the "Apply Now" button entirely.
+	res, _ := wd.ExecuteScript(`
+var els = document.querySelectorAll(arguments[0]);
+for (var i = 0; i < els.length; i++) {
+    var e = els[i];
+    if (e.disabled) continue;
+    if (e.offsetParent !== null || window.getComputedStyle(e).position === 'fixed') return true;
+}
+return false;`, []interface{}{appFormSelector})
+	if res == true {
 		return false
 	}
 
 	clicked := false
 
 	// 1. Attribute-based CSS — highest precision, platform-specific IDs/classes.
+	// Ordered: ATS-specific first, then generic data attributes.
 	for _, sel := range []string{
+		// BambooHR
+		`a[class*="BambooHR-ATS-Jobs-Apply"]`,
+		`[class*="BambooHR-ATS-Jobs-Apply"]`,
+		// Greenhouse, Lever, Ashby, generic ATS
 		`button[data-qa*="apply" i]`, `a[data-qa*="apply" i]`,
 		`button[id*="apply-btn" i]`, `button[id*="btn-apply" i]`,
 		`a[id*="apply-btn" i]`, `a[id*="btn-apply" i]`,
 		`button[class*="apply-btn" i]`, `a[class*="apply-btn" i]`,
+		`a[class*="jobs-apply" i]`, `button[class*="jobs-apply" i]`,
 		`[data-automation*="apply" i]`,
 		`button[data-testid*="apply" i]`, `a[data-testid*="apply" i]`,
 	} {
 		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
-		if err == nil && len(els) > 0 {
-			if els[0].Click() == nil {
+		if err != nil || len(els) == 0 {
+			continue
+		}
+		// Try every match — the first one in DOM order may be off-screen.
+		for _, el := range els {
+			if el.Click() == nil {
 				clicked = true
 				break
 			}
+		}
+		if clicked {
+			break
 		}
 	}
 
@@ -667,11 +806,17 @@ func clickPreApplyIfNeeded(ctx context.Context, wd selenium.WebDriver) bool {
 		} {
 			xpath := fmt.Sprintf(`(//button|//a)[contains(%s,'%s')]`, lc, phrase)
 			els, err := wd.FindElements(selenium.ByXPATH, xpath)
-			if err == nil && len(els) > 0 {
-				if els[0].Click() == nil {
+			if err != nil || len(els) == 0 {
+				continue
+			}
+			for _, el := range els {
+				if el.Click() == nil {
 					clicked = true
 					break
 				}
+			}
+			if clicked {
+				break
 			}
 		}
 		// Bare "apply" only when the entire label is exactly that word, to
@@ -679,15 +824,21 @@ func clickPreApplyIfNeeded(ctx context.Context, wd selenium.WebDriver) bool {
 		if !clicked {
 			xpath := fmt.Sprintf(`(//button|//a)[%s='apply']`, lc)
 			els, err := wd.FindElements(selenium.ByXPATH, xpath)
-			if err == nil && len(els) > 0 {
-				if els[0].Click() == nil {
-					clicked = true
+			if err == nil {
+				for _, el := range els {
+					if el.Click() == nil {
+						clicked = true
+						break
+					}
 				}
 			}
 		}
 	}
 
-	// 3. JS fallback — skips nav/header/footer to reduce false positives.
+	// 3. JS fallback — scrolls each candidate into view before clicking so
+	// off-screen buttons (sticky headers, bottom CTAs) are reachable.
+	// Excludes nav/footer/[role="navigation"] but NOT <header> — legitimate
+	// ATS apply buttons are frequently placed inside sticky page headers.
 	if !clicked {
 		const jsApply = `
 var MULTI = /\b(apply\s+(?:to\s+this\s+(?:job|position|role)|for\s+this\s+(?:job|position|role)|now|with\s+\S+)|easy\s+apply|quick\s+apply|(?:start|begin)\s+(?:your\s+)?application|1[\s-]click\s+apply)\b/i;
@@ -696,7 +847,7 @@ var all = Array.from(document.querySelectorAll('button, a[href], [role="button"]
 for (var i = 0; i < all.length; i++) {
     var el = all[i];
     if (el.disabled || el.offsetParent === null) continue;
-    if (el.closest('nav, header, footer, [role="navigation"]')) continue;
+    if (el.closest('nav, footer, [role="navigation"]')) continue;
     var t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
     if (MULTI.test(t) || BARE.test(t)) {
         el.scrollIntoView({block: 'center'});
@@ -725,16 +876,27 @@ return false;`
 // sets its value via the native HTMLInputElement/HTMLTextAreaElement prototype
 // setter and fires input/change/blur so React, Vue, and Angular frameworks
 // pick up the new value — plain SendKeys does not reliably trigger these.
+// Returns true when an element was found and filled, false otherwise so the
+// Go caller can distinguish "filled" from "no visible element found".
 const jsFill = `
 var sel = arguments[0], val = arguments[1];
 var els = document.querySelectorAll(sel), el = null;
 for (var i = 0; i < els.length; i++) {
-    if (!els[i].disabled && els[i].offsetParent !== null) { el = els[i]; break; }
+    var e = els[i];
+    if (e.disabled) continue;
+    // offsetParent is null for:
+    //   a) elements whose ancestor has display:none  — truly hidden, skip
+    //   b) elements with position:fixed              — visible, keep
+    // Check computed position to distinguish the two.
+    if (e.offsetParent !== null || window.getComputedStyle(e).position === 'fixed') {
+        el = e; break;
+    }
 }
-if (!el) return;
+if (!el) return false;
+el.focus();
 el.scrollIntoView({block: 'center'});
 try {
-    var proto  = el.tagName === 'TEXTAREA'
+    var proto = el.tagName === 'TEXTAREA'
         ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
     setter.call(el, val);
@@ -742,6 +904,7 @@ try {
 el.dispatchEvent(new Event('input',  {bubbles: true}));
 el.dispatchEvent(new Event('change', {bubbles: true}));
 el.dispatchEvent(new Event('blur',   {bubbles: true}));
+return true;
 `
 
 // jsFillByLabel finds the first visible input associated with a <label> whose
@@ -777,7 +940,10 @@ for (var i = 0; i < labels.length; i++) {
             sib = sib.nextElementSibling;
         }
     }
-    if (!inp || inp.disabled || inp.offsetParent === null) continue;
+    if (!inp || inp.disabled) continue;
+    // Same visibility logic as jsFill: accept position:fixed elements.
+    if (inp.offsetParent === null && window.getComputedStyle(inp).position !== 'fixed') continue;
+    inp.focus();
     inp.scrollIntoView({block: 'center'});
     try {
         var proto = inp.tagName === 'TEXTAREA'
@@ -844,59 +1010,120 @@ func waitForElement(ctx context.Context, wd selenium.WebDriver, selector string,
 	return nil
 }
 
-// setInput fills the first element matching selector; silently skips when absent.
-func setInput(wd selenium.WebDriver, selector, value string) {
-	trySetInput(wd, selector, value)
-}
-
-// trySetInput fills the first element matching selector, returning true when an
-// element was found.  It uses a JS native-setter approach as the primary path
-// (necessary for React/Vue controlled inputs) and falls back to WebDriver
-// Click/Clear/SendKeys when ExecuteScript is unavailable.
+// trySetInput fills the first visible element matching selector using the JS
+// native-setter approach (required for React/Vue controlled inputs) and returns
+// true only when an element was found AND the value was actually written.
+// If jsFill cannot find a usable visible element it returns false so callers
+// can continue down the fallback chain rather than silently stopping.
+// As a last resort it tries WebDriver SendKeys on every matched element.
 func trySetInput(wd selenium.WebDriver, selector, value string) bool {
 	if value == "" {
 		return false
 	}
-	// Verify the element exists via WebDriver before going to JS so we can
-	// return false immediately when no match — JS querySelector would also
-	// return null, but checking here avoids a round-trip to the browser.
 	els, err := wd.FindElements(selenium.ByCSSSelector, selector)
 	if err != nil || len(els) == 0 {
 		return false
 	}
-	if _, err = wd.ExecuteScript(jsFill, []interface{}{selector, value}); err != nil {
-		// JS unavailable — fall back to click / clear / SendKeys.
-		_ = els[0].Click()
-		_ = els[0].Clear()
-		_ = els[0].SendKeys(value)
+	res, err := wd.ExecuteScript(jsFill, []interface{}{selector, value})
+	if err == nil && res == true {
+		return true
 	}
-	return true
+	// jsFill found no usable visible element (returned false) or JS errored.
+	// Fall back to WebDriver SendKeys on every matched element — works for
+	// plain-HTML forms that don't need synthetic events.
+	for _, el := range els {
+		_ = el.Click()
+		_ = el.Clear()
+		if err2 := el.SendKeys(value); err2 == nil {
+			return true
+		}
+	}
+	return false
 }
 
-// uploadFile sets a file-input to an absolute path.
-// geckodriver requires an absolute path to locate the file on disk.
-func uploadFile(wd selenium.WebDriver, selector, path string) {
-	tryUploadFile(wd, selector, path)
+// uploadSelectors are tried in order by uploadResume.
+// Ordered from most specific (known attribute values) to most generic.
+var uploadSelectors = []string{
+	`input[name="resume"]`,
+	`input[name="cv"]`,
+	`input[name*="resume" i]`,
+	`input[name*="cv" i]`,
+	`input[name*="attachment" i]`,
+	`input[accept*=".pdf" i]`,
+	`input[accept*="pdf" i]`,
+	`input[type="file"]`,
 }
 
-// tryUploadFile is like uploadFile but returns true when the element was found.
-func tryUploadFile(wd selenium.WebDriver, selector, path string) bool {
+// jsRevealFileInputs makes every file input in the document reachable via
+// SendKeys.  Many ATS platforms hide the real <input type="file"> behind a
+// styled drag-drop zone or a custom button — the CSS hiding (display:none,
+// opacity:0, pointer-events:none, etc.) prevents geckodriver from injecting
+// the file path.  We force all of them into a minimal 1×1 px visible rect
+// before attempting the upload, then rely on the browser to handle the rest.
+const jsRevealFileInputs = `
+var inputs = document.querySelectorAll('input[type="file"]');
+for (var i = 0; i < inputs.length; i++) {
+    inputs[i].style.cssText = [
+        'display:block!important',
+        'opacity:1!important',
+        'visibility:visible!important',
+        'position:fixed!important',
+        'left:0px!important',
+        'top:0px!important',
+        'width:1px!important',
+        'height:1px!important',
+        'overflow:visible!important',
+        'pointer-events:auto!important'
+    ].join(';');
+}
+return inputs.length;
+`
+
+// uploadResume tries to upload path to any file input on the current page.
+// It first reveals all hidden file inputs (a common ATS pattern where the real
+// <input type="file"> is hidden behind a drag-drop zone), then walks through
+// uploadSelectors from most specific to most generic, attempting SendKeys on
+// every matching element until one succeeds.  Logs the outcome either way.
+func uploadResume(wd selenium.WebDriver, path string) bool {
 	if path == "" {
 		return false
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
+		log.Printf("[upload] cannot resolve path %q: %v", path, err)
 		return false
 	}
 	if _, err := os.Stat(absPath); err != nil {
+		log.Printf("[upload] resume file not found: %q", absPath)
 		return false
 	}
-	els, err := wd.FindElements(selenium.ByCSSSelector, selector)
-	if err != nil || len(els) == 0 {
-		return false
+
+	// Reveal all hidden file inputs before FindElements so geckodriver can
+	// reach them.  Ignore errors — reveal is best-effort.
+	if n, err2 := wd.ExecuteScript(jsRevealFileInputs, nil); err2 == nil {
+		if cnt, ok := n.(float64); ok && cnt > 0 {
+			time.Sleep(150 * time.Millisecond) // let CSS transitions settle
+		}
 	}
-	_ = els[0].SendKeys(absPath)
-	return true
+
+	base := filepath.Base(absPath)
+	for _, sel := range uploadSelectors {
+		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+		if err != nil || len(els) == 0 {
+			continue
+		}
+		for _, el := range els {
+			if err := el.SendKeys(absPath); err != nil {
+				log.Printf("[upload] SendKeys failed on %q: %v", sel, err)
+				continue
+			}
+			log.Printf("[upload] %q uploaded via selector %q", base, sel)
+			return true
+		}
+	}
+
+	log.Printf("[upload] WARNING: no file input found on page — resume not uploaded")
+	return false
 }
 
 // jsVerifySubmission checks whether the page shows signs of a successful
