@@ -311,6 +311,47 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+// jsFill scrolls the first element matching a CSS selector into view, then
+// sets its value via the native HTMLInputElement/HTMLTextAreaElement prototype
+// setter and fires input/change/blur so React, Vue, and Angular frameworks
+// pick up the new value — plain SendKeys does not reliably trigger these.
+const jsFill = `
+var sel = arguments[0], val = arguments[1];
+var el  = document.querySelector(sel);
+if (!el) return;
+el.scrollIntoView({block: 'center'});
+try {
+    var proto  = el.tagName === 'TEXTAREA'
+        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(el, val);
+} catch (e) { el.value = val; }
+el.dispatchEvent(new Event('input',  {bubbles: true}));
+el.dispatchEvent(new Event('change', {bubbles: true}));
+el.dispatchEvent(new Event('blur',   {bubbles: true}));
+`
+
+// jsSubmit finds and clicks the most likely submit button via JS heuristics,
+// returning true when it clicked something.  Used as a last resort after all
+// CSS/XPath attempts fail.
+const jsSubmit = `
+var WORDS = /\b(submit|apply|send|complete|finish|confirm)\b/i;
+var all = Array.from(document.querySelectorAll(
+    'button[type="submit"], input[type="submit"], button, [role="button"]'
+));
+for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    if (el.disabled || el.offsetParent === null) continue;
+    var label = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    if (el.type === 'submit' || WORDS.test(label)) {
+        el.scrollIntoView({block: 'center'});
+        el.click();
+        return true;
+    }
+}
+return false;
+`
+
 // waitForElement polls for selector to match at least one element, returning
 // the first match or nil after timeout.  Requires implicit wait to be 0 so
 // each FindElements call returns immediately.
@@ -331,25 +372,32 @@ func waitForElement(ctx context.Context, wd selenium.WebDriver, selector string,
 	return nil
 }
 
-// setInput clicks, clears, and types value into the first element matching
-// selector.  Silently skips when selector matches nothing.
+// setInput fills the first element matching selector; silently skips when absent.
 func setInput(wd selenium.WebDriver, selector, value string) {
 	trySetInput(wd, selector, value)
 }
 
-// trySetInput is like setInput but returns true when an element was found and
-// filled, letting callers stop at the first successful selector.
+// trySetInput fills the first element matching selector, returning true when an
+// element was found.  It uses a JS native-setter approach as the primary path
+// (necessary for React/Vue controlled inputs) and falls back to WebDriver
+// Click/Clear/SendKeys when ExecuteScript is unavailable.
 func trySetInput(wd selenium.WebDriver, selector, value string) bool {
 	if value == "" {
 		return false
 	}
+	// Verify the element exists via WebDriver before going to JS so we can
+	// return false immediately when no match — JS querySelector would also
+	// return null, but checking here avoids a round-trip to the browser.
 	els, err := wd.FindElements(selenium.ByCSSSelector, selector)
 	if err != nil || len(els) == 0 {
 		return false
 	}
-	_ = els[0].Click() // focus triggers framework event handlers
-	_ = els[0].Clear()
-	_ = els[0].SendKeys(value)
+	if _, err = wd.ExecuteScript(jsFill, []interface{}{selector, value}); err != nil {
+		// JS unavailable — fall back to click / clear / SendKeys.
+		_ = els[0].Click()
+		_ = els[0].Clear()
+		_ = els[0].SendKeys(value)
+	}
 	return true
 }
 
@@ -379,13 +427,30 @@ func tryUploadFile(wd selenium.WebDriver, selector, path string) bool {
 	return true
 }
 
-// clickSubmit tries well-known CSS selectors then falls back to XPath text search.
+// submitButtonTexts covers the button labels used across ATS platforms.
+// Ordered from most specific to most generic to avoid false positives.
+var submitButtonTexts = []string{
+	"submit application", "submit my application",
+	"complete application", "complete my application",
+	"send application", "send my application",
+	"apply now", "apply for this job", "apply for this position",
+	"submit", "apply", "send", "complete", "finish", "confirm",
+}
+
+// clickSubmit tries CSS attribute selectors, XPath text search across all
+// common ATS button labels, and finally a JS heuristic as a last resort.
 func clickSubmit(wd selenium.WebDriver) error {
+	// 1. Attribute-based CSS — most reliable; not text-dependent.
 	for _, sel := range []string{
 		`button[type="submit"]`,
 		`input[type="submit"]`,
-		`button[data-qa="btn-submit"]`,
-		`button[data-testid*="submit"]`,
+		`button[data-qa*="submit" i]`,
+		`button[data-testid*="submit" i]`,
+		`button[data-testid*="apply" i]`,
+		`button[aria-label*="submit" i]`,
+		`button[aria-label*="apply" i]`,
+		`[role="button"][aria-label*="submit" i]`,
+		`[role="button"][aria-label*="apply" i]`,
 	} {
 		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
 		if err == nil && len(els) > 0 {
@@ -395,10 +460,12 @@ func clickSubmit(wd selenium.WebDriver) error {
 			}
 		}
 	}
-	for _, xpath := range []string{
-		`//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'submit')]`,
-		`//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'apply')]`,
-	} {
+
+	// 2. XPath text search — covers buttons labelled with human-readable text.
+	const lowerXPath = `translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')`
+	for _, phrase := range submitButtonTexts {
+		xpath := fmt.Sprintf(`//button[contains(%s,'%s')] | //a[contains(%s,'%s')]`,
+			lowerXPath, phrase, lowerXPath, phrase)
 		els, err := wd.FindElements(selenium.ByXPATH, xpath)
 		if err == nil && len(els) > 0 {
 			if cerr := els[0].Click(); cerr == nil {
@@ -407,6 +474,14 @@ func clickSubmit(wd selenium.WebDriver) error {
 			}
 		}
 	}
+
+	// 3. JS heuristic — last resort for non-standard markup.
+	res, err := wd.ExecuteScript(jsSubmit, nil)
+	if err == nil && res == true {
+		time.Sleep(2 * time.Second)
+		return nil
+	}
+
 	return fmt.Errorf("no submit button found on page")
 }
 
