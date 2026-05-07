@@ -221,113 +221,185 @@ func waitForWindowClose(ctx context.Context, wd selenium.WebDriver) {
 // ── ATS-specific form fillers ─────────────────────────────────────────────────
 
 func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
-	// Wait for the form to render before touching any field.
-	if waitForElement(ctx, wd, "#first_name", 15*time.Second) == nil {
-		return
-	}
+	waitForElement(ctx, wd, "#first_name", 8*time.Second)
 	first, last := splitName(info.Name)
-	setInput(wd, "#first_name", first)
-	setInput(wd, "#last_name", last)
-	setInput(wd, "#email", info.Email)
-	setInput(wd, "#phone", info.Phone)
-	setInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL)
+	if !trySetInput(wd, "#first_name", first) {
+		tryFillByLabel(wd, "first name", first)
+	}
+	if !trySetInput(wd, "#last_name", last) {
+		tryFillByLabel(wd, "last name", last)
+	}
+	if !trySetInput(wd, "#email", info.Email) {
+		tryFillByLabel(wd, "email", info.Email)
+	}
+	if !trySetInput(wd, "#phone", info.Phone) {
+		tryFillByLabel(wd, "phone", info.Phone)
+	}
+	if !trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
+		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
+	}
 	uploadFile(wd, `input[name="resume"]`, resumePath)
 }
 
 func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
-	if waitForElement(ctx, wd, `input[name="name"]`, 15*time.Second) == nil {
-		return
-	}
+	waitForElement(ctx, wd, `input[name="name"]`, 8*time.Second)
 	first, last := splitName(info.Name)
-	setInput(wd, `input[name="name"]`, info.Name)
-	setInput(wd, `input[placeholder*="First" i]`, first)
-	setInput(wd, `input[placeholder*="Last" i]`, last)
-	setInput(wd, `input[name="email"]`, info.Email)
-	setInput(wd, `input[name="phone"]`, info.Phone)
-	setInput(wd, `input[name="urls[LinkedIn]"]`, info.LinkedInURL)
-	// Lever exposes a single file input; try by name then fall back to type.
+	if !trySetInput(wd, `input[name="name"]`, info.Name) {
+		tryFillByLabel(wd, "full name", info.Name)
+	}
+	if !trySetInput(wd, `input[placeholder*="First" i]`, first) {
+		tryFillByLabel(wd, "first name", first)
+	}
+	if !trySetInput(wd, `input[placeholder*="Last" i]`, last) {
+		tryFillByLabel(wd, "last name", last)
+	}
+	if !trySetInput(wd, `input[name="email"]`, info.Email) {
+		tryFillByLabel(wd, "email", info.Email)
+	}
+	if !trySetInput(wd, `input[name="phone"]`, info.Phone) {
+		tryFillByLabel(wd, "phone", info.Phone)
+	}
+	if !trySetInput(wd, `input[name="urls[LinkedIn]"]`, info.LinkedInURL) {
+		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
+	}
 	if !tryUploadFile(wd, `input[name="resume"]`, resumePath) {
 		tryUploadFile(wd, `input[type="file"]`, resumePath)
 	}
 }
 
 func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
-	if waitForElement(ctx, wd, `input[name="name"]`, 15*time.Second) == nil {
-		return
+	waitForElement(ctx, wd, `input[name="name"]`, 8*time.Second)
+	if !trySetInput(wd, `input[name="name"]`, info.Name) {
+		tryFillByLabel(wd, "full name", info.Name)
 	}
-	setInput(wd, `input[name="name"]`, info.Name)
-	setInput(wd, `input[name="email"]`, info.Email)
-	setInput(wd, `input[name="phone"]`, info.Phone)
-	setInput(wd, `input[placeholder*="LinkedIn" i]`, info.LinkedInURL)
+	if !trySetInput(wd, `input[name="email"]`, info.Email) {
+		tryFillByLabel(wd, "email", info.Email)
+	}
+	if !trySetInput(wd, `input[name="phone"]`, info.Phone) {
+		tryFillByLabel(wd, "phone", info.Phone)
+	}
+	if !trySetInput(wd, `input[placeholder*="LinkedIn" i]`, info.LinkedInURL) {
+		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
+	}
 	uploadFile(wd, `input[type="file"]`, resumePath)
 }
 
 func fillBambooHR(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
-	if waitForElement(ctx, wd, `input[id*="firstName" i]`, 15*time.Second) == nil {
-		return
-	}
+	waitForElement(ctx, wd, `input[id*="firstName" i]`, 8*time.Second)
 	first, last := splitName(info.Name)
-	setInput(wd, `input[id*="firstName" i]`, first)
-	setInput(wd, `input[id*="lastName" i]`, last)
-	setInput(wd, `input[id*="email" i]`, info.Email)
-	setInput(wd, `input[id*="phone" i]`, info.Phone)
+	if !trySetInput(wd, `input[id*="firstName" i]`, first) {
+		tryFillByLabel(wd, "first name", first)
+	}
+	if !trySetInput(wd, `input[id*="lastName" i]`, last) {
+		tryFillByLabel(wd, "last name", last)
+	}
+	if !trySetInput(wd, `input[id*="email" i]`, info.Email) {
+		tryFillByLabel(wd, "email", info.Email)
+	}
+	if !trySetInput(wd, `input[id*="phone" i]`, info.Phone) {
+		tryFillByLabel(wd, "phone", info.Phone)
+	}
 	uploadFile(wd, `input[type="file"]`, resumePath)
 }
 
 func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
-	// Wait for at least one text input to appear before trying to fill.
-	if waitForElement(ctx, wd, `input[type="text"], input[type="email"], input[name]`, 15*time.Second) == nil {
-		return
-	}
+	waitForElement(ctx, wd, `input[type="text"], input[type="email"], input[name]`, 8*time.Second)
 	first, last := splitName(info.Name)
 
-	// For each logical field, try selectors in priority order and stop at the first hit.
+	// For each field: try attribute-based selectors first, then label-based
+	// fallback for React/Vue forms that expose no standard name/id attributes.
+	filled := false
 	for _, sel := range []string{
 		`input[name*="first" i]`, `input[placeholder*="First name" i]`,
 		`input[id*="first" i]`, `input[aria-label*="First" i]`,
 	} {
 		if trySetInput(wd, sel, first) {
+			filled = true
 			break
 		}
 	}
+	if !filled {
+		if !tryFillByLabel(wd, "first name", first) {
+			tryFillByLabel(wd, "given name", first)
+		}
+	}
+
+	filled = false
 	for _, sel := range []string{
 		`input[name*="last" i]`, `input[placeholder*="Last name" i]`,
 		`input[id*="last" i]`, `input[aria-label*="Last" i]`,
 	} {
 		if trySetInput(wd, sel, last) {
+			filled = true
 			break
 		}
 	}
+	if !filled {
+		if !tryFillByLabel(wd, "last name", last) {
+			tryFillByLabel(wd, "family name", last)
+		}
+	}
+
+	filled = false
 	for _, sel := range []string{
 		`input[name="name"]`, `input[placeholder*="Full name" i]`,
+		`input[placeholder*="Your name" i]`,
 	} {
 		if trySetInput(wd, sel, info.Name) {
+			filled = true
 			break
 		}
 	}
+	if !filled {
+		if !tryFillByLabel(wd, "full name", info.Name) {
+			tryFillByLabel(wd, "your name", info.Name)
+		}
+	}
+
+	filled = false
 	for _, sel := range []string{
 		`input[type="email"]`, `input[name*="email" i]`,
 		`input[placeholder*="email" i]`, `input[id*="email" i]`,
 	} {
 		if trySetInput(wd, sel, info.Email) {
+			filled = true
 			break
 		}
 	}
+	if !filled {
+		tryFillByLabel(wd, "email", info.Email)
+	}
+
+	filled = false
 	for _, sel := range []string{
 		`input[type="tel"]`, `input[name*="phone" i]`,
 		`input[placeholder*="phone" i]`, `input[id*="phone" i]`,
 	} {
 		if trySetInput(wd, sel, info.Phone) {
+			filled = true
 			break
 		}
 	}
+	if !filled {
+		if !tryFillByLabel(wd, "phone", info.Phone) {
+			tryFillByLabel(wd, "mobile", info.Phone)
+		}
+	}
+
+	filled = false
 	for _, sel := range []string{
 		`input[placeholder*="LinkedIn" i]`, `input[name*="linkedin" i]`,
+		`input[id*="linkedin" i]`, `input[aria-label*="LinkedIn" i]`,
 	} {
 		if trySetInput(wd, sel, info.LinkedInURL) {
+			filled = true
 			break
 		}
 	}
+	if !filled {
+		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
+	}
+
 	uploadFile(wd, `input[type="file"]`, resumePath)
 }
 
@@ -472,10 +544,23 @@ func detectDeadPage(wd selenium.WebDriver) error {
 	return nil
 }
 
-// formReadySelector matches visible text/email/tel inputs and textareas that
-// signal the application form has rendered.  Deliberately excludes
-// input[name] without a type to avoid hidden system fields (CSRF tokens etc.).
+// formReadySelector matches any visible text/email/tel input or textarea.
+// Used as the post-fill-click wait target (broad enough to catch any activity).
 const formReadySelector = `input[type="text"], input[type="email"], input[type="tel"], textarea`
+
+// appFormSelector is tighter than formReadySelector: it only matches inputs
+// that are characteristic of job application forms (email, first/last name).
+// Used to decide whether an application form is present before trying to click
+// an "Apply" button, so that search bars and cookie-consent inputs don't
+// trigger a false "form already loaded" early exit.
+const appFormSelector = `input[type="email"],` +
+	`input[name*="email" i],` +
+	`input[name*="first" i],` +
+	`input[name*="last" i],` +
+	`input[name="name"],` +
+	`input[id*="email" i],` +
+	`input[id*="firstname" i],` +
+	`input[id*="first_name" i]`
 
 // clickPreApplyIfNeeded detects the "job description first, form second"
 // pattern: if the page has no form inputs yet it looks for an "Apply" trigger
@@ -484,8 +569,11 @@ const formReadySelector = `input[type="text"], input[type="email"], input[type="
 // appeared — the caller's waitForElement inside the fill function will handle
 // the remaining wait).
 func clickPreApplyIfNeeded(ctx context.Context, wd selenium.WebDriver) bool {
-	// Fast exit: form inputs already in the DOM — nothing to trigger.
-	els, _ := wd.FindElements(selenium.ByCSSSelector, formReadySelector)
+	// Fast exit: an application-specific form is already in the DOM.
+	// Uses appFormSelector (email / name inputs) rather than formReadySelector
+	// so that search bars, cookie banners, and nav inputs don't cause a false
+	// "form already loaded" result that skips the actual Apply button.
+	els, _ := wd.FindElements(selenium.ByCSSSelector, appFormSelector)
 	if len(els) > 0 {
 		return false
 	}
@@ -499,6 +587,7 @@ func clickPreApplyIfNeeded(ctx context.Context, wd selenium.WebDriver) bool {
 		`a[id*="apply-btn" i]`, `a[id*="btn-apply" i]`,
 		`button[class*="apply-btn" i]`, `a[class*="apply-btn" i]`,
 		`[data-automation*="apply" i]`,
+		`button[data-testid*="apply" i]`, `a[data-testid*="apply" i]`,
 	} {
 		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
 		if err == nil && len(els) > 0 {
@@ -516,9 +605,15 @@ func clickPreApplyIfNeeded(ctx context.Context, wd selenium.WebDriver) bool {
 		for _, phrase := range []string{
 			"apply to this job",
 			"apply for this position",
+			"apply for this role",
 			"apply for this job",
+			"start your application",
+			"start application",
+			"begin application",
 			"apply with linkedin",
 			"apply with resume",
+			"quick apply",
+			"1-click apply",
 			"apply now",
 			"easy apply",
 		} {
@@ -547,7 +642,7 @@ func clickPreApplyIfNeeded(ctx context.Context, wd selenium.WebDriver) bool {
 	// 3. JS fallback — skips nav/header/footer to reduce false positives.
 	if !clicked {
 		const jsApply = `
-var MULTI = /\b(apply\s+(?:to\s+this\s+(?:job|position)|for\s+this\s+(?:job|position)|now|with\s+\S+)|easy\s+apply)\b/i;
+var MULTI = /\b(apply\s+(?:to\s+this\s+(?:job|position|role)|for\s+this\s+(?:job|position|role)|now|with\s+\S+)|easy\s+apply|quick\s+apply|(?:start|begin)\s+(?:your\s+)?application|1[\s-]click\s+apply)\b/i;
 var BARE  = /^\s*apply\s*$/i;
 var all = Array.from(document.querySelectorAll('button, a[href], [role="button"]'));
 for (var i = 0; i < all.length; i++) {
@@ -569,8 +664,8 @@ return false;`
 	}
 
 	if clicked {
-		// Give the form time to animate in / load before the caller's fill
-		// function runs its own waitForElement.
+		// Give the form time to animate in / load (use broad formReadySelector
+		// here since any text input signals that rendering has started).
 		waitForElement(ctx, wd, formReadySelector, 10*time.Second)
 	}
 	return clicked
@@ -582,7 +677,10 @@ return false;`
 // pick up the new value — plain SendKeys does not reliably trigger these.
 const jsFill = `
 var sel = arguments[0], val = arguments[1];
-var el  = document.querySelector(sel);
+var els = document.querySelectorAll(sel), el = null;
+for (var i = 0; i < els.length; i++) {
+    if (!els[i].disabled && els[i].offsetParent !== null) { el = els[i]; break; }
+}
 if (!el) return;
 el.scrollIntoView({block: 'center'});
 try {
@@ -595,6 +693,47 @@ el.dispatchEvent(new Event('input',  {bubbles: true}));
 el.dispatchEvent(new Event('change', {bubbles: true}));
 el.dispatchEvent(new Event('blur',   {bubbles: true}));
 `
+
+// jsFillByLabel finds the first visible input associated with a <label> whose
+// text contains the given needle (case-insensitive), fills it with val using
+// the same native-setter approach as jsFill, and returns true on success.
+// This is the most reliable fallback for React/Vue forms that expose no
+// standard name/id/placeholder attributes but do have visible labels.
+const jsFillByLabel = `
+var needle = arguments[0].toLowerCase(), val = arguments[1];
+var labels = document.querySelectorAll('label');
+for (var i = 0; i < labels.length; i++) {
+    var l = labels[i];
+    if (l.textContent.trim().toLowerCase().indexOf(needle) === -1) continue;
+    var inp = null;
+    var fid = l.getAttribute('for');
+    if (fid) inp = document.getElementById(fid);
+    if (!inp) inp = l.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea');
+    if (!inp || inp.disabled || inp.offsetParent === null) continue;
+    inp.scrollIntoView({block: 'center'});
+    try {
+        var proto = inp.tagName === 'TEXTAREA'
+            ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+        setter.call(inp, val);
+    } catch(e) { inp.value = val; }
+    inp.dispatchEvent(new Event('input',  {bubbles: true}));
+    inp.dispatchEvent(new Event('change', {bubbles: true}));
+    inp.dispatchEvent(new Event('blur',   {bubbles: true}));
+    return true;
+}
+return false;
+`
+
+// tryFillByLabel fills the input whose label text contains labelText.
+// Returns true when an element was found and filled.
+func tryFillByLabel(wd selenium.WebDriver, labelText, value string) bool {
+	if value == "" {
+		return false
+	}
+	res, err := wd.ExecuteScript(jsFillByLabel, []interface{}{labelText, value})
+	return err == nil && res == true
+}
 
 // jsSubmit finds and clicks the most likely submit button via JS heuristics,
 // returning true when it clicked something.  Used as a last resort after all
