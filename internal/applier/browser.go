@@ -138,22 +138,25 @@ func (b *Browser) FillApplication(
 		return ctx.Err()
 	}
 
-	// Bail out early for dead pages (404s, expired postings, filled roles, etc.)
-	// before spending time on captcha solving, pre-apply clicks, and form filling.
-	if err := detectDeadPage(wd); err != nil {
-		return err
-	}
-
 	// Many job-description pages show the posting first and only reveal the
 	// application form after the visitor clicks "Apply to this Job" or similar.
 	// Detect this pattern and click through before attempting to fill.
 	clickPreApplyIfNeeded(ctx, wd)
 
-	// After the pre-apply click (or when there was none), verify a form is
-	// actually present.  If nothing rendered, the job is definitively closed,
-	// removed, or on a platform we can't handle — bail now rather than
-	// running the fill routine against an empty page.
-	if fels, _ := wd.FindElements(selenium.ByCSSSelector, formReadySelector); len(fels) == 0 {
+	// Verify a form is present.  clickPreApplyIfNeeded only waits when it
+	// performs a click; give slow SPAs an extra window to finish rendering.
+	var formEls []selenium.WebElement
+	if formEls, _ = wd.FindElements(selenium.ByCSSSelector, formReadySelector); len(formEls) == 0 {
+		waitForElement(ctx, wd, formReadySelector, 5*time.Second)
+		formEls, _ = wd.FindElements(selenium.ByCSSSelector, formReadySelector)
+	}
+	if len(formEls) == 0 {
+		// Only run phrase/status detection when there is no form — this avoids
+		// false positives on pages that have a "no longer available" notice in
+		// a footer or sidebar while still showing a live application form.
+		if err := detectDeadPage(wd); err != nil {
+			return err
+		}
 		return fmt.Errorf("no application form found on page (job may be closed or removed)")
 	}
 
@@ -405,10 +408,10 @@ try {
         'h1','h2','h3','h4',
         '[role="alert"]','[role="status"]','[aria-live]',
         'main p','article p',
-        '[class*="error" i]','[class*="expired" i]','[class*="closed" i]',
-        '[class*="not-found" i]','[class*="unavailable" i]','[class*="filled" i]',
+        '[class*="expired" i]','[class*="closed" i]',
+        '[class*="not-found" i]','[class*="unavailable" i]',
         '[class*="empty-state" i]','[class*="empty_state" i]',
-        '[id*="error" i]','[id*="expired" i]','[id*="not-found" i]'
+        '[id*="expired" i]','[id*="not-found" i]'
     ];
     selectors.forEach(function(s) {
         try {
