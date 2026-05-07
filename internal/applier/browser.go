@@ -92,7 +92,7 @@ func (b *Browser) FillApplication(
 	info ApplicantInfo,
 	resumePath string,
 	flags FillFlags,
-) error {
+) (retErr error) {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -101,7 +101,21 @@ func (b *Browser) FillApplication(
 	if err != nil {
 		return fmt.Errorf("open Firefox session: %w", err)
 	}
-	defer wd.Quit()
+	// In headful/hold mode keep the browser visible long enough to be useful
+	// when an error occurs — otherwise defer wd.Quit() closes it instantly.
+	defer func() {
+		if retErr != nil {
+			if flags.Hold {
+				log.Printf("[hold] error — close the Firefox window to continue: %v", retErr)
+				waitForWindowClose(ctx, wd)
+				retErr = nil
+			} else if flags.Headful {
+				log.Printf("[apply] headful error — keeping browser open 10 s: %v", retErr)
+				time.Sleep(10 * time.Second)
+			}
+		}
+		_ = wd.Quit()
+	}()
 
 	_ = wd.SetPageLoadTimeout(30 * time.Second)
 	// Zero implicit wait so FindElements returns immediately for absent fields
@@ -147,7 +161,7 @@ func (b *Browser) FillApplication(
 	// Hold mode: keep the window open until the user closes it.
 	// Takes priority over everything else — no auto-submit.
 	if flags.Hold {
-		waitForWindowClose(wd)
+		waitForWindowClose(ctx, wd)
 		return nil
 	}
 
@@ -162,13 +176,18 @@ func (b *Browser) FillApplication(
 	return clickSubmit(wd)
 }
 
-// waitForWindowClose blocks until the user closes the Firefox window.
-// It polls window handles every 500 ms; when geckodriver reports no open
-// windows (or returns an error because the session ended), the function returns.
-func waitForWindowClose(wd selenium.WebDriver) {
+// waitForWindowClose blocks until the user closes the Firefox window or ctx is
+// cancelled.  It polls window handles every 500 ms; when geckodriver reports no
+// open windows (or returns an error because the session ended), the function
+// returns.
+func waitForWindowClose(ctx context.Context, wd selenium.WebDriver) {
 	fmt.Println("[hold] Form filled — close the Firefox window to move to the next URL")
 	for {
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
 		handles, err := wd.WindowHandles()
 		if err != nil || len(handles) == 0 {
 			log.Printf("[hold] window closed — proceeding to next URL")

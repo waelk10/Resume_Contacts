@@ -1,9 +1,13 @@
 package extractor
 
 import (
+	"context"
 	"html"
+	"net"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 )
 
 var emailRe = regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
@@ -16,8 +20,16 @@ var skipPrefixes = []string{
 	"mailer-daemon", "unsubscribe", "notifications",
 }
 
+// dnsCache stores per-domain resolution results for the lifetime of the process,
+// avoiding redundant DNS round-trips for the same domain.
+var (
+	dnsCache   = make(map[string]bool)
+	dnsCacheMu sync.RWMutex
+)
+
 // ExtractEmails pulls unique, valid email addresses from raw text or HTML.
 // HTML entities (e.g. &#64;) are decoded before matching.
+// Each extracted domain is validated via DNS before the address is accepted.
 func ExtractEmails(text string) []string {
 	text = html.UnescapeString(text)
 	raw := emailRe.FindAllString(text, -1)
@@ -66,5 +78,33 @@ func isValid(email string) bool {
 	if !strings.Contains(domain, ".") {
 		return false
 	}
-	return true
+	return domainResolves(domain)
+}
+
+// domainResolves returns true when domain has at least one MX record or, as a
+// fallback for organisations that send from their web host, at least one A/AAAA
+// record.  A 5 s deadline prevents slow DNS from stalling the scraper.
+// Results are cached for the lifetime of the process.
+func domainResolves(domain string) bool {
+	dnsCacheMu.RLock()
+	if result, ok := dnsCache[domain]; ok {
+		dnsCacheMu.RUnlock()
+		return result
+	}
+	dnsCacheMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result := false
+	if mx, err := net.DefaultResolver.LookupMX(ctx, domain); err == nil && len(mx) > 0 {
+		result = true
+	} else if addrs, err := net.DefaultResolver.LookupHost(ctx, domain); err == nil && len(addrs) > 0 {
+		result = true
+	}
+
+	dnsCacheMu.Lock()
+	dnsCache[domain] = result
+	dnsCacheMu.Unlock()
+	return result
 }
