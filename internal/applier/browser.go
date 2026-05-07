@@ -143,11 +143,20 @@ func (b *Browser) FillApplication(
 	// Detect this pattern and click through before attempting to fill.
 	clickPreApplyIfNeeded(ctx, wd)
 
-	// Verify a form is present.  clickPreApplyIfNeeded only waits when it
-	// performs a click; give slow SPAs an extra window to finish rendering.
+	// Verify a real application form is present.  Primary check uses
+	// appFormSelector (email / name inputs) because formReadySelector is too
+	// broad: a search bar or cookie banner already in the DOM satisfies it even
+	// when the actual form modal hasn't rendered yet.
+	// Fall back to formReadySelector only for unusual forms without email/name
+	// inputs (e.g. resume-only uploads, cover-letter-only pages).
 	var formEls []selenium.WebElement
-	if formEls, _ = wd.FindElements(selenium.ByCSSSelector, formReadySelector); len(formEls) == 0 {
-		waitForElement(ctx, wd, formReadySelector, 5*time.Second)
+	if formEls, _ = wd.FindElements(selenium.ByCSSSelector, appFormSelector); len(formEls) == 0 {
+		waitForElement(ctx, wd, appFormSelector, 8*time.Second)
+		formEls, _ = wd.FindElements(selenium.ByCSSSelector, appFormSelector)
+	}
+	if len(formEls) == 0 {
+		// appFormSelector didn't match — last resort: check for any text input
+		// so unusual ATS forms (no email/name field) are not incorrectly rejected.
 		formEls, _ = wd.FindElements(selenium.ByCSSSelector, formReadySelector)
 	}
 	if len(formEls) == 0 {
@@ -268,17 +277,35 @@ func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 }
 
 func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
-	waitForElement(ctx, wd, `input[name="name"]`, 8*time.Second)
-	if !trySetInput(wd, `input[name="name"]`, info.Name) {
-		tryFillByLabel(wd, "full name", info.Name)
+	// Wait for the name or email field — whichever appears first.
+	// Using a compound selector so we're not blocked on a single ID/name variant.
+	waitForElement(ctx, wd,
+		`input[name="name"], input[autocomplete="name"], input[type="email"], input[autocomplete="email"]`,
+		12*time.Second)
+
+	// Name — try every known Ashby variant before falling back to label text.
+	if !trySetInput(wd, `input[name="name"]`, info.Name) &&
+		!trySetInput(wd, `input[autocomplete="name"]`, info.Name) &&
+		!trySetInput(wd, `input[placeholder*="name" i]`, info.Name) {
+		if !tryFillByLabel(wd, "full name", info.Name) {
+			tryFillByLabel(wd, "name", info.Name)
+		}
 	}
-	if !trySetInput(wd, `input[name="email"]`, info.Email) {
+	// Email
+	if !trySetInput(wd, `input[name="email"]`, info.Email) &&
+		!trySetInput(wd, `input[type="email"]`, info.Email) &&
+		!trySetInput(wd, `input[autocomplete="email"]`, info.Email) {
 		tryFillByLabel(wd, "email", info.Email)
 	}
-	if !trySetInput(wd, `input[name="phone"]`, info.Phone) {
+	// Phone
+	if !trySetInput(wd, `input[name="phone"]`, info.Phone) &&
+		!trySetInput(wd, `input[type="tel"]`, info.Phone) &&
+		!trySetInput(wd, `input[autocomplete="tel"]`, info.Phone) {
 		tryFillByLabel(wd, "phone", info.Phone)
 	}
-	if !trySetInput(wd, `input[placeholder*="LinkedIn" i]`, info.LinkedInURL) {
+	// LinkedIn
+	if !trySetInput(wd, `input[placeholder*="LinkedIn" i]`, info.LinkedInURL) &&
+		!trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
 	uploadFile(wd, `input[type="file"]`, resumePath)
@@ -553,11 +580,16 @@ const formReadySelector = `input[type="text"], input[type="email"], input[type="
 // Used to decide whether an application form is present before trying to click
 // an "Apply" button, so that search bars and cookie-consent inputs don't
 // trigger a false "form already loaded" early exit.
+// Also used as the post-click wait target so that a search bar already in the
+// DOM (when Apply opens a modal overlay on the same page) doesn't cause the
+// wait to return before the actual form fields have rendered.
 const appFormSelector = `input[type="email"],` +
 	`input[name*="email" i],` +
+	`input[autocomplete="email"],` +
 	`input[name*="first" i],` +
 	`input[name*="last" i],` +
 	`input[name="name"],` +
+	`input[autocomplete="name"],` +
 	`input[id*="email" i],` +
 	`input[id*="firstname" i],` +
 	`input[id*="first_name" i]`
@@ -664,9 +696,11 @@ return false;`
 	}
 
 	if clicked {
-		// Give the form time to animate in / load (use broad formReadySelector
-		// here since any text input signals that rendering has started).
-		waitForElement(ctx, wd, formReadySelector, 10*time.Second)
+		// Wait for application-specific inputs (email / name fields) rather than
+		// any text input.  When Apply opens a modal overlay the underlying page
+		// may already have a search bar that would satisfy formReadySelector
+		// immediately, before the modal's own fields have rendered.
+		waitForElement(ctx, wd, appFormSelector, 12*time.Second)
 	}
 	return clicked
 }
