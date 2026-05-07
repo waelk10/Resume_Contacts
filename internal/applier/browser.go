@@ -138,6 +138,11 @@ func (b *Browser) FillApplication(
 		return ctx.Err()
 	}
 
+	// Many job-description pages show the posting first and only reveal the
+	// application form after the visitor clicks "Apply to this Job" or similar.
+	// Detect this pattern and click through before attempting to fill.
+	clickPreApplyIfNeeded(ctx, wd)
+
 	switch job.ATSPlatform {
 	case "greenhouse":
 		fillGreenhouse(ctx, wd, info, resumePath)
@@ -310,6 +315,110 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// formReadySelector matches visible text/email/tel inputs and textareas that
+// signal the application form has rendered.  Deliberately excludes
+// input[name] without a type to avoid hidden system fields (CSRF tokens etc.).
+const formReadySelector = `input[type="text"], input[type="email"], input[type="tel"], textarea`
+
+// clickPreApplyIfNeeded detects the "job description first, form second"
+// pattern: if the page has no form inputs yet it looks for an "Apply" trigger
+// button, clicks it, then waits up to 10 s for the form to appear.
+// Returns true when it performed a click (regardless of whether the form
+// appeared — the caller's waitForElement inside the fill function will handle
+// the remaining wait).
+func clickPreApplyIfNeeded(ctx context.Context, wd selenium.WebDriver) bool {
+	// Fast exit: form inputs already in the DOM — nothing to trigger.
+	els, _ := wd.FindElements(selenium.ByCSSSelector, formReadySelector)
+	if len(els) > 0 {
+		return false
+	}
+
+	clicked := false
+
+	// 1. Attribute-based CSS — highest precision, platform-specific IDs/classes.
+	for _, sel := range []string{
+		`button[data-qa*="apply" i]`, `a[data-qa*="apply" i]`,
+		`button[id*="apply-btn" i]`, `button[id*="btn-apply" i]`,
+		`a[id*="apply-btn" i]`, `a[id*="btn-apply" i]`,
+		`button[class*="apply-btn" i]`, `a[class*="apply-btn" i]`,
+		`[data-automation*="apply" i]`,
+	} {
+		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+		if err == nil && len(els) > 0 {
+			if els[0].Click() == nil {
+				clicked = true
+				break
+			}
+		}
+	}
+
+	// 2. XPath text — longest phrases first to avoid matching sub-strings in
+	// unrelated elements (e.g. "Browse and apply" matching "apply").
+	if !clicked {
+		const lc = `translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')`
+		for _, phrase := range []string{
+			"apply to this job",
+			"apply for this position",
+			"apply for this job",
+			"apply with linkedin",
+			"apply with resume",
+			"apply now",
+			"easy apply",
+		} {
+			xpath := fmt.Sprintf(`(//button|//a)[contains(%s,'%s')]`, lc, phrase)
+			els, err := wd.FindElements(selenium.ByXPATH, xpath)
+			if err == nil && len(els) > 0 {
+				if els[0].Click() == nil {
+					clicked = true
+					break
+				}
+			}
+		}
+		// Bare "apply" only when the entire label is exactly that word, to
+		// prevent matching navigation links like "Jobs / Apply" breadcrumbs.
+		if !clicked {
+			xpath := fmt.Sprintf(`(//button|//a)[%s='apply']`, lc)
+			els, err := wd.FindElements(selenium.ByXPATH, xpath)
+			if err == nil && len(els) > 0 {
+				if els[0].Click() == nil {
+					clicked = true
+				}
+			}
+		}
+	}
+
+	// 3. JS fallback — skips nav/header/footer to reduce false positives.
+	if !clicked {
+		const jsApply = `
+var MULTI = /\b(apply\s+(?:to\s+this\s+(?:job|position)|for\s+this\s+(?:job|position)|now|with\s+\S+)|easy\s+apply)\b/i;
+var BARE  = /^\s*apply\s*$/i;
+var all = Array.from(document.querySelectorAll('button, a[href], [role="button"]'));
+for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    if (el.disabled || el.offsetParent === null) continue;
+    if (el.closest('nav, header, footer, [role="navigation"]')) continue;
+    var t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    if (MULTI.test(t) || BARE.test(t)) {
+        el.scrollIntoView({block: 'center'});
+        el.click();
+        return true;
+    }
+}
+return false;`
+		res, err := wd.ExecuteScript(jsApply, nil)
+		if err == nil && res == true {
+			clicked = true
+		}
+	}
+
+	if clicked {
+		// Give the form time to animate in / load before the caller's fill
+		// function runs its own waitForElement.
+		waitForElement(ctx, wd, formReadySelector, 10*time.Second)
+	}
+	return clicked
+}
 
 // jsFill scrolls the first element matching a CSS selector into view, then
 // sets its value via the native HTMLInputElement/HTMLTextAreaElement prototype
