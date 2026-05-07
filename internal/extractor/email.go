@@ -1,18 +1,19 @@
 package extractor
 
 import (
-	"context"
 	"html"
-	"net"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	emailverifier "github.com/AfterShip/email-verifier"
 )
 
 var emailRe = regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
 
 // skipPrefixes are local-parts that belong to system/role addresses, not people.
+// They are checked before any network call as a fast pre-filter.
 var skipPrefixes = []string{
 	"noreply", "no-reply", "donotreply", "do-not-reply",
 	"admin", "webmaster", "postmaster", "abuse",
@@ -20,16 +21,42 @@ var skipPrefixes = []string{
 	"mailer-daemon", "unsubscribe", "notifications",
 }
 
-// dnsCache stores per-domain resolution results for the lifetime of the process,
-// avoiding redundant DNS round-trips for the same domain.
 var (
-	dnsCache   = make(map[string]bool)
-	dnsCacheMu sync.RWMutex
+	gVerifier    *emailverifier.Verifier
+	gVerifierMu  sync.RWMutex
+	gSMTPEnabled bool
 )
+
+func init() {
+	gVerifier = newVerifier(false)
+}
+
+func newVerifier(smtp bool) *emailverifier.Verifier {
+	v := emailverifier.NewVerifier().
+		DisableGravatarCheck().
+		DisableDomainSuggest().
+		DisableAutoUpdateDisposable().
+		ConnectTimeout(5 * time.Second).
+		OperationTimeout(7 * time.Second)
+	if smtp {
+		return v.EnableSMTPCheck()
+	}
+	return v.DisableSMTPCheck()
+}
+
+// EnableSMTP switches on SMTP verification for subsequent ExtractEmails calls.
+// Call once at startup, before scraper goroutines begin.
+func EnableSMTP() {
+	gVerifierMu.Lock()
+	defer gVerifierMu.Unlock()
+	gVerifier = newVerifier(true)
+	gSMTPEnabled = true
+}
 
 // ExtractEmails pulls unique, valid email addresses from raw text or HTML.
 // HTML entities (e.g. &#64;) are decoded before matching.
-// Each extracted domain is validated via DNS before the address is accepted.
+// Each address is validated for syntax, MX records, disposability, and role
+// account status; when --smtp-verify is active, SMTP deliverability is checked too.
 func ExtractEmails(text string) []string {
 	text = html.UnescapeString(text)
 	raw := emailRe.FindAllString(text, -1)
@@ -67,44 +94,34 @@ func isValid(email string) bool {
 	if at < 1 {
 		return false
 	}
+	// Fast pre-filter: skip known system/role local-parts without any network call.
 	local := email[:at]
 	for _, prefix := range skipPrefixes {
 		if local == prefix || strings.HasPrefix(local, prefix) {
 			return false
 		}
 	}
-	// Reject bare TLD-only domains (e.g. x@com)
-	domain := email[at+1:]
-	if !strings.Contains(domain, ".") {
+	// Reject bare TLD-only domains (e.g. x@com).
+	if !strings.Contains(email[at+1:], ".") {
 		return false
 	}
-	return domainResolves(domain)
-}
 
-// domainResolves returns true when domain has at least one MX record or, as a
-// fallback for organisations that send from their web host, at least one A/AAAA
-// record.  A 5 s deadline prevents slow DNS from stalling the scraper.
-// Results are cached for the lifetime of the process.
-func domainResolves(domain string) bool {
-	dnsCacheMu.RLock()
-	if result, ok := dnsCache[domain]; ok {
-		dnsCacheMu.RUnlock()
-		return result
+	gVerifierMu.RLock()
+	v := gVerifier
+	smtpOn := gSMTPEnabled
+	gVerifierMu.RUnlock()
+
+	result, err := v.Verify(email)
+	if err != nil {
+		return false
 	}
-	dnsCacheMu.RUnlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	result := false
-	if mx, err := net.DefaultResolver.LookupMX(ctx, domain); err == nil && len(mx) > 0 {
-		result = true
-	} else if addrs, err := net.DefaultResolver.LookupHost(ctx, domain); err == nil && len(addrs) > 0 {
-		result = true
+	if !result.Syntax.Valid || !result.HasMxRecords || result.Disposable || result.RoleAccount {
+		return false
 	}
-
-	dnsCacheMu.Lock()
-	dnsCache[domain] = result
-	dnsCacheMu.Unlock()
-	return result
+	// When SMTP is active, reject addresses the server explicitly rejects
+	// (deliverable=false AND not catch-all).  Treat timeouts/unknowns as passing.
+	if smtpOn && result.SMTP != nil && !result.SMTP.Deliverable && !result.SMTP.CatchAll {
+		return false
+	}
+	return true
 }

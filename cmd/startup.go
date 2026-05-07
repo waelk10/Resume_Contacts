@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"Resume_Contacts_Scraper/internal/contact"
+	"Resume_Contacts_Scraper/internal/extractor"
 	"Resume_Contacts_Scraper/internal/output"
 	"Resume_Contacts_Scraper/internal/scraper"
 )
@@ -16,6 +17,9 @@ import (
 const outputDir = "contacts"
 
 func startup(f runFlags) {
+	if f.smtpVerify {
+		extractor.EnableSMTP()
+	}
 	cfg := scraper.DefaultConfig
 	cfg.Parallelism = f.concurrency
 	cfg.ExtraSeeds = mustLoadSeeds(f.seedsFile)

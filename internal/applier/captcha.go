@@ -23,15 +23,16 @@ var challengeTitles = []string{
 	"please wait",              // Generic
 }
 
-// challengeBodySelectors are DOM elements whose presence signals a challenge page.
+// challengeBodySelectors are DOM elements whose presence signals a WAF
+// challenge page.  Only include selectors that are exclusive to full-page
+// bot-protection walls — NOT embedded CAPTCHAs that appear inside normal
+// application forms (which would cause a false positive and block form filling).
 var challengeBodySelectors = []string{
-	"#cf-challenge-running",
-	"#cf-please-wait",
-	"#challenge-form",          // Cloudflare
-	"#challenge-stage",         // Cloudflare Turnstile
-	".cf-browser-verification",
-	".h-captcha",               // hCaptcha embedded
-	".g-recaptcha",             // reCAPTCHA embedded
+	"#cf-challenge-running",   // Cloudflare challenge active
+	"#cf-please-wait",         // Cloudflare waiting room
+	"#challenge-form",         // Cloudflare challenge form
+	"#challenge-stage",        // Cloudflare Turnstile
+	".cf-browser-verification", // Cloudflare browser check
 }
 
 // waitForChallenge checks whether the currently loaded page is a bot-protection

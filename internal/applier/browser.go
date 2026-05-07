@@ -140,15 +140,15 @@ func (b *Browser) FillApplication(
 
 	switch job.ATSPlatform {
 	case "greenhouse":
-		fillGreenhouse(wd, info, resumePath)
+		fillGreenhouse(ctx, wd, info, resumePath)
 	case "lever":
-		fillLever(wd, info, resumePath)
+		fillLever(ctx, wd, info, resumePath)
 	case "ashby":
-		fillAshby(wd, info, resumePath)
+		fillAshby(ctx, wd, info, resumePath)
 	case "bamboohr":
-		fillBambooHR(wd, info, resumePath)
+		fillBambooHR(ctx, wd, info, resumePath)
 	default:
-		fillGeneric(wd, info, resumePath)
+		fillGeneric(ctx, wd, info, resumePath)
 	}
 
 	if flags.Screenshot {
@@ -198,7 +198,11 @@ func waitForWindowClose(ctx context.Context, wd selenium.WebDriver) {
 
 // ── ATS-specific form fillers ─────────────────────────────────────────────────
 
-func fillGreenhouse(wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	// Wait for the form to render before touching any field.
+	if waitForElement(ctx, wd, "#first_name", 15*time.Second) == nil {
+		return
+	}
 	first, last := splitName(info.Name)
 	setInput(wd, "#first_name", first)
 	setInput(wd, "#last_name", last)
@@ -208,7 +212,10 @@ func fillGreenhouse(wd selenium.WebDriver, info ApplicantInfo, resumePath string
 	uploadFile(wd, `input[name="resume"]`, resumePath)
 }
 
-func fillLever(wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	if waitForElement(ctx, wd, `input[name="name"]`, 15*time.Second) == nil {
+		return
+	}
 	first, last := splitName(info.Name)
 	setInput(wd, `input[name="name"]`, info.Name)
 	setInput(wd, `input[placeholder*="First" i]`, first)
@@ -216,11 +223,16 @@ func fillLever(wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
 	setInput(wd, `input[name="email"]`, info.Email)
 	setInput(wd, `input[name="phone"]`, info.Phone)
 	setInput(wd, `input[name="urls[LinkedIn]"]`, info.LinkedInURL)
-	uploadFile(wd, `input[name="resume"]`, resumePath)
-	uploadFile(wd, `input[type="file"]`, resumePath)
+	// Lever exposes a single file input; try by name then fall back to type.
+	if !tryUploadFile(wd, `input[name="resume"]`, resumePath) {
+		tryUploadFile(wd, `input[type="file"]`, resumePath)
+	}
 }
 
-func fillAshby(wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	if waitForElement(ctx, wd, `input[name="name"]`, 15*time.Second) == nil {
+		return
+	}
 	setInput(wd, `input[name="name"]`, info.Name)
 	setInput(wd, `input[name="email"]`, info.Email)
 	setInput(wd, `input[name="phone"]`, info.Phone)
@@ -228,7 +240,10 @@ func fillAshby(wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
 	uploadFile(wd, `input[type="file"]`, resumePath)
 }
 
-func fillBambooHR(wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+func fillBambooHR(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	if waitForElement(ctx, wd, `input[id*="firstName" i]`, 15*time.Second) == nil {
+		return
+	}
 	first, last := splitName(info.Name)
 	setInput(wd, `input[id*="firstName" i]`, first)
 	setInput(wd, `input[id*="lastName" i]`, last)
@@ -237,78 +252,131 @@ func fillBambooHR(wd selenium.WebDriver, info ApplicantInfo, resumePath string) 
 	uploadFile(wd, `input[type="file"]`, resumePath)
 }
 
-func fillGeneric(wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	// Wait for at least one text input to appear before trying to fill.
+	if waitForElement(ctx, wd, `input[type="text"], input[type="email"], input[name]`, 15*time.Second) == nil {
+		return
+	}
 	first, last := splitName(info.Name)
 
+	// For each logical field, try selectors in priority order and stop at the first hit.
 	for _, sel := range []string{
 		`input[name*="first" i]`, `input[placeholder*="First name" i]`,
 		`input[id*="first" i]`, `input[aria-label*="First" i]`,
 	} {
-		setInput(wd, sel, first)
+		if trySetInput(wd, sel, first) {
+			break
+		}
 	}
 	for _, sel := range []string{
 		`input[name*="last" i]`, `input[placeholder*="Last name" i]`,
 		`input[id*="last" i]`, `input[aria-label*="Last" i]`,
 	} {
-		setInput(wd, sel, last)
+		if trySetInput(wd, sel, last) {
+			break
+		}
 	}
 	for _, sel := range []string{
 		`input[name="name"]`, `input[placeholder*="Full name" i]`,
 	} {
-		setInput(wd, sel, info.Name)
+		if trySetInput(wd, sel, info.Name) {
+			break
+		}
 	}
 	for _, sel := range []string{
 		`input[type="email"]`, `input[name*="email" i]`,
 		`input[placeholder*="email" i]`, `input[id*="email" i]`,
 	} {
-		setInput(wd, sel, info.Email)
+		if trySetInput(wd, sel, info.Email) {
+			break
+		}
 	}
 	for _, sel := range []string{
 		`input[type="tel"]`, `input[name*="phone" i]`,
 		`input[placeholder*="phone" i]`, `input[id*="phone" i]`,
 	} {
-		setInput(wd, sel, info.Phone)
+		if trySetInput(wd, sel, info.Phone) {
+			break
+		}
 	}
-	setInput(wd, `input[placeholder*="LinkedIn" i]`, info.LinkedInURL)
-	setInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL)
+	for _, sel := range []string{
+		`input[placeholder*="LinkedIn" i]`, `input[name*="linkedin" i]`,
+	} {
+		if trySetInput(wd, sel, info.LinkedInURL) {
+			break
+		}
+	}
 	uploadFile(wd, `input[type="file"]`, resumePath)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// setInput fills the first matching element; silently skips when absent.
-// Uses FindElements (plural) so a zero-result match returns immediately
-// without waiting for the implicit-wait timeout.
+// waitForElement polls for selector to match at least one element, returning
+// the first match or nil after timeout.  Requires implicit wait to be 0 so
+// each FindElements call returns immediately.
+func waitForElement(ctx context.Context, wd selenium.WebDriver, selector string, timeout time.Duration) selenium.WebElement {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		els, err := wd.FindElements(selenium.ByCSSSelector, selector)
+		if err == nil && len(els) > 0 {
+			return els[0]
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return nil
+}
+
+// setInput clicks, clears, and types value into the first element matching
+// selector.  Silently skips when selector matches nothing.
 func setInput(wd selenium.WebDriver, selector, value string) {
+	trySetInput(wd, selector, value)
+}
+
+// trySetInput is like setInput but returns true when an element was found and
+// filled, letting callers stop at the first successful selector.
+func trySetInput(wd selenium.WebDriver, selector, value string) bool {
 	if value == "" {
-		return
+		return false
 	}
 	els, err := wd.FindElements(selenium.ByCSSSelector, selector)
 	if err != nil || len(els) == 0 {
-		return
+		return false
 	}
+	_ = els[0].Click() // focus triggers framework event handlers
 	_ = els[0].Clear()
 	_ = els[0].SendKeys(value)
+	return true
 }
 
 // uploadFile sets a file-input to an absolute path.
 // geckodriver requires an absolute path to locate the file on disk.
 func uploadFile(wd selenium.WebDriver, selector, path string) {
+	tryUploadFile(wd, selector, path)
+}
+
+// tryUploadFile is like uploadFile but returns true when the element was found.
+func tryUploadFile(wd selenium.WebDriver, selector, path string) bool {
 	if path == "" {
-		return
+		return false
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return
+		return false
 	}
 	if _, err := os.Stat(absPath); err != nil {
-		return
+		return false
 	}
 	els, err := wd.FindElements(selenium.ByCSSSelector, selector)
 	if err != nil || len(els) == 0 {
-		return
+		return false
 	}
 	_ = els[0].SendKeys(absPath)
+	return true
 }
 
 // clickSubmit tries well-known CSS selectors then falls back to XPath text search.

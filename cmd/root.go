@@ -22,6 +22,7 @@ type runFlags struct {
 	seedsFile   string
 	countries   []string // ISO 3166-1 alpha-2 codes or region aliases; nil = all seeds
 	hops        int      // BFS depth for discover (ignored by start/pages)
+	smtpVerify  bool     // probe mail server to confirm address exists (start only)
 }
 
 func Execute() {
@@ -72,6 +73,8 @@ func parseFlags(cmd string) runFlags {
 	fs.StringVar(&s, "s", "", "path to a line-separated file of extra seed URLs (shorthand)")
 	fs.StringVar(&countriesRaw, "countries", "", "comma-separated country/region codes to restrict seeds")
 	fs.IntVar(&hops, "hops", 2, "BFS depth for discover: how many meta-source hops beyond the initial list (discover only)")
+	var smtpVerify bool
+	fs.BoolVar(&smtpVerify, "smtp-verify", false, "probe the mail server to confirm each address exists before saving (start only; slower)")
 	_ = fs.Parse(os.Args[2:])
 	if c < 1 {
 		c = 1
@@ -89,7 +92,7 @@ func parseFlags(cmd string) runFlags {
 			countries = append(countries, tok)
 		}
 	}
-	return runFlags{concurrency: c, seedsFile: s, countries: countries, hops: hops}
+	return runFlags{concurrency: c, seedsFile: s, countries: countries, hops: hops, smtpVerify: smtpVerify}
 }
 
 // loadSeedsFile reads a line-separated file of seed URLs.
@@ -141,6 +144,8 @@ Flags (start, pages, discover):
       --countries CODES   comma-separated country/region codes to restrict seeds
       --hops int          BFS depth for discover: extra meta-source hops beyond the initial
                           list (default 2, 0 = single-pass; ignored by start/pages)
+      --smtp-verify       probe each email's mail server to confirm the address exists before
+                          saving it (start only; adds latency, use on slow/targeted runs)
 
 Country codes (ISO 3166-1 alpha-2):
   Individual:  de at ch nl be lu fr es pt it gr mt gb ie
