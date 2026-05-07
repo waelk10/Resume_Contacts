@@ -13,7 +13,7 @@ const version = "0.1.0"
 
 const (
 	defaultConcurrency = 4
-	maxConcurrency     = 8
+	maxConcurrency     = 64
 )
 
 // runFlags holds the parsed flags common to the start, pages, and discover commands.
