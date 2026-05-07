@@ -92,6 +92,21 @@ func newTransport() *http.Transport {
 	}
 }
 
+// ctxTransport wraps a base RoundTripper and attaches a context to every
+// outgoing request.  When ctx is cancelled the transport tears down the
+// connection immediately instead of waiting for the full request timeout.
+type ctxTransport struct {
+	base http.RoundTripper
+	ctx  context.Context
+}
+
+func (t *ctxTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.ctx.Err() != nil {
+		return nil, t.ctx.Err()
+	}
+	return t.base.RoundTrip(req.WithContext(t.ctx))
+}
+
 func (c Config) parallelism() int {
 	if c.Parallelism < 1 {
 		return 1
@@ -189,7 +204,7 @@ func (e *Engine) runHN(ctx context.Context) {
 	seen := make(map[string]bool)
 
 	for {
-		threadID, err := hnLatestHiringID(client)
+		threadID, err := hnLatestHiringID(ctx, client)
 		if err != nil {
 			log.Printf("[hn] finding thread: %v", err)
 		} else if seen[threadID] {
@@ -213,7 +228,7 @@ func (e *Engine) runHN(ctx context.Context) {
 // processHNThread fetches all top-level comments for threadID and emits emails.
 // Returns early when ctx is cancelled.
 func (e *Engine) processHNThread(ctx context.Context, client *http.Client, threadID string) error {
-	thread, err := hnFetchItem(client, threadID)
+	thread, err := hnFetchItem(ctx, client, threadID)
 	if err != nil {
 		return fmt.Errorf("fetching thread: %w", err)
 	}
@@ -226,15 +241,17 @@ func (e *Engine) processHNThread(ctx context.Context, client *http.Client, threa
 		case <-ctx.Done():
 			wg.Wait()
 			return ctx.Err()
-		default:
+		case sem <- struct{}{}:
 		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(id int) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			item, err := hnFetchItem(client, fmt.Sprint(id))
+			if ctx.Err() != nil {
+				return
+			}
+			item, err := hnFetchItem(ctx, client, fmt.Sprint(id))
 			if err != nil || item.Text == "" {
 				return
 			}
@@ -246,7 +263,10 @@ func (e *Engine) processHNThread(ctx context.Context, client *http.Client, threa
 					Source: src,
 				})
 			}
-			time.Sleep(e.cfg.Delay / 4)
+			select {
+			case <-ctx.Done():
+			case <-time.After(e.cfg.Delay / 4):
+			}
 		}(kid)
 	}
 	wg.Wait()
@@ -268,7 +288,7 @@ func (e *Engine) runWeb(ctx context.Context) {
 		}
 
 		queue := newURLQueue()
-		c := e.newCollector(blocker, queue)
+		c := e.newCollector(ctx, blocker, queue)
 
 		for _, seed := range e.cfg.buildSeeds() {
 			u, err := url.Parse(seed)
@@ -304,15 +324,28 @@ func (e *Engine) runWeb(ctx context.Context) {
 // newCollector creates a fresh colly Collector wired to the given blocker and
 // queue. A new Collector resets colly's visited-URL cache so that seeds are
 // re-crawled each cycle without duplicating work within a single cycle.
-func (e *Engine) newCollector(blocker *domainBlocker, queue *urlQueue) *colly.Collector {
+//
+// ctx is attached to every outgoing HTTP request so that cancelling ctx
+// (e.g. Ctrl+C) causes the transport to abort in-flight connections
+// immediately, allowing c.Wait() to return within milliseconds.
+func (e *Engine) newCollector(ctx context.Context, blocker *domainBlocker, queue *urlQueue) *colly.Collector {
 	c := colly.NewCollector(
 		colly.MaxDepth(e.cfg.MaxDepth),
 		colly.Async(true),
 		colly.MaxBodySize(e.cfg.MaxBodyBytes),
 	)
-	c.WithTransport(newTransport())
+	// ctxTransport wraps every HTTP request with ctx so the transport aborts
+	// in-flight connections the moment ctx is cancelled (e.g. Ctrl+C).
+	c.WithTransport(&ctxTransport{base: newTransport(), ctx: ctx})
 	c.SetRequestTimeout(e.cfg.RequestTimeout)
 	extensions.RandomUserAgent(c)
+
+	// Also abort colly's queued-but-not-yet-dispatched requests on cancel.
+	c.OnRequest(func(r *colly.Request) {
+		if ctx.Err() != nil {
+			r.Abort()
+		}
+	})
 	if err := c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: e.cfg.parallelism(),
@@ -440,10 +473,13 @@ func hnDecode(resp *http.Response, dst any) error {
 	return json.NewDecoder(bufio.NewReaderSize(lr, 32*1024)).Decode(dst)
 }
 
-func hnLatestHiringID(client *http.Client) (string, error) {
-	resp, err := client.Get(
-		"https://hn.algolia.com/api/v1/search?query=Ask+HN+Who+is+Hiring&tags=story&hitsPerPage=1",
-	)
+func hnLatestHiringID(ctx context.Context, client *http.Client) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://hn.algolia.com/api/v1/search?query=Ask+HN+Who+is+Hiring&tags=story&hitsPerPage=1", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -457,10 +493,13 @@ func hnLatestHiringID(client *http.Client) (string, error) {
 	return r.Hits[0].ObjectID, nil
 }
 
-func hnFetchItem(client *http.Client, id string) (*hnItem, error) {
-	resp, err := client.Get(
-		"https://hacker-news.firebaseio.com/v0/item/" + id + ".json",
-	)
+func hnFetchItem(ctx context.Context, client *http.Client, id string) (*hnItem, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://hacker-news.firebaseio.com/v0/item/"+id+".json", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
