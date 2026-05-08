@@ -3,6 +3,7 @@ package output
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 // Re-opening an existing file resumes without duplicates.
 type URLWriter struct {
 	mu    sync.Mutex
+	path  string
 	file  *os.File
 	seen  map[string]struct{}
 	count int
@@ -26,7 +28,7 @@ func NewURLWriter(path string) (*URLWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &URLWriter{file: f, seen: seen}, nil
+	return &URLWriter{path: path, file: f, seen: seen}, nil
 }
 
 // Write appends rawURL on its own line if it has not been seen before.
@@ -34,6 +36,9 @@ func NewURLWriter(path string) (*URLWriter, error) {
 func (w *URLWriter) Write(rawURL string) (bool, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.resetIfDeleted(); err != nil {
+		return false, err
+	}
 	key := strings.ToLower(rawURL)
 	if _, dup := w.seen[key]; dup {
 		return false, nil
@@ -44,6 +49,26 @@ func (w *URLWriter) Write(rawURL string) (bool, error) {
 	}
 	w.count++
 	return true, nil
+}
+
+// resetIfDeleted checks whether the output file still exists at w.path.
+// If it has been deleted, the seen set and count are cleared and a new file
+// is created, so the next write starts with a blank slate.
+// Must be called with w.mu held.
+func (w *URLWriter) resetIfDeleted() error {
+	if _, err := os.Stat(w.path); !os.IsNotExist(err) {
+		return nil
+	}
+	_ = w.file.Close()
+	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	w.file = f
+	w.seen = make(map[string]struct{})
+	w.count = 0
+	log.Printf("[url-writer] output file deleted; restarting fresh at %s", w.path)
+	return nil
 }
 
 func (w *URLWriter) Count() int {

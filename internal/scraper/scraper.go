@@ -3,6 +3,7 @@ package scraper
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -89,6 +90,19 @@ func newTransport() *http.Transport {
 		ExpectContinueTimeout: 1 * time.Second,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
+		// Restrict to classical curves only. Go 1.23+ advertises post-quantum
+		// key shares (Kyber/MLKEM) by default; many self-hosted servers running
+		// older TLS stacks reject the oversized ClientHello with a handshake
+		// failure alert (e.g. fsf.org). Listing only classical curves keeps the
+		// ClientHello small and compatible without weakening cipher security.
+		TLSClientConfig: &tls.Config{
+			CurvePreferences: []tls.CurveID{
+				tls.X25519,
+				tls.CurveP256,
+				tls.CurveP384,
+				tls.CurveP521,
+			},
+		},
 	}
 }
 
@@ -160,6 +174,15 @@ func (db *domainBlocker) recordSuccess(host string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	delete(db.failures, host)
+}
+
+// blockNow immediately blocks a host, bypassing the failure threshold.
+// Use for errors that are guaranteed to be permanent for the whole domain
+// (e.g. TLS handshake failures), so we avoid repeated log spam.
+func (db *domainBlocker) blockNow(host string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.blocked[host] = true
 }
 
 // Engine orchestrates all scraping sources.
@@ -408,34 +431,96 @@ func (e *Engine) newCollector(ctx context.Context, blocker *domainBlocker, queue
 
 	c.OnError(func(r *colly.Response, err error) {
 		host := r.Request.URL.Hostname()
-		if r.StatusCode == http.StatusTooManyRequests {
+		switch {
+		case r.StatusCode == http.StatusNotFound:
+			// 404s are normal on the live web; don't penalise the domain.
+			log.Printf("[web] %s: 404 (skipped)", r.Request.URL)
+		case r.StatusCode == http.StatusTooManyRequests:
 			log.Printf("[web] %s: rate-limited (429)", host)
-		} else {
+			blocker.recordFailure(host)
+		case err != nil && strings.Contains(err.Error(), "tls:"):
+			// TLS failures are domain-wide and permanent; block immediately so we
+			// don't retry and spam the log for every subsequent URL on that host.
+			log.Printf("[web] %s: TLS error — skipping domain: %v", host, err)
+			blocker.blockNow(host)
+		default:
 			log.Printf("[web] %s: %v", r.Request.URL, err)
+			blocker.recordFailure(host)
 		}
-		blocker.recordFailure(host)
 	})
 
 	return c
 }
 
+// relevantSegKws is the set of path-segment keywords that indicate a page may
+// contain recruiter/hiring contact info.  Matching is done at segment word
+// boundaries (see segMatchesKw) to avoid false positives from unrelated slugs
+// like "/gifts-for-people-who-have-everything" matching the keyword "people".
+var relevantSegKws = []string{
+	// English
+	"contact", "contacts",
+	"about",
+	"team", "teams",
+	"career", "careers",
+	"job", "jobs",
+	"hire", "hiring",
+	"recruit", "recruiting", "recruitment",
+	"people",
+	"staff",
+	"join",
+	"opening", "openings",
+	"position", "positions",
+	"vacancy", "vacancies",
+	"listing", "listings",
+	// German
+	"kontakt",
+	"karriere",
+	"stelle", "stellen",
+	"stellenangebot", "stellenangebote",
+	"ausschreibung", "ausschreibungen",
+	"bewerbung", "bewerben",
+	"einstellung",
+	"jobsuche", "jobdetail",
+}
+
 // isRelevantURL returns true for pages likely to contain contact emails.
+// It splits the path on "/" and checks each segment at word boundaries
+// (hyphens and underscores) rather than searching the full path string.
+// This prevents false positives like "/gifts-for-people-who-have-everything"
+// matching the keyword "people".
 func isRelevantURL(raw string) bool {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return false
 	}
-	p := strings.ToLower(u.Path + "?" + u.RawQuery)
-	for _, kw := range []string{
-		"contact", "about", "team", "career", "job", "hire",
-		"recruit", "people", "staff", "join", "opening",
-		"position", "vacancy", "listing",
-	} {
-		if strings.Contains(p, kw) {
+	for _, seg := range strings.Split(strings.ToLower(u.Path), "/") {
+		if seg == "" {
+			continue
+		}
+		for _, kw := range relevantSegKws {
+			if segMatchesKw(seg, kw) {
+				return true
+			}
+		}
+	}
+	// Also check query-string parameters for search/filter contexts.
+	q := strings.ToLower(u.RawQuery)
+	for _, kw := range []string{"job", "career", "vacancy", "stelle", "jobsuche", "bewerb"} {
+		if strings.Contains(q, kw) {
 			return true
 		}
 	}
 	return false
+}
+
+// segMatchesKw reports whether a URL path segment contains kw at a slug word
+// boundary: the segment equals kw, or kw appears at the start/end separated
+// by a hyphen or underscore.  This accepts "/people", "/our-people",
+// "/people-ops" but rejects "/gifts-for-people-who-have-everything".
+func segMatchesKw(seg, kw string) bool {
+	return seg == kw ||
+		strings.HasPrefix(seg, kw+"-") || strings.HasPrefix(seg, kw+"_") ||
+		strings.HasSuffix(seg, "-"+kw) || strings.HasSuffix(seg, "_"+kw)
 }
 
 // ── HN Firebase API ──────────────────────────────────────────────────────────
