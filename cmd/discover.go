@@ -33,8 +33,14 @@ func discoverSeeds(f runFlags) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Load URLs already saved in previous runs so they are excluded from the
+	// current run's results (both for deduplication inside the discoverer and
+	// to avoid re-appending them to the file).
+	existing, _ := readLines(discoveredSeedsFile) // ignore "file not found"
+	knownSeeds := append(scraper.BuiltInSeeds(), existing...)
+
 	d := sources.New(cfg)
-	results, err := d.Run(ctx, scraper.BuiltInSeeds())
+	results, err := d.Run(ctx, knownSeeds)
 
 	cancelled := ctx.Err() != nil
 	if err != nil && !cancelled {
@@ -49,9 +55,9 @@ func discoverSeeds(f runFlags) {
 		return
 	}
 
-	file, err := os.Create(discoveredSeedsFile)
+	file, err := os.OpenFile(discoveredSeedsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		log.Fatalf("failed to create output file: %v", err)
+		log.Fatalf("failed to open output file: %v", err)
 	}
 	defer file.Close()
 
@@ -64,7 +70,7 @@ func discoverSeeds(f runFlags) {
 	if cancelled {
 		label = "Partial"
 	}
-	fmt.Printf("\n%s. %d new sources written to %s\n", label, len(results), discoveredSeedsFile)
+	fmt.Printf("\n%s. %d new sources appended to %s\n", label, len(results), discoveredSeedsFile)
 	fmt.Printf("Tip: feed them into the scraper with:  -s %s\n", discoveredSeedsFile)
 }
 

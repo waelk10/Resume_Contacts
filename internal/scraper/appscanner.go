@@ -15,7 +15,8 @@ import (
 // the most widely used ATS platforms.
 var appPageRe = regexp.MustCompile(`(?i)` +
 	`boards\.greenhouse\.io/[^/?#]+/jobs/\d+` +
-	`|jobs\.lever\.co/[^/?#]+/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}` +
+	// Lever: job detail page is jobs.lever.co/co/uuid; the apply form is at .../uuid/apply.
+	`|jobs\.lever\.co/[^/?#]+/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/apply(?:[/?#]|$)` +
 	`|[^./\s]+\.myworkdayjobs\.com/.+/job/.+` +
 	`|[^./\s]+\.icims\.com/jobs/\d+/[^/?#]+/job\b` +
 	`|[^./\s]+\.bamboohr\.com/careers/\d+` +
@@ -47,6 +48,23 @@ var atsListingRe = regexp.MustCompile(`(?i)` +
 	`|[^./\s]+\.breezy\.hr/?(?:[/?#]|$)` +
 	`|[^./\s]+\.pinpointhq\.com/jobs/?(?:[/?#]|$)`,
 )
+
+// applyTextRe matches the visible text of typical "Apply" call-to-action buttons
+// in English and German.
+var applyTextRe = regexp.MustCompile(`(?i)^\s*(?:` +
+	`apply(?:\s+(?:now|here|for\s+this\s+(?:job|role|position)))?` +
+	`|jetzt\s+bewerben` +
+	`|bewerben(?:\s+(?:sie\s+sich|jetzt))?` +
+	`|zur\s+bewerbung` +
+	`|bewerbung\s+starten` +
+	`)\s*$`)
+
+// atsDomainRe matches hostnames of the ATS platforms we track.
+var atsDomainRe = regexp.MustCompile(`(?i)greenhouse\.io|lever\.co|myworkdayjobs\.com|icims\.com|bamboohr\.com|taleo\.net|ashbyhq\.com|workable\.com|smartrecruiters\.com|breezy\.hr|personio\.|recruitee\.com|jazz\.co|jobvite\.com|pinpointhq\.com|dover\.com`)
+
+func isATSDomain(host string) bool {
+	return atsDomainRe.MatchString(strings.ToLower(host))
+}
 
 // isAppPageURL reports whether raw points to a single-job application page.
 func isAppPageURL(raw string) bool {
@@ -94,8 +112,9 @@ func (s *AppScanner) Run() error {
 	blocker := newDomainBlocker(3)
 
 	c := colly.NewCollector(
-		// Extra depth so we can reach: board → company listing → job → apply page.
-		colly.MaxDepth(s.cfg.MaxDepth+1),
+		// +2 so the path board(0)→listing(1)→job-detail(2)→apply-form(3) fits within the limit,
+		// with one extra hop for boards that interpose an intermediate redirect page.
+		colly.MaxDepth(s.cfg.MaxDepth+2),
 		colly.Async(true),
 		colly.MaxBodySize(s.cfg.MaxBodyBytes),
 	)
@@ -110,8 +129,8 @@ func (s *AppScanner) Run() error {
 		log.Printf("[app] rate limit setup: %v", err)
 	}
 
-	// Safety net: if a redirect lands us on an application page, emit it.
-	// Only reset the failure counter on clean 2xx — 429s must not clear strikes.
+	// Emit application-page URLs only on a clean 2xx response.
+	// URLs that return 404 or any other error are silently discarded.
 	c.OnResponse(func(r *colly.Response) {
 		if r.StatusCode >= 200 && r.StatusCode < 300 {
 			blocker.recordSuccess(r.Request.URL.Hostname())
@@ -130,28 +149,54 @@ func (s *AppScanner) Run() error {
 		if err != nil || blocker.isBlocked(u.Hostname()) {
 			return
 		}
-		// Application pages are leaf nodes — emit and do not follow.
+		// Application pages: visit first so that 404s are never passed to the
+		// output. OnResponse above handles the actual emit on a 2xx response.
 		if isAppPageURL(abs) {
-			s.on(abs)
+			_ = c.Visit(abs)
 			return
 		}
 		// Job-board and ATS listing pages are worth crawling deeper.
 		if isFollowableJobURL(abs) {
+			_ = c.Visit(abs)
+			return
+		}
+		// Fallback: follow explicit "Apply" / "Apply Now" button links on known ATS
+		// domains even when the href doesn't yet match a known apply-form pattern.
+		// This catches platforms where the apply URL differs from the job-detail URL.
+		if applyTextRe.MatchString(strings.TrimSpace(el.Text)) && isATSDomain(u.Hostname()) {
 			_ = c.Visit(abs)
 		}
 	})
 
 	c.OnError(func(r *colly.Response, err error) {
 		host := r.Request.URL.Hostname()
-		if r.StatusCode == http.StatusTooManyRequests {
+		switch r.StatusCode {
+		case http.StatusNotFound:
+			// A 404 means the listing was removed — don't penalise the domain.
+			log.Printf("[app] %s: 404 not found (skipped)", r.Request.URL)
+		case http.StatusTooManyRequests:
 			log.Printf("[app] %s: rate-limited (429)", host)
-		} else {
-			log.Printf("[app] %s: %v", r.Request.URL, err)
+			blocker.recordFailure(host)
+		default:
+			if err != nil && strings.Contains(err.Error(), "tls:") {
+				log.Printf("[app] %s: TLS error — skipping domain: %v", host, err)
+				blocker.blockNow(host)
+			} else {
+				log.Printf("[app] %s: %v", r.Request.URL, err)
+				blocker.recordFailure(host)
+			}
 		}
-		blocker.recordFailure(host)
 	})
 
-	for _, seed := range s.cfg.buildSeeds() {
+	allSeeds := s.cfg.buildSeeds()
+	// Append app-scanner-specific seeds (not used by the contact scraper).
+	appFilter := expandCountries(s.cfg.Countries)
+	for _, as := range appScanSeeds {
+		if appFilter == nil || seedMatchesFilter(as.Countries, appFilter) {
+			allSeeds = append(allSeeds, as.URL)
+		}
+	}
+	for _, seed := range allSeeds {
 		u, err := url.Parse(seed)
 		if err != nil || blocker.isBlocked(u.Hostname()) {
 			continue
@@ -160,4 +205,15 @@ func (s *AppScanner) Run() error {
 	}
 	c.Wait()
 	return nil
+}
+
+// appScanSeeds are built-in seeds specific to the application-page scanner.
+// They are not included in the general contact scraper's seed list.
+var appScanSeeds = []taggedSeed{
+	// German Federal Employment Agency — Nuremberg/Mittelfranken, 25 km radius,
+	// IT and industrial sectors (branche=3;11).
+	{
+		URL:       "https://www.arbeitsagentur.de/jobsuche/suche?angebotsart=1&wo=N%C3%BCrnberg,%20Mittelfranken&umkreis=25&branche=3;11",
+		Countries: []string{"de"},
+	},
 }
