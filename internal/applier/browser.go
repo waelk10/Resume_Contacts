@@ -17,10 +17,11 @@ import (
 
 // FillFlags controls form-fill behaviour for a single application.
 type FillFlags struct {
-	DryRun     bool // fill fields but do not click Submit
-	Screenshot bool // save a PNG after filling
-	Headful    bool // browser is visible — pause on dry-run so user can inspect form
-	Hold       bool // keep window open until user closes it, then move to next URL
+	DryRun       bool          // fill fields but do not click Submit
+	Screenshot   bool          // save a PNG after filling
+	Headful      bool          // browser is visible — pause on dry-run so user can inspect form
+	Hold         bool          // keep window open until user closes it, then move to next URL
+	SimplifyWait time.Duration // pause after form appears to let the Simplify extension auto-fill (0 = disabled)
 }
 
 // Browser manages a single geckodriver process and spawns one Firefox
@@ -34,9 +35,20 @@ type Browser struct {
 }
 
 // NewBrowser locates geckodriver in PATH, starts it on port 4444, and
-// configures Firefox capabilities.  Returns a clear error message with
-// install instructions when geckodriver is not found.
-func NewBrowser(headful bool) (*Browser, error) {
+// configures Firefox capabilities.  profileDir, when non-empty, is passed as
+// the Firefox -profile argument so that extensions (e.g. Simplify) and their
+// authentication cookies persist across sessions.  Returns a clear error
+// message with install instructions when geckodriver is not found.
+func NewBrowser(headful bool, profileDir string) (*Browser, error) {
+	if profileDir != "" {
+		if _, err := os.Stat(filepath.Join(profileDir, "prefs.js")); os.IsNotExist(err) {
+			return nil, fmt.Errorf(
+				"profile directory %q has not been initialized — run with --setup first",
+				profileDir,
+			)
+		}
+	}
+
 	geckodriverPath, err := exec.LookPath("geckodriver")
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -56,17 +68,20 @@ func NewBrowser(headful bool) (*Browser, error) {
 		return nil, fmt.Errorf("start geckodriver on :%d: %w\n(is port %d already in use?)", port, err, port)
 	}
 
-	ffCaps := firefox.Capabilities{
-		// Hide the webdriver flag and automation extension from JavaScript so
-		// Cloudflare's fingerprint checks are less likely to flag the session.
-		Prefs: map[string]interface{}{
-			"dom.webdriver.enabled":  false,
-			"useAutomationExtension": false,
-		},
-	}
+	var args []string
 	if !headful {
-		ffCaps.Args = []string{"-headless"}
+		args = append(args, "-headless")
 	}
+	if profileDir != "" {
+		// Use the profile directory in-place so installed extensions and their
+		// session cookies survive between geckodriver invocations.
+		args = append(args, "-profile", profileDir)
+	}
+	// Do NOT set dom.webdriver.enabled or useAutomationExtension via Prefs —
+	// Firefox 75+ locks dom.webdriver.enabled and geckodriver will refuse to
+	// create the session with "Failed to set preferences".  The webdriver flag
+	// is already masked at runtime by injectStealthJS (Object.defineProperty).
+	ffCaps := firefox.Capabilities{Args: args}
 	caps := selenium.Capabilities{"browserName": "firefox"}
 	caps.AddFirefox(ffCaps)
 
@@ -79,9 +94,90 @@ func NewBrowser(headful bool) (*Browser, error) {
 	}, nil
 }
 
+// RunSetup launches Firefox directly (without geckodriver) with profileDir as
+// the active profile, navigates to the Simplify extension page, and waits for
+// the user to close the window.  Using Firefox directly (rather than via
+// geckodriver) avoids the "Failed to set preferences" error that geckodriver
+// raises on uninitialised profile directories, and ensures the profile is
+// written out cleanly when Firefox exits normally.
+func RunSetup(ctx context.Context, profileDir string) error {
+	if err := os.MkdirAll(profileDir, 0o755); err != nil {
+		return fmt.Errorf("create profile directory %q: %w", profileDir, err)
+	}
+	// Remove stale lock files left by any previously killed Firefox process.
+	// Firefox refuses to open a profile that has these files even when no
+	// other Firefox instance is actually using it.
+	for _, f := range []string{"lock", ".parentlock"} {
+		_ = os.Remove(filepath.Join(profileDir, f))
+	}
+
+	var ffPath string
+	for _, name := range []string{"firefox", "firefox-esr", "firefox-bin"} {
+		if p, err := exec.LookPath(name); err == nil {
+			ffPath = p
+			break
+		}
+	}
+	if ffPath == "" {
+		return fmt.Errorf("firefox binary not found in PATH (tried: firefox, firefox-esr, firefox-bin)")
+	}
+
+	fmt.Println("[setup] Opening Firefox with your persistent profile…")
+	fmt.Println("[setup]   1. Install the Simplify extension from the page that opens.")
+	fmt.Println("[setup]   2. Click the Simplify icon and log in with your account.")
+	fmt.Println("[setup]   3. Configure autofill (name, email, resume, etc.).")
+	fmt.Println("[setup]   4. Close Firefox when done — your profile will be saved automatically.")
+
+	cmd := exec.CommandContext(ctx, ffPath,
+		"--no-remote",
+		"--profile", profileDir,
+		"https://addons.mozilla.org/en-US/firefox/addon/simplify-jobs/",
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil && ctx.Err() == nil {
+		// Non-zero exit is normal when the user force-closes the window.
+		log.Printf("[setup] Firefox exited: %v", err)
+	}
+
+	fmt.Printf("[setup] Profile saved to %q.\n", profileDir)
+	fmt.Println("[setup] Run 'apply --profile-dir <dir> --simplify-wait 3 ...' to start applying.")
+	return nil
+}
+
 // Close stops the geckodriver process.
 func (b *Browser) Close() {
 	_ = b.service.Stop()
+}
+
+// ErrWindowClosed is returned by FillApplication when the user closes the
+// browser tab or window during a headful session.  processOne maps this to
+// "skipped" rather than "error" so the URL is not added to the failure list.
+var ErrWindowClosed = fmt.Errorf("window closed by user")
+
+// isWindowClosedErr reports whether a WebDriver error indicates the browser
+// session or window was closed (by the user or by the browser crashing).
+func isWindowClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, phrase := range []string{
+		"no such window",
+		"no such session",
+		"invalid session id",
+		"target window already closed",
+		"session deleted",
+		"window was already closed",
+		"browsing context has been discarded",
+		"tried to run command without establishing a connection",
+	} {
+		if strings.Contains(msg, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // FillApplication opens a fresh Firefox session, navigates to job.URL,
@@ -108,7 +204,11 @@ func (b *Browser) FillApplication(
 	// when an error occurs — otherwise defer wd.Quit() closes it instantly.
 	defer func() {
 		if retErr != nil {
-			if flags.Hold {
+			// User closed the tab/window — not a failure, just skip.
+			if isWindowClosedErr(retErr) {
+				log.Printf("[apply] browser window closed by user — skipping to next URL")
+				retErr = ErrWindowClosed
+			} else if flags.Hold {
 				log.Printf("[hold] error — close the Firefox window to continue: %v", retErr)
 				waitForWindowClose(ctx, wd)
 				retErr = nil
@@ -177,6 +277,22 @@ func (b *Browser) FillApplication(
 		return fmt.Errorf("no application form found on page (job may be closed or removed)")
 	}
 
+	// Trigger the Simplify extension: poll for its injected autofill button,
+	// click it once found, then wait for the fill to settle before our
+	// supplemental pass runs.
+	if flags.SimplifyWait > 0 {
+		if waitAndClickSimplify(ctx, wd, flags.SimplifyWait) {
+			// Simplify fills asynchronously — give it a moment to finish.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+		} else {
+			log.Printf("[simplify] autofill button not found — continuing with standard fill")
+		}
+	}
+
 	switch job.ATSPlatform {
 	case "greenhouse":
 		fillGreenhouse(ctx, wd, info, resumePath)
@@ -186,6 +302,8 @@ func (b *Browser) FillApplication(
 		fillAshby(ctx, wd, info, resumePath)
 	case "bamboohr":
 		fillBambooHR(ctx, wd, info, resumePath)
+	case "personio":
+		fillPersonio(ctx, wd, info, resumePath)
 	default:
 		fillGeneric(ctx, wd, info, resumePath)
 	}
@@ -238,6 +356,722 @@ func waitForWindowClose(ctx context.Context, wd selenium.WebDriver) {
 	}
 }
 
+// ── Common extras filler ──────────────────────────────────────────────────────
+
+// jsSelectOption picks the best-matching option in the first visible <select>
+// that matches the CSS selector.  Tries (1) exact value, (2) exact text,
+// (3) prefix text, (4) substring text — all case-insensitive, skipping blank
+// placeholder options.
+const jsSelectOption = `
+(function(){
+    var sel=arguments[0], lv=arguments[1].toLowerCase().trim();
+    function pick(s){
+        var opts=s.options;
+        for(var p=0;p<4;p++){
+            for(var i=0;i<opts.length;i++){
+                if(!opts[i].value) continue;
+                var tv=opts[i].value.toLowerCase().trim(), tt=opts[i].text.toLowerCase().trim();
+                var match=(p===0&&tv===lv)||(p===1&&tt===lv)||
+                          (p===2&&tt.indexOf(lv)===0)||(p===3&&tt.indexOf(lv)!==-1);
+                if(match){s.selectedIndex=i;s.dispatchEvent(new Event('change',{bubbles:true}));return true;}
+            }
+        }
+        return false;
+    }
+    var ss=document.querySelectorAll(sel);
+    for(var j=0;j<ss.length;j++){
+        var s=ss[j];
+        if(s.disabled) continue;
+        if(s.offsetParent===null&&window.getComputedStyle(s).position!=='fixed') continue;
+        if(pick(s)) return true;
+    }
+    return false;
+})();
+`
+
+// jsSelectByLabel picks an option in the <select> whose label text contains
+// needle (case-insensitive), using the same 4-level matching as jsSelectOption.
+const jsSelectByLabel = `
+(function(){
+    var needle=arguments[0].toLowerCase(), lv=arguments[1].toLowerCase().trim();
+    function pick(s){
+        var opts=s.options;
+        for(var p=0;p<4;p++){
+            for(var i=0;i<opts.length;i++){
+                if(!opts[i].value) continue;
+                var tv=opts[i].value.toLowerCase().trim(), tt=opts[i].text.toLowerCase().trim();
+                var match=(p===0&&tv===lv)||(p===1&&tt===lv)||
+                          (p===2&&tt.indexOf(lv)===0)||(p===3&&tt.indexOf(lv)!==-1);
+                if(match){s.selectedIndex=i;s.dispatchEvent(new Event('change',{bubbles:true}));return true;}
+            }
+        }
+        return false;
+    }
+    function findSel(lbl){
+        var fid=lbl.getAttribute('for');
+        var s=fid?document.getElementById(fid):null;
+        if(s&&s.tagName==='SELECT') return s;
+        s=lbl.querySelector('select'); if(s) return s;
+        var sib=lbl.nextElementSibling;
+        while(sib){
+            if(sib.tagName==='SELECT') return sib;
+            var inner=sib.querySelector('select'); if(inner) return inner;
+            if(sib.tagName==='LABEL') break;
+            sib=sib.nextElementSibling;
+        }
+        // Also walk upward one level (form-group pattern)
+        if(lbl.parentElement){
+            var ps=lbl.parentElement.querySelector('select');
+            if(ps) return ps;
+        }
+        return null;
+    }
+    var labels=document.querySelectorAll('label');
+    for(var i=0;i<labels.length;i++){
+        if(labels[i].textContent.toLowerCase().indexOf(needle)===-1) continue;
+        var s=findSel(labels[i]);
+        if(!s||s.disabled) continue;
+        if(s.offsetParent===null&&window.getComputedStyle(s).position!=='fixed') continue;
+        if(pick(s)) return true;
+    }
+    return false;
+})();
+`
+
+// jsHandleWorkEligibility answers "authorized to work" and "require
+// sponsorship" questions — radio buttons, <select> dropdowns, or
+// [role="radio"] custom widgets — in a single round-trip.
+// arguments[0] = "yes"|"no" for work-auth
+// arguments[1] = "yes"|"no" for sponsorship
+const jsHandleWorkEligibility = `
+(function(authAns, sponsorAns){
+    var AUTH=/\b(authorized|authorised|legally\s+(?:able|eligible|authorized|allowed)|right\s+to\s+work|eligible\s+to\s+work|work\s+authoriz|work\s+permit|authorization\s+to\s+work|arbeitserlaubnis|arbeitsgenehmigung|arbeitsberechtigung|recht\s+auf\s+arbeit|rechtlich\s+berechtigt|berechtigt\s+zu\s+arbeiten|befugt\s+zu\s+arbeiten)\b/i;
+    var SPONSOR=/\b(sponsorship|visa\s+sponsor|require\s+(?:a\s+)?(?:visa|sponsor)|will\s+you\s+(?:now|in\s+the\s+future)\s+require|need\s+(?:visa|sponsor|h[\-\s]?1b)|aufenthaltserlaubnis|aufenthaltstitel|visa[\-\s]?sponsoring|visumsponsoring|ben[öo]tigen\s+sie\s+(?:ein\s+)?visum|visumsbedarf)\b/i;
+    var YES=/^\s*yes\s*$/i, NO=/^\s*no\s*$/i;
+
+    function pickSelect(container, wantYes){
+        var sel=container.querySelector('select');
+        if(!sel||sel.disabled) return false;
+        var re=wantYes?YES:NO;
+        for(var i=0;i<sel.options.length;i++){
+            if(sel.options[i].value&&re.test(sel.options[i].text)){
+                sel.selectedIndex=i; sel.dispatchEvent(new Event('change',{bubbles:true})); return true;
+            }
+        }
+        return false;
+    }
+    function pickRadio(container, wantYes){
+        var radios=container.querySelectorAll('input[type="radio"],[role="radio"]');
+        var re=wantYes?YES:NO;
+        for(var i=0;i<radios.length;i++){
+            var r=radios[i]; if(r.disabled) continue;
+            var lbl=document.querySelector('label[for="'+r.id+'"]')||r.closest('label');
+            var t=(lbl?lbl.textContent:(r.getAttribute('aria-label')||r.value||'')).trim();
+            if(re.test(t)){
+                r.scrollIntoView({block:'center'}); r.click();
+                r.dispatchEvent(new Event('change',{bubbles:true})); return true;
+            }
+        }
+        return false;
+    }
+    function handle(container, isAuth){
+        var wantYes=isAuth?(authAns==='yes'):(sponsorAns==='yes');
+        return pickSelect(container,wantYes)||pickRadio(container,wantYes);
+    }
+
+    var authDone=false, sponsorDone=false;
+
+    // 1. Fieldset/legend (most semantic)
+    document.querySelectorAll('fieldset').forEach(function(fs){
+        var leg=fs.querySelector('legend'); if(!leg) return;
+        if(!authDone&&AUTH.test(leg.textContent)) authDone=handle(fs,true);
+        if(!sponsorDone&&SPONSOR.test(leg.textContent)) sponsorDone=handle(fs,false);
+    });
+
+    // 2. Common form-group/question containers
+    if(!authDone||!sponsorDone){
+        var divs=document.querySelectorAll(
+            '[class*="question"],[class*="field-group"],[class*="form-group"],[class*="form-field"],[class*="input-group"],[class*="radio-group"]'
+        );
+        divs.forEach(function(d){
+            var t=d.textContent;
+            if(!authDone&&AUTH.test(t)) authDone=handle(d,true);
+            if(!sponsorDone&&SPONSOR.test(t)) sponsorDone=handle(d,false);
+        });
+    }
+
+    return {auth:authDone,sponsor:sponsorDone};
+})(arguments[0],arguments[1]);
+`
+
+// jsHandleEEORadios answers gender and ethnicity radio-button groups that
+// appear in voluntary self-identification (EEO) sections.  Used on Ashby and
+// any other ATS that renders EEO as radio inputs rather than <select> elements.
+//
+// arguments[0] = gender value  ("male"|"female"|"non-binary"|"decline")
+// arguments[1] = ethnicity value ("white"|"black"|"hispanic"|"asian"|
+//                "american-indian"|"pacific-islander"|"two-or-more"|"decline")
+//
+// Each option is scored against the requested value; the highest-scoring
+// option wins.  "decline" values explicitly match "prefer not to answer" /
+// "decline to self-identify" phrasing and receive a boosted score so they
+// are never accidentally chosen when a specific demographic is requested.
+const jsHandleEEORadios = `
+(function(genderVal, ethnicityVal){
+    var GENDER_Q  = /\bgender\b|\bgeschlecht\b/i;
+    var ETH_Q     = /\b(ethnicity|ethnic\s+(?:origin|group)|race(?:\s*\/\s*ethnicity)?|racial\s+background|ethnizit[äa]t|ethnische\s+herkunft|volkszugeh[öo]rigkeit)\b/i;
+    var DECLINE_T = /prefer\s+not|decline|choose\s+not|do\s+not\s+wish|not\s+to\s+(?:answer|disclose|identify)|not\s+disclose|keine\s+angabe|nicht\s+angeben|lieber\s+nicht|m[öo]chte\s+nicht\s+(?:antworten|angeben)|nicht\s+angegeben|lehne\s+ab|keine\s+antwort/i;
+
+    function pickBest(container, scoreFn) {
+        var els = Array.from(container.querySelectorAll('input[type="radio"],[role="radio"]'));
+        if (!els.length) return false;
+        var best = null, bestScore = -Infinity;
+        els.forEach(function(r) {
+            if (r.disabled) return;
+            var lbl = document.querySelector('label[for="'+r.id+'"]') || r.closest('label');
+            var txt = (lbl
+                ? lbl.textContent
+                : (r.getAttribute('aria-label') || r.value || '')
+            ).trim();
+            var s = scoreFn(txt);
+            if (s > bestScore) { bestScore = s; best = r; }
+        });
+        if (!best || bestScore < 1) return false;
+        best.scrollIntoView({block:'center'});
+        best.click();
+        best.dispatchEvent(new Event('change',{bubbles:true}));
+        return true;
+    }
+
+    function scoreGender(txt) {
+        var t = txt.toLowerCase();
+        if (DECLINE_T.test(t)) return genderVal === 'decline' ? 10 : -10;
+        if (genderVal === 'male')       return /^\s*male\b|^\s*man\b/.test(t) ? 8 : 0;
+        if (genderVal === 'female')     return /^\s*female\b|^\s*woman\b/.test(t) ? 8 : 0;
+        if (genderVal === 'non-binary') return /non[\s\-]?binary|non[\s\-]?conform|genderqueer|gender[\s\-]?fluid/.test(t) ? 8 : 0;
+        return 0;
+    }
+
+    function scoreEthnicity(txt) {
+        var t = txt.toLowerCase();
+        if (DECLINE_T.test(t)) return ethnicityVal === 'decline' ? 10 : -10;
+        var MAP = {
+            'white':            /\bwhite\b/,
+            'black':            /\bblack\b|african\s+american|african\s+canadian/,
+            'hispanic':         /hispanic|latino/,
+            'asian':            /\basian\b/,
+            'american-indian':  /american\s+indian|alaska\s+native|native\s+american/,
+            'pacific-islander': /pacific\s+islander|hawaiian/,
+            'two-or-more':      /two\s+or\s+more|multiracial|multiple\s+race/,
+        };
+        var re = MAP[ethnicityVal];
+        return (re && re.test(t)) ? 8 : 0;
+    }
+
+    var genderDone = false, ethDone = false;
+
+    // Strategy 1: fieldset/legend (most semantic HTML)
+    document.querySelectorAll('fieldset').forEach(function(fs) {
+        var leg = fs.querySelector('legend'); if (!leg) return;
+        var lt = leg.textContent;
+        if (!genderDone && GENDER_Q.test(lt))  genderDone = pickBest(fs, scoreGender);
+        if (!ethDone    && ETH_Q.test(lt))     ethDone    = pickBest(fs, scoreEthnicity);
+    });
+
+    // Strategy 2: common question/field containers (covers Ashby React UI and others)
+    if (!genderDone || !ethDone) {
+        var CONTAINERS = [
+            '[class*="question"]', '[class*="field-group"]', '[class*="form-group"]',
+            '[class*="eeo"]', '[class*="eeoc"]', '[class*="voluntary"]',
+            '[class*="diversity"]', '[class*="demographic"]',
+            '[data-qa*="gender"]', '[data-qa*="ethnicity"]', '[data-qa*="race"]',
+        ].join(',');
+        document.querySelectorAll(CONTAINERS).forEach(function(c) {
+            var ct = c.textContent;
+            if (!genderDone && GENDER_Q.test(ct)) genderDone = pickBest(c, scoreGender);
+            if (!ethDone    && ETH_Q.test(ct))    ethDone    = pickBest(c, scoreEthnicity);
+        });
+    }
+
+    return {gender: genderDone, ethnicity: ethDone};
+})(arguments[0], arguments[1]);
+`
+
+// jsHandleOptionalSelects fills EEO dropdowns with "prefer not to answer" /
+// "decline" and answers "how did you hear about us" with "Indeed" or "Other".
+// All in one round-trip since these fields are typically non-required but
+// leaving them blank occasionally blocks submission.
+const jsHandleOptionalSelects = `
+(function(){
+    var EEO=/\b(gender|sex(?:ual)?|race|ethnicity|ethnic\s+(?:origin|group)|national\s+origin|veteran|disability|disabilities|eeoc?|protected\s+class|geschlecht|ethnizit[äa]t|nationalit[äa]t|behinderung)\b/i;
+    var HEARD=/\b(how\s+(?:did\s+you|have\s+you)\s+(?:hear|find|learn|discover)|referral\s+source|where\s+did\s+you\s+(?:hear|find)|how\s+did\s+you\s+come\s+across|wie\s+(?:haben\s+sie|sind\s+sie)\s+(?:auf\s+uns|auf\s+diese)|wie\s+sind\s+sie\s+auf\s+die\s+stelle|wo\s+haben\s+sie\s+die\s+stelle|woher\s+(?:kennen|haben)\s+sie)\b/i;
+    var DECLINE=['prefer not','decline','not to disclose','do not wish','choose not','not specified','not provided','keine angabe','nicht angeben','lieber nicht'];
+    var HEARD_PREF=['indeed','linkedin','job board','job site','online job','internet','other','stellenbörse','jobbörse'];
+
+    document.querySelectorAll('select').forEach(function(sel){
+        if(sel.disabled) continue;
+        if(sel.offsetParent===null&&window.getComputedStyle(sel).position!=='fixed') return;
+
+        // Collect context text from label + surrounding container
+        var ctx='';
+        var lbl=document.querySelector('label[for="'+sel.id+'"]');
+        if(lbl) ctx+=lbl.textContent;
+        var p=sel.parentElement;
+        for(var i=0;i<3&&p;i++){ ctx+=p.textContent; p=p.parentElement; }
+        ctx=(ctx+' '+(sel.name||'')+' '+(sel.id||'')).toLowerCase();
+
+        if(EEO.test(ctx)){
+            for(var di=0;di<DECLINE.length;di++){
+                for(var oi=0;oi<sel.options.length;oi++){
+                    if(sel.options[oi].value&&sel.options[oi].text.toLowerCase().indexOf(DECLINE[di])!==-1){
+                        sel.selectedIndex=oi; sel.dispatchEvent(new Event('change',{bubbles:true})); break;
+                    }
+                }
+                if(sel.selectedIndex>0) break;
+            }
+        } else if(HEARD.test(ctx)){
+            for(var hi=0;hi<HEARD_PREF.length;hi++){
+                var found=false;
+                for(var oi=0;oi<sel.options.length;oi++){
+                    if(sel.options[oi].value&&sel.options[oi].text.toLowerCase().indexOf(HEARD_PREF[hi])!==-1){
+                        sel.selectedIndex=oi; sel.dispatchEvent(new Event('change',{bubbles:true})); found=true; break;
+                    }
+                }
+                if(found) break;
+            }
+        }
+    });
+    return true;
+})();
+`
+
+// jsAcceptPrivacyConsent ticks any unchecked checkbox whose label mentions
+// privacy, data processing, GDPR / DSGVO, or application consent.  Personio
+// and several other ATS platforms make this checkbox mandatory; leaving it
+// unticked prevents the Submit button from becoming active.
+const jsAcceptPrivacyConsent = `
+(function(){
+    var CONSENT = /\b(privacy|data\s*(?:processing|protection|policy)|gdpr|dsgvo|datenschutz|personal\s+data|application\s+terms|consent\s+to\s+(?:the\s*)?(?:processing|collection))\b/i;
+    var cbs = document.querySelectorAll('input[type="checkbox"]:not(:checked)');
+    for (var i = 0; i < cbs.length; i++) {
+        var cb = cbs[i];
+        if (cb.disabled) continue;
+        var lbl = document.querySelector('label[for="'+cb.id+'"]') || cb.closest('label');
+        var txt = (lbl ? lbl.textContent : (cb.getAttribute('aria-label') || cb.name || '')).toLowerCase();
+        if (CONSENT.test(txt)) { cb.click(); }
+    }
+    return true;
+})();
+`
+
+// jsHandleSalary fills expected-salary/compensation inputs and selects.
+// Searches by label text and form-group containers so React/Vue forms are covered.
+// When val is "Negotiable" (the baked-in default) and the field is a <select>,
+// pickSelFallback picks the first non-trivial option so the field is never left blank.
+// arguments[0] = salary string (e.g. "85000", "80k-100k", "Negotiable")
+const jsHandleSalary = `
+(function(val){
+    var Q=/\b(salary|compensation|expected\s+pay|desired\s+pay|expected\s+salary|desired\s+salary|salary\s+expect|pay\s+expect|ctc|annual\s+(?:salary|pay|comp)|remuneration|pay\s+range|expected\s+package|gehalt|gehaltsvorstellung|gew[üu]nschtes\s+gehalt|verg[üu]tung|jahresgehalt|bruttogehalt)\b/i;
+    var SKIP=/\b(prefer\s+not|not\s+to\s+say|not\s+specified|decline|n\/a)\b/i;
+    function fill(el,v){
+        if(el.disabled) return false;
+        if(el.offsetParent===null&&window.getComputedStyle(el).position!=='fixed') return false;
+        el.focus(); el.scrollIntoView({block:'center'});
+        try{ var proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+             Object.getOwnPropertyDescriptor(proto,'value').set.call(el,v); }
+        catch(e){ el.value=v; }
+        ['input','change','blur'].forEach(function(ev){ el.dispatchEvent(new Event(ev,{bubbles:true})); });
+        return true;
+    }
+    function pickSel(sel,v){
+        var lv=v.toLowerCase(),opts=sel.options;
+        // 4-pass exact→text→prefix→substring match
+        for(var p=0;p<4;p++) for(var i=0;i<opts.length;i++){
+            if(!opts[i].value) continue;
+            var tv=opts[i].value.toLowerCase().trim(),tt=opts[i].text.toLowerCase().trim();
+            if((p===0&&tv===lv)||(p===1&&tt===lv)||(p===2&&tt.indexOf(lv)===0)||(p===3&&tt.indexOf(lv)!==-1)){
+                sel.selectedIndex=i; sel.dispatchEvent(new Event('change',{bubbles:true})); return true;
+            }
+        }
+        return false;
+    }
+    function pickSelFallback(sel){
+        // Called when the value didn't match any option (e.g. "Negotiable" on a
+        // range-based select).  Pick the middle non-trivial option so the field
+        // is not left at the blank placeholder.
+        var real=[];
+        for(var i=0;i<sel.options.length;i++){
+            var o=sel.options[i];
+            if(!o.value||SKIP.test(o.text)) continue;
+            real.push(i);
+        }
+        if(!real.length) return false;
+        var mid=real[Math.floor(real.length/2)];
+        sel.selectedIndex=mid; sel.dispatchEvent(new Event('change',{bubbles:true})); return true;
+    }
+    function tryContainer(c){
+        if(!Q.test(c.textContent)) return false;
+        var inp=c.querySelector('input:not([type=hidden]):not([type=file]):not([type=checkbox]):not([type=radio]),textarea');
+        if(inp) return fill(inp,val);
+        var s=c.querySelector('select');
+        if(s&&!s.disabled) return pickSel(s,val)||pickSelFallback(s);
+        return false;
+    }
+    var done=false;
+    document.querySelectorAll('fieldset').forEach(function(fs){
+        if(done) return;
+        var leg=fs.querySelector('legend'); if(leg&&Q.test(leg.textContent)) done=tryContainer(fs);
+    });
+    if(done) return true;
+    document.querySelectorAll('[class*="field"],[class*="group"],[class*="question"],[class*="input-wrap"]').forEach(function(d){
+        if(done) return; done=tryContainer(d);
+    });
+    return done;
+})(arguments[0]);
+`
+
+// jsHandleAvailability fills notice-period selects/text-inputs and start-date
+// date-pickers using label-text and form-group container heuristics.
+// arguments[0] = notice period text (e.g. "2 weeks")
+// arguments[1] = ISO start date (e.g. "2026-05-26")
+const jsHandleAvailability = `
+(function(notice, dateStr){
+    var Q=/\b(notice\s*period|notice|availability|available\s*(?:from|date|to\s+start)?|start\s*date|earliest\s*start|when\s+can\s+you\s+start|when\s+(?:are\s+you|would\s+you\s+be)\s+available|joining\s+date|commencement|start\s+of\s+(?:work|employment)|k[üu]ndigungsfrist|fr[üu]hestm[öo]glich(?:er)?|verf[üu]gbarkeit|eintrittsdatum|startdatum|wann\s+(?:k[öo]nnen\s+sie|stehen\s+sie)|eintrittstermin|beginn\s+der\s+t[äa]tigkeit)\b/i;
+    function fill(el,v){
+        if(el.disabled) return false;
+        if(el.offsetParent===null&&window.getComputedStyle(el).position!=='fixed') return false;
+        el.focus(); el.scrollIntoView({block:'center'});
+        try{ Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,v); }
+        catch(e){ el.value=v; }
+        ['input','change','blur'].forEach(function(ev){ el.dispatchEvent(new Event(ev,{bubbles:true})); });
+        return true;
+    }
+    function pickSel(sel,v){
+        var lv=v.toLowerCase(),opts=sel.options;
+        for(var p=0;p<4;p++) for(var i=0;i<opts.length;i++){
+            if(!opts[i].value) continue;
+            var tv=opts[i].value.toLowerCase().trim(),tt=opts[i].text.toLowerCase().trim();
+            if((p===0&&tv===lv)||(p===1&&tt===lv)||(p===2&&tt.indexOf(lv)===0)||(p===3&&tt.indexOf(lv)!==-1)){
+                sel.selectedIndex=i; sel.dispatchEvent(new Event('change',{bubbles:true})); return true;
+            }
+        }
+        return false;
+    }
+    function handleContainer(c){
+        if(!Q.test(c.textContent)) return;
+        var sel=c.querySelector('select');
+        if(sel&&!sel.disabled&&notice){ pickSel(sel,notice); return; }
+        var dateInp=c.querySelector('input[type="date"]');
+        if(dateInp&&dateStr){ fill(dateInp,dateStr); return; }
+        var inp=c.querySelector('input:not([type=hidden]):not([type=file]):not([type=checkbox]):not([type=radio])');
+        if(inp&&notice) fill(inp,notice);
+    }
+    document.querySelectorAll('fieldset').forEach(function(fs){
+        var leg=fs.querySelector('legend'); if(leg&&Q.test(leg.textContent)) handleContainer(fs);
+    });
+    document.querySelectorAll('[class*="field"],[class*="group"],[class*="question"]').forEach(handleContainer);
+    // Direct attribute fallback for date inputs with start/available names
+    document.querySelectorAll('input[type="date"]').forEach(function(inp){
+        if(inp.disabled) return;
+        var nm=(inp.name||inp.id||inp.placeholder||'').toLowerCase();
+        if(dateStr&&/start|available|notice|join|commenc/.test(nm)) fill(inp,dateStr);
+    });
+    return true;
+})(arguments[0],arguments[1]);
+`
+
+// usStateNames maps 2-letter codes to full names so both representations can
+// be tried when filling state text-inputs or <select> dropdowns.
+var usStateNames = map[string]string{
+	"AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+	"CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+	"FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+	"IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+	"KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+	"MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+	"MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+	"NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+	"NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+	"OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+	"SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+	"VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+	"WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia",
+	// Canadian provinces
+	"AB": "Alberta", "BC": "British Columbia", "MB": "Manitoba",
+	"NB": "New Brunswick", "NL": "Newfoundland and Labrador",
+	"NS": "Nova Scotia", "ON": "Ontario", "PE": "Prince Edward Island",
+	"QC": "Quebec", "SK": "Saskatchewan",
+}
+
+// trySetSelect uses jsSelectOption to pick a matching option in a <select>.
+func trySetSelect(wd selenium.WebDriver, selector, value string) bool {
+	if value == "" {
+		return false
+	}
+	res, err := wd.ExecuteScript(jsSelectOption, []interface{}{selector, value})
+	return err == nil && res == true
+}
+
+// trySetSelectByLabel uses jsSelectByLabel to pick a matching option in a
+// <select> found via its label text.
+func trySetSelectByLabel(wd selenium.WebDriver, labelText, optionValue string) bool {
+	if optionValue == "" {
+		return false
+	}
+	res, err := wd.ExecuteScript(jsSelectByLabel, []interface{}{labelText, optionValue})
+	return err == nil && res == true
+}
+
+// fillCommonExtras fills the form fields that are common across all ATS
+// platforms but are not covered by the ATS-specific fillers: address,
+// professional links, cover letter, work authorization, EEO, and "how did
+// you hear".  It is called after every ATS-specific filler.
+func fillCommonExtras(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo) {
+	// ── City ─────────────────────────────────────────────────────────────────
+	if info.City != "" {
+		for _, sel := range []string{
+			`input[name*="city" i]`, `input[id*="city" i]`,
+			`input[placeholder*="city" i]`, `input[autocomplete="address-level2"]`,
+		} {
+			if trySetInput(wd, sel, info.City) {
+				break
+			}
+		}
+		tryFillByLabel(wd, "city", info.City)
+		tryFillByLabel(wd, "ort", info.City)
+		tryFillByLabel(wd, "wohnort", info.City)
+		tryFillByLabel(wd, "stadt", info.City)
+	}
+
+	// ── State / Province ──────────────────────────────────────────────────────
+	if info.State != "" {
+		expanded := usStateNames[strings.ToUpper(info.State)] // full name, may be ""
+		stateSelectors := `select[name*="state" i],select[id*="state" i],select[name*="province" i],select[id*="province" i]`
+		inputSelectors := `input[name*="state" i],input[id*="state" i],input[name*="province" i],input[autocomplete="address-level1"]`
+
+		// Try the code first, then the full name, for both select and input.
+		if !trySetSelect(wd, stateSelectors, info.State) && expanded != "" {
+			trySetSelect(wd, stateSelectors, expanded)
+		}
+		if !trySetSelectByLabel(wd, "state", info.State) && expanded != "" {
+			trySetSelectByLabel(wd, "state", expanded)
+		}
+		trySetSelectByLabel(wd, "province", info.State)
+		if expanded != "" {
+			trySetSelectByLabel(wd, "province", expanded)
+		}
+		if !trySetInput(wd, inputSelectors, info.State) {
+			tryFillByLabel(wd, "state", info.State)
+			tryFillByLabel(wd, "province", info.State)
+			tryFillByLabel(wd, "bundesland", info.State)
+		}
+		trySetSelectByLabel(wd, "bundesland", info.State)
+	}
+
+	// ── ZIP / Postal code ─────────────────────────────────────────────────────
+	if info.ZipCode != "" {
+		for _, sel := range []string{
+			`input[name*="zip" i]`, `input[id*="zip" i]`,
+			`input[name*="postal" i]`, `input[id*="postal" i]`,
+			`input[autocomplete="postal-code"]`,
+		} {
+			if trySetInput(wd, sel, info.ZipCode) {
+				break
+			}
+		}
+		tryFillByLabel(wd, "zip", info.ZipCode)
+		tryFillByLabel(wd, "postal", info.ZipCode)
+		tryFillByLabel(wd, "postleitzahl", info.ZipCode)
+		tryFillByLabel(wd, "plz", info.ZipCode)
+	}
+
+	// ── Country ───────────────────────────────────────────────────────────────
+	if info.Country != "" {
+		countrySelectors := `select[name*="country" i],select[id*="country" i],select[autocomplete="country"],select[autocomplete="country-name"]`
+		if !trySetSelect(wd, countrySelectors, info.Country) {
+			trySetSelectByLabel(wd, "country", info.Country)
+		}
+		for _, sel := range []string{
+			`input[name*="country" i]`, `input[id*="country" i]`,
+			`input[autocomplete="country-name"]`,
+		} {
+			if trySetInput(wd, sel, info.Country) {
+				break
+			}
+		}
+		tryFillByLabel(wd, "country", info.Country)
+		trySetSelectByLabel(wd, "land", info.Country)
+		tryFillByLabel(wd, "land", info.Country)
+		trySetSelectByLabel(wd, "heimatland", info.Country)
+	}
+
+	// ── Website / portfolio ───────────────────────────────────────────────────
+	if info.Website != "" {
+		for _, sel := range []string{
+			`input[name*="website" i]`, `input[id*="website" i]`,
+			`input[name*="portfolio" i]`, `input[id*="portfolio" i]`,
+			`input[placeholder*="website" i]`, `input[placeholder*="portfolio" i]`,
+		} {
+			if trySetInput(wd, sel, info.Website) {
+				break
+			}
+		}
+		tryFillByLabel(wd, "website", info.Website)
+		tryFillByLabel(wd, "portfolio", info.Website)
+		tryFillByLabel(wd, "personal site", info.Website)
+		tryFillByLabel(wd, "webseite", info.Website)
+		tryFillByLabel(wd, "internetseite", info.Website)
+	}
+
+	// ── GitHub ────────────────────────────────────────────────────────────────
+	if info.GitHubURL != "" {
+		for _, sel := range []string{
+			`input[name*="github" i]`, `input[id*="github" i]`,
+			`input[placeholder*="github" i]`, `input[aria-label*="github" i]`,
+		} {
+			if trySetInput(wd, sel, info.GitHubURL) {
+				break
+			}
+		}
+		tryFillByLabel(wd, "github", info.GitHubURL)
+	}
+
+	// ── Cover letter ──────────────────────────────────────────────────────────
+	if info.CoverLetter != "" {
+		for _, sel := range []string{
+			`textarea[name*="cover" i]`, `textarea[id*="cover" i]`,
+			`textarea[placeholder*="cover letter" i]`, `textarea[aria-label*="cover letter" i]`,
+		} {
+			if trySetInput(wd, sel, info.CoverLetter) {
+				break
+			}
+		}
+		tryFillByLabel(wd, "cover letter", info.CoverLetter)
+		tryFillByLabel(wd, "motivation", info.CoverLetter)
+		tryFillByLabel(wd, "anschreiben", info.CoverLetter)
+		tryFillByLabel(wd, "motivationsschreiben", info.CoverLetter)
+		tryFillByLabel(wd, "bewerbungsschreiben", info.CoverLetter)
+	}
+
+	// ── Work authorization & sponsorship ──────────────────────────────────────
+	if info.WorkAuthorized != "" || info.RequireSponsorship != "" {
+		authAns := info.WorkAuthorized
+		sponsorAns := info.RequireSponsorship
+		if authAns == "" {
+			authAns = "yes" // safe default: authorised; skip if not set
+		}
+		if sponsorAns == "" {
+			sponsorAns = "no" // safe default: no sponsorship needed
+		}
+		wd.ExecuteScript(jsHandleWorkEligibility, []interface{}{authAns, sponsorAns}) //nolint:errcheck
+	}
+
+	// ── EEO radio buttons (gender + ethnicity — Ashby and others) ────────────
+	genderVal := info.Gender
+	if genderVal == "" {
+		genderVal = "decline"
+	}
+	ethnicityVal := info.Ethnicity
+	if ethnicityVal == "" {
+		ethnicityVal = "decline"
+	}
+	wd.ExecuteScript(jsHandleEEORadios, []interface{}{genderVal, ethnicityVal}) //nolint:errcheck
+
+	// ── EEO <select> dropdowns + "how did you hear" ───────────────────────────
+	wd.ExecuteScript(jsHandleOptionalSelects, nil) //nolint:errcheck
+
+	// ── Privacy / GDPR consent checkbox ──────────────────────────────────────
+	// Personio and several other ATS platforms require this checkbox before
+	// the Submit button becomes active.
+	wd.ExecuteScript(jsAcceptPrivacyConsent, nil) //nolint:errcheck
+
+	// ── Expected salary ───────────────────────────────────────────────────────
+	// Always set: defaults to "Negotiable" when the caller provides no value.
+	for _, sel := range []string{
+		`input[name*="salary" i]`, `input[id*="salary" i]`,
+		`input[placeholder*="salary" i]`,
+		`input[name*="compensation" i]`, `input[id*="compensation" i]`,
+		`input[name*="ctc" i]`,
+	} {
+		if trySetInput(wd, sel, info.ExpectedSalary) {
+			break
+		}
+	}
+	tryFillByLabel(wd, "expected salary", info.ExpectedSalary)
+	tryFillByLabel(wd, "desired salary", info.ExpectedSalary)
+	tryFillByLabel(wd, "salary expectation", info.ExpectedSalary)
+	tryFillByLabel(wd, "annual salary", info.ExpectedSalary)
+	tryFillByLabel(wd, "expected compensation", info.ExpectedSalary)
+	tryFillByLabel(wd, "compensation", info.ExpectedSalary)
+	tryFillByLabel(wd, "expected ctc", info.ExpectedSalary)
+	tryFillByLabel(wd, "salary", info.ExpectedSalary)
+	trySetSelectByLabel(wd, "expected salary", info.ExpectedSalary)
+	trySetSelectByLabel(wd, "salary range", info.ExpectedSalary)
+	trySetSelectByLabel(wd, "salary", info.ExpectedSalary)
+	tryFillByLabel(wd, "gehaltsvorstellung", info.ExpectedSalary)
+	tryFillByLabel(wd, "gewünschtes gehalt", info.ExpectedSalary)
+	tryFillByLabel(wd, "gehalt", info.ExpectedSalary)
+	tryFillByLabel(wd, "vergütung", info.ExpectedSalary)
+	trySetSelectByLabel(wd, "gehaltsvorstellung", info.ExpectedSalary)
+	wd.ExecuteScript(jsHandleSalary, []interface{}{info.ExpectedSalary}) //nolint:errcheck
+
+	// ── Notice period / earliest start date ──────────────────────────────────
+	np := info.NoticePeriod
+	sd := info.EarliestStartDate
+	if np != "" || sd != "" {
+		// Date-picker inputs (name/id must signal availability or start context)
+		if sd != "" {
+			for _, sel := range []string{
+				`input[type="date"][name*="start" i]`,
+				`input[type="date"][id*="start" i]`,
+				`input[type="date"][name*="available" i]`,
+				`input[type="date"][id*="available" i]`,
+				`input[type="date"][name*="notice" i]`,
+			} {
+				if trySetInput(wd, sel, sd) {
+					break
+				}
+			}
+		}
+		// Text inputs and selects
+		if np != "" {
+			for _, sel := range []string{
+				`input[name*="notice" i]`, `input[id*="notice" i]`,
+				`input[placeholder*="notice period" i]`,
+			} {
+				if trySetInput(wd, sel, np) {
+					break
+				}
+			}
+			for _, sel := range []string{
+				`select[name*="notice" i]`, `select[id*="notice" i]`,
+			} {
+				if trySetSelect(wd, sel, np) {
+					break
+				}
+			}
+			tryFillByLabel(wd, "notice period", np)
+			tryFillByLabel(wd, "notice", np)
+			tryFillByLabel(wd, "earliest start date", np)
+			tryFillByLabel(wd, "start date", np)
+			tryFillByLabel(wd, "available from", np)
+			tryFillByLabel(wd, "availability", np)
+			tryFillByLabel(wd, "when can you start", np)
+			trySetSelectByLabel(wd, "notice period", np)
+			trySetSelectByLabel(wd, "notice", np)
+			trySetSelectByLabel(wd, "availability", np)
+			trySetSelectByLabel(wd, "start date", np)
+			tryFillByLabel(wd, "kündigungsfrist", np)
+			tryFillByLabel(wd, "verfügbarkeit", np)
+			tryFillByLabel(wd, "eintrittsdatum", np)
+			tryFillByLabel(wd, "frühestmöglicher eintrittstermin", np)
+			trySetSelectByLabel(wd, "kündigungsfrist", np)
+			trySetSelectByLabel(wd, "verfügbarkeit", np)
+		}
+		wd.ExecuteScript(jsHandleAvailability, []interface{}{np, sd}) //nolint:errcheck
+	}
+}
+
 // ── ATS-specific form fillers ─────────────────────────────────────────────────
 
 func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -259,6 +1093,7 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
 	uploadResume(wd, resumePath)
+	fillCommonExtras(ctx, wd, info)
 }
 
 func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -283,6 +1118,7 @@ func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
 	uploadResume(wd, resumePath)
+	fillCommonExtras(ctx, wd, info)
 }
 
 func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -318,6 +1154,7 @@ func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
 	uploadResume(wd, resumePath)
+	fillCommonExtras(ctx, wd, info)
 }
 
 func fillBambooHR(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -346,6 +1183,79 @@ func fillBambooHR(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo
 		tryFillByLabel(wd, "phone", info.Phone)
 	}
 	uploadResume(wd, resumePath)
+	fillCommonExtras(ctx, wd, info)
+}
+
+// fillPersonio fills Personio career-page application forms.
+// Personio forms are React SPAs that require a longer wait, have known field
+// names (first_name / firstName, salary_expectations, available_from), and
+// always include a mandatory GDPR/privacy consent checkbox.
+func fillPersonio(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	// React form takes longer to render than static ATS pages.
+	waitForElement(ctx, wd,
+		`input[name="first_name"], input[name="firstName"], `+
+			`input[autocomplete="given-name"], input[placeholder*="First" i]`,
+		15*time.Second)
+
+	first, last := splitName(info.Name)
+
+	// First name
+	if !trySetInput(wd, `input[name="first_name"]`, first) &&
+		!trySetInput(wd, `input[name="firstName"]`, first) &&
+		!trySetInput(wd, `input[autocomplete="given-name"]`, first) &&
+		!trySetInput(wd, `input[placeholder*="First name" i]`, first) {
+		if !tryFillByLabel(wd, "first name", first) {
+			tryFillByLabel(wd, "vorname", first)
+		}
+	}
+	// Last name
+	if !trySetInput(wd, `input[name="last_name"]`, last) &&
+		!trySetInput(wd, `input[name="lastName"]`, last) &&
+		!trySetInput(wd, `input[autocomplete="family-name"]`, last) &&
+		!trySetInput(wd, `input[placeholder*="Last name" i]`, last) {
+		if !tryFillByLabel(wd, "last name", last) {
+			tryFillByLabel(wd, "nachname", last)
+		}
+	}
+	// Email
+	if !trySetInput(wd, `input[name="email"]`, info.Email) &&
+		!trySetInput(wd, `input[type="email"]`, info.Email) &&
+		!trySetInput(wd, `input[autocomplete="email"]`, info.Email) {
+		tryFillByLabel(wd, "email", info.Email)
+	}
+	// Phone
+	if !trySetInput(wd, `input[name="phone"]`, info.Phone) &&
+		!trySetInput(wd, `input[type="tel"]`, info.Phone) &&
+		!trySetInput(wd, `input[autocomplete="tel"]`, info.Phone) {
+		tryFillByLabel(wd, "phone", info.Phone)
+	}
+	// LinkedIn
+	if !trySetInput(wd, `input[name="linkedin_profile"]`, info.LinkedInURL) &&
+		!trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
+		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
+	}
+	// Salary expectations — always set (defaults to "Negotiable").
+	if !trySetInput(wd, `input[name="salary_expectations"]`, info.ExpectedSalary) &&
+		!trySetInput(wd, `input[name="salaryExpectations"]`, info.ExpectedSalary) &&
+		!trySetInput(wd, `input[name*="salary" i]`, info.ExpectedSalary) {
+		if !tryFillByLabel(wd, "salary expectations", info.ExpectedSalary) {
+			tryFillByLabel(wd, "gehaltsvorstellung", info.ExpectedSalary)
+		}
+	}
+	// Earliest start date — always set (defaults to today + 14 days).
+	if !trySetInput(wd, `input[name="available_from"]`, info.EarliestStartDate) &&
+		!trySetInput(wd, `input[name="availabilityDate"]`, info.EarliestStartDate) &&
+		!trySetInput(wd, `input[name="availability_date"]`, info.EarliestStartDate) &&
+		!trySetInput(wd, `input[type="date"][name*="available" i]`, info.EarliestStartDate) {
+		if !tryFillByLabel(wd, "earliest start date", info.EarliestStartDate) &&
+			!tryFillByLabel(wd, "start date", info.EarliestStartDate) {
+			tryFillByLabel(wd, "frühestmöglicher eintrittstermin", info.EarliestStartDate)
+		}
+	}
+	uploadResume(wd, resumePath)
+	// fillCommonExtras handles city/country, cover letter, work auth, EEO,
+	// privacy consent checkbox, salary (JS fallback), and availability (JS fallback).
+	fillCommonExtras(ctx, wd, info)
 }
 
 func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -365,8 +1275,9 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 		}
 	}
 	if !filled {
-		if !tryFillByLabel(wd, "first name", first) {
-			tryFillByLabel(wd, "given name", first)
+		if !tryFillByLabel(wd, "first name", first) &&
+			!tryFillByLabel(wd, "given name", first) {
+			tryFillByLabel(wd, "vorname", first)
 		}
 	}
 
@@ -381,8 +1292,11 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 		}
 	}
 	if !filled {
-		if !tryFillByLabel(wd, "last name", last) {
-			tryFillByLabel(wd, "family name", last)
+		if !tryFillByLabel(wd, "last name", last) &&
+			!tryFillByLabel(wd, "family name", last) {
+			if !tryFillByLabel(wd, "nachname", last) {
+				tryFillByLabel(wd, "familienname", last)
+			}
 		}
 	}
 
@@ -397,8 +1311,9 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 		}
 	}
 	if !filled {
-		if !tryFillByLabel(wd, "full name", info.Name) {
-			tryFillByLabel(wd, "your name", info.Name)
+		if !tryFillByLabel(wd, "full name", info.Name) &&
+			!tryFillByLabel(wd, "your name", info.Name) {
+			tryFillByLabel(wd, "vollständiger name", info.Name)
 		}
 	}
 
@@ -427,8 +1342,11 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 		}
 	}
 	if !filled {
-		if !tryFillByLabel(wd, "phone", info.Phone) {
-			tryFillByLabel(wd, "mobile", info.Phone)
+		if !tryFillByLabel(wd, "phone", info.Phone) &&
+			!tryFillByLabel(wd, "mobile", info.Phone) {
+			if !tryFillByLabel(wd, "telefon", info.Phone) {
+				tryFillByLabel(wd, "handynummer", info.Phone)
+			}
 		}
 	}
 
@@ -447,6 +1365,7 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 	}
 
 	uploadResume(wd, resumePath)
+	fillCommonExtras(ctx, wd, info)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -616,6 +1535,18 @@ var deadPagePhrases = []string{
 	"page does not exist",
 	"this page no longer exists",
 	"we couldn't find that page",
+	// German closed / expired
+	"diese stelle ist nicht mehr verfügbar",
+	"diese position ist nicht mehr verfügbar",
+	"diese ausschreibung ist nicht mehr aktiv",
+	"stelle wurde besetzt",
+	"stelle ist besetzt",
+	"bewerbung nicht mehr möglich",
+	"stellenangebot nicht mehr verfügbar",
+	"stelle abgelaufen",
+	"stelle geschlossen",
+	"seite nicht gefunden",
+	"diese seite existiert nicht",
 }
 
 // jsDeadPage collects signals used by detectDeadPage in a single round-trip:
@@ -724,6 +1655,8 @@ const appFormSelector = `input[type="email"],` +
 	`input[name*="last" i],` +
 	`input[name="name"],` +
 	`input[autocomplete="name"],` +
+	`input[autocomplete="given-name"],` +
+	`input[autocomplete="family-name"],` +
 	`input[id*="email" i],` +
 	`input[id*="firstname" i],` +
 	`input[id*="first_name" i]`
@@ -790,6 +1723,7 @@ return false;`, []interface{}{appFormSelector})
 	if !clicked {
 		const lc = `translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')`
 		for _, phrase := range []string{
+			// English
 			"apply to this job",
 			"apply for this position",
 			"apply for this role",
@@ -803,6 +1737,13 @@ return false;`, []interface{}{appFormSelector})
 			"1-click apply",
 			"apply now",
 			"easy apply",
+			// German
+			"jetzt bewerben",
+			"zur bewerbung",
+			"bewerbung starten",
+			"bewerben sie sich",
+			"hier bewerben",
+			"online bewerben",
 		} {
 			xpath := fmt.Sprintf(`(//button|//a)[contains(%s,'%s')]`, lc, phrase)
 			els, err := wd.FindElements(selenium.ByXPATH, xpath)
@@ -822,14 +1763,19 @@ return false;`, []interface{}{appFormSelector})
 		// Bare "apply" only when the entire label is exactly that word, to
 		// prevent matching navigation links like "Jobs / Apply" breadcrumbs.
 		if !clicked {
-			xpath := fmt.Sprintf(`(//button|//a)[%s='apply']`, lc)
-			els, err := wd.FindElements(selenium.ByXPATH, xpath)
-			if err == nil {
-				for _, el := range els {
-					if el.Click() == nil {
-						clicked = true
-						break
+			for _, bare := range []string{"apply", "bewerben"} {
+				xpath := fmt.Sprintf(`(//button|//a)[%s='%s']`, lc, bare)
+				els, err := wd.FindElements(selenium.ByXPATH, xpath)
+				if err == nil {
+					for _, el := range els {
+						if el.Click() == nil {
+							clicked = true
+							break
+						}
 					}
+				}
+				if clicked {
+					break
 				}
 			}
 		}
@@ -841,8 +1787,8 @@ return false;`, []interface{}{appFormSelector})
 	// ATS apply buttons are frequently placed inside sticky page headers.
 	if !clicked {
 		const jsApply = `
-var MULTI = /\b(apply\s+(?:to\s+this\s+(?:job|position|role)|for\s+this\s+(?:job|position|role)|now|with\s+\S+)|easy\s+apply|quick\s+apply|(?:start|begin)\s+(?:your\s+)?application|1[\s-]click\s+apply)\b/i;
-var BARE  = /^\s*apply\s*$/i;
+var MULTI = /\b(apply\s+(?:to\s+this\s+(?:job|position|role)|for\s+this\s+(?:job|position|role)|now|with\s+\S+)|easy\s+apply|quick\s+apply|(?:start|begin)\s+(?:your\s+)?application|1[\s-]click\s+apply|jetzt\s+bewerben|zur\s+bewerbung|bewerbung\s+starten|bewerben\s+sie\s+sich|hier\s+bewerben|online\s+bewerben)\b/i;
+var BARE  = /^\s*(?:apply|bewerben)\s*$/i;
 var all = Array.from(document.querySelectorAll('button, a[href], [role="button"]'));
 for (var i = 0; i < all.length; i++) {
     var el = all[i];
@@ -1127,32 +2073,52 @@ func uploadResume(wd selenium.WebDriver, path string) bool {
 }
 
 // jsVerifySubmission checks whether the page shows signs of a successful
-// submission or a validation error, collecting both in one round-trip.
+// submission or a validation/server error, collecting all signals in one
+// round-trip.  Returns:
+//   {success: true,  phrase: "..."}  — confirmation phrase detected
+//   {success: false, error: "..."}   — visible form-validation error element
+//   {success: false, serverError: "..."} — server-side failure phrase detected
+//   {success: false}                 — no conclusive signal
 const jsVerifySubmission = `
 try {
-    var txt   = ((document.body && document.body.innerText) || '').toLowerCase();
-    var title = (document.title || '').toLowerCase();
-    var combined = title + ' ' + txt.slice(0, 3000);
+    var txt   = ((document.body && document.body.innerText) || ‘’).toLowerCase();
+    var title = (document.title || ‘’).toLowerCase();
+    var combined = title + ‘ ‘ + txt.slice(0, 3000);
 
     var ok = [
-        'thank you for applying','thanks for applying',
-        'application received','application submitted',
-        'successfully submitted','successfully applied',
-        'we will review','we’ll be in touch',"we'll be in touch",
-        'you have applied','application complete',
-        'your application has been','application was submitted',
-        'submission confirmed','we received your application',
-        'your application is complete','application is under review'
+        ‘thank you for applying’,’thanks for applying’,
+        ‘application received’,’application submitted’,
+        ‘successfully submitted’,’successfully applied’,
+        ‘we will review’,’we’ll be in touch’,"we’ll be in touch",
+        ‘you have applied’,’application complete’,
+        ‘your application has been’,’application was submitted’,
+        ‘submission confirmed’,’we received your application’,
+        ‘your application is complete’,’application is under review’
     ];
     for (var i = 0; i < ok.length; i++) {
         if (combined.indexOf(ok[i]) !== -1) return {success: true, phrase: ok[i]};
     }
 
+    // Server-side failure phrases — distinct from per-field validation errors.
+    var fail = [
+        ‘submission failed’,’failed to submit’,’error submitting’,
+        ‘unable to submit’,’could not submit’,
+        ‘something went wrong’,’an error occurred’,
+        ‘please try again’,’try again later’,
+        ‘submission unsuccessful’,’unable to process your application’,
+        ‘we encountered a problem’,’there was a problem’,
+        ‘there was an error’,’application could not be submitted’,
+        ‘your application was not submitted’
+    ];
+    for (var k = 0; k < fail.length; k++) {
+        if (combined.indexOf(fail[k]) !== -1) return {success: false, serverError: fail[k]};
+    }
+
     // Visible validation-error elements — indicates the form is still open with errors.
-    var errSels = '[class*="error" i]:not([class*="error-page" i]),[class*="invalid" i],[aria-invalid="true"],[data-error],.field-error,.form-error';
+    var errSels = ‘[class*="error" i]:not([class*="error-page" i]),[class*="invalid" i],[aria-invalid="true"],[data-error],.field-error,.form-error’;
     var errEls  = document.querySelectorAll(errSels);
     for (var j = 0; j < errEls.length; j++) {
-        var t = (errEls[j].innerText || '').trim();
+        var t = (errEls[j].innerText || ‘’).trim();
         if (t && t.length < 300) return {success: false, error: t};
     }
     return {success: false};
@@ -1165,6 +2131,10 @@ var successURLSegs = []string{
 	"thank", "thanks", "success", "confirm", "submitted",
 	"complete", "done", "received", "applied",
 }
+
+// errorURLSegs are path segments that indicate an error or failure page after
+// a form submission redirect.
+var errorURLSegs = []string{"/error", "/failed", "/failure", "/problem", "/oops"}
 
 // verifySubmission waits up to 10 s after submit for a confirmation signal:
 // a URL redirect to a thank-you page, a success phrase in the page text, or
@@ -1187,18 +2157,47 @@ func verifySubmission(ctx context.Context, wd selenium.WebDriver, headful bool) 
 		// thank-you or confirmation page after successful submission.
 		if cur, _ := wd.CurrentURL(); cur != originalURL {
 			low := strings.ToLower(cur)
+
+			// Explicit error path segments beat everything else.
+			for _, seg := range errorURLSegs {
+				if strings.Contains(low, seg) {
+					return fmt.Errorf("submission redirected to error page: %s", cur)
+				}
+			}
+
 			for _, seg := range successURLSegs {
 				if strings.Contains(low, seg) {
 					log.Printf("[apply] submission confirmed via redirect: %s", cur)
 					return nil
 				}
 			}
-			// Any navigation away from the form page counts as acceptance.
+
+			// Ambiguous redirect — inspect the new page before declaring success.
+			if raw, err := wd.ExecuteScript(jsVerifySubmission, nil); err == nil {
+				if data, ok := raw.(map[string]interface{}); ok {
+					if svrErr, _ := data["serverError"].(string); svrErr != "" {
+						if headful {
+							log.Printf("[apply] server error on redirect — keeping window open 15 s: %s", svrErr)
+							time.Sleep(15 * time.Second)
+						}
+						return fmt.Errorf("submission failed: %s", svrErr)
+					}
+					if errMsg, _ := data["error"].(string); errMsg != "" {
+						if headful {
+							log.Printf("[apply] form validation error on redirect — keeping window open 15 s: %s", errMsg)
+							time.Sleep(15 * time.Second)
+						}
+						return fmt.Errorf("form validation failed: %s", errMsg)
+					}
+				}
+			}
+
+			// No error signals on the new page — treat navigation as acceptance.
 			log.Printf("[apply] form navigated → %s (treating as submitted)", cur)
 			return nil
 		}
 
-		// Page-content check: success phrase or validation error.
+		// Page-content check: success phrase, server error, or validation error.
 		raw, err := wd.ExecuteScript(jsVerifySubmission, nil)
 		if err != nil {
 			continue
@@ -1208,6 +2207,13 @@ func verifySubmission(ctx context.Context, wd selenium.WebDriver, headful bool) 
 			phrase, _ := data["phrase"].(string)
 			log.Printf("[apply] submission confirmed (%q)", phrase)
 			return nil
+		}
+		if svrErr, _ := data["serverError"].(string); svrErr != "" {
+			if headful {
+				log.Printf("[apply] server error — keeping window open 15 s: %s", svrErr)
+				time.Sleep(15 * time.Second)
+			}
+			return fmt.Errorf("submission failed: %s", svrErr)
 		}
 		if errMsg, _ := data["error"].(string); errMsg != "" {
 			if headful {
@@ -1279,6 +2285,87 @@ func clickSubmit(wd selenium.WebDriver) error {
 	}
 
 	return fmt.Errorf("no submit button found on page")
+}
+
+// jsClickSimplify finds and clicks the Simplify extension's injected autofill
+// button.  Simplify injects a floating panel into the page DOM (not a browser
+// popup) so it is reachable via document.querySelector.  We try three
+// strategies in order:
+//  1. Elements whose class or id contains "simplify" and that are themselves
+//     or contain a clickable button/role=button.
+//  2. Any visible button whose full text matches known Simplify autofill labels.
+//  3. Any button inside a fixed-position container (Simplify uses position:fixed
+//     for its floating panel) whose text suggests an autofill action.
+const jsClickSimplify = `
+(function(){
+    function vis(el){
+        return el.offsetParent!==null || window.getComputedStyle(el).position==='fixed';
+    }
+    function tryClick(el){
+        if(!el||el.disabled||!vis(el)) return false;
+        el.scrollIntoView({block:'center'});
+        el.click();
+        return true;
+    }
+
+    // Strategy 1: elements with "simplify" in class/id that are or contain buttons
+    var simplifyEls = document.querySelectorAll(
+        'button[class*="simplify" i], button[id*="simplify" i],' +
+        '[class*="simplify" i] button, [id*="simplify" i] button,' +
+        '[class*="simplify" i][role="button"], [id*="simplify" i][role="button"],' +
+        '[data-simplify] button, [data-extension="simplify"] button'
+    );
+    for(var i=0;i<simplifyEls.length;i++){
+        if(tryClick(simplifyEls[i])) return true;
+    }
+
+    // Strategy 2: text-based search — Simplify's button text variants
+    var FILL=/^\s*(autofill|fill\s+application|fill\s+form|apply\s+with\s+simplify|simplify\s+autofill|autofill\s+application)\s*$/i;
+    var btns=document.querySelectorAll('button,[role="button"]');
+    for(var j=0;j<btns.length;j++){
+        var t=(btns[j].innerText||btns[j].textContent||btns[j].getAttribute('aria-label')||'').trim();
+        if(FILL.test(t) && tryClick(btns[j])) return true;
+    }
+
+    // Strategy 3: any button in a fixed-position ancestor whose text includes
+    // "autofill" or "simplify" — covers future Simplify UI variants
+    var BROAD=/simplify|autofill/i;
+    for(var k=0;k<btns.length;k++){
+        var btn=btns[k];
+        if(!vis(btn)) continue;
+        var p=btn.parentElement;
+        var inFixed=false;
+        while(p){
+            if(window.getComputedStyle(p).position==='fixed'){inFixed=true;break;}
+            p=p.parentElement;
+        }
+        if(!inFixed) continue;
+        var bt=(btn.innerText||btn.textContent||btn.getAttribute('aria-label')||'').trim();
+        if(BROAD.test(bt) && tryClick(btn)) return true;
+    }
+    return false;
+})()
+`
+
+// waitAndClickSimplify polls for the Simplify extension's injected autofill
+// button for up to timeout, clicking it as soon as it appears.  Returns true
+// when the button was found and clicked.
+func waitAndClickSimplify(ctx context.Context, wd selenium.WebDriver, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		res, err := wd.ExecuteScript(jsClickSimplify, nil)
+		if err == nil && res == true {
+			log.Printf("[simplify] autofill button clicked")
+			return true
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
 }
 
 func splitName(full string) (first, last string) {

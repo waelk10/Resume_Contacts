@@ -13,6 +13,7 @@ import (
 	"Resume_Contacts_Scraper/internal/resume"
 )
 
+
 // platformCooldowns is the minimum pause between consecutive applications on
 // the same ATS platform.  Ashby's spam filters are sensitive to rapid
 // submissions — a per-platform cooldown prevents the account from being flagged
@@ -23,10 +24,55 @@ var platformCooldowns = map[string]time.Duration{
 
 // ApplicantInfo holds the personal details typed into application forms.
 type ApplicantInfo struct {
+	// Core contact — always required
 	Name        string
 	Email       string
 	Phone       string
 	LinkedInURL string
+
+	// Address — auto-extracted from CV when empty
+	City    string
+	State   string // 2-letter code or full name accepted
+	ZipCode string
+	Country string
+
+	// Professional links — auto-extracted from CV when empty
+	Website   string // personal site / portfolio
+	GitHubURL string
+
+	// Application text
+	CoverLetter string // plain text; injected into cover-letter textareas
+
+	// Expected salary — fills "expected salary" / "desired compensation" fields.
+	// Examples: "85000", "$85,000", "80k-100k".  Empty means skip.
+	ExpectedSalary string
+
+	// NoticePeriod is the text answer to "notice period" selects and text
+	// inputs (e.g. "2 weeks", "immediately", "1 month").
+	// Default when empty: "2 weeks" (set by New()).
+	NoticePeriod string
+
+	// EarliestStartDate is an ISO-8601 date (YYYY-MM-DD) injected into
+	// date-picker inputs for "available from" / "start date" questions.
+	// Default when empty: today + 14 days (set by New()).
+	EarliestStartDate string
+
+	// Work eligibility — used to answer yes/no radio/select questions
+	// Values: "yes" or "no".  Empty means "don't answer".
+	WorkAuthorized     string // "Are you authorised to work…?"
+	RequireSponsorship string // "Do you require sponsorship?"
+
+	// Voluntary self-identification (EEO).  Both default to "decline" which
+	// selects "Prefer not to answer" / "Decline to self-identify" when present.
+	//
+	// Accepted Gender values:
+	//   male | female | non-binary | decline
+	//
+	// Accepted Ethnicity values:
+	//   white | black | hispanic | asian |
+	//   american-indian | pacific-islander | two-or-more | decline
+	Gender    string
+	Ethnicity string
 }
 
 // Config controls the auto-apply pipeline.
@@ -42,6 +88,13 @@ type Config struct {
 	// Resume tailoring via the local claude CLI
 	TailorResumes     bool   // generate a position-specific resume PDF before applying
 	TailoredOutputDir string // directory for tailored PDFs (default: "tailored_resumes")
+
+	// Simplify extension support
+	// ProfileDir is a persistent Firefox profile directory that contains the
+	// Simplify extension already installed and authenticated.  Run with
+	// --setup to create the profile interactively.
+	ProfileDir   string
+	SimplifyWait time.Duration // pause after form appears for Simplify to auto-fill (0 = disabled)
 }
 
 // Result records the outcome of one application attempt.
@@ -74,11 +127,71 @@ func New(cfg Config) (*Applicator, error) {
 	if err := os.MkdirAll(cfg.TailoredOutputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create tailored-resume dir: %w", err)
 	}
-	b, err := NewBrowser(cfg.Headful)
+
+	// Fill any empty ApplicantInfo fields from the CV before opening the browser
+	// so every field is available to the form-fillers on all platforms.
+	if cfg.ResumePath != "" {
+		enrichFromResume(&cfg)
+	}
+
+	// Bake in defaults for all compensation/availability fields so forms are
+	// always filled without requiring the caller to specify values.
+	a := &cfg.Applicant
+	if a.ExpectedSalary == "" {
+		a.ExpectedSalary = "Negotiable"
+	}
+	if a.NoticePeriod == "" {
+		a.NoticePeriod = "2 weeks"
+	}
+	if a.EarliestStartDate == "" {
+		a.EarliestStartDate = time.Now().AddDate(0, 0, 14).Format("2006-01-02")
+	}
+
+	if cfg.ProfileDir != "" {
+		if err := os.MkdirAll(cfg.ProfileDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create profile directory %q: %w", cfg.ProfileDir, err)
+		}
+	}
+	b, err := NewBrowser(cfg.Headful, cfg.ProfileDir)
 	if err != nil {
 		return nil, fmt.Errorf("browser init: %w", err)
 	}
 	return &Applicator{cfg: cfg, browser: b, lastRun: make(map[string]time.Time)}, nil
+}
+
+// enrichFromResume parses the CV PDF and back-fills any ApplicantInfo fields
+// that the user has not explicitly supplied.  Failures are logged but never
+// fatal — missing CV data just means some form fields may be left blank.
+func enrichFromResume(cfg *Config) {
+	text, err := resume.ExtractText(cfg.ResumePath)
+	if err != nil {
+		log.Printf("[cv] could not read CV for field extraction: %v", err)
+		return
+	}
+	f := resume.ParseFields(text)
+	a := &cfg.Applicant
+
+	if a.City == "" {
+		a.City = f.City
+	}
+	if a.State == "" {
+		a.State = f.State
+	}
+	if a.ZipCode == "" {
+		a.ZipCode = f.ZipCode
+	}
+	if a.Country == "" {
+		a.Country = f.Country
+	}
+	if a.GitHubURL == "" {
+		a.GitHubURL = f.GitHub
+	}
+	if a.Website == "" {
+		a.Website = f.Website
+	}
+
+	log.Printf("[cv] fields extracted — city=%q state=%q zip=%q country=%q github=%v website=%v",
+		a.City, a.State, a.ZipCode, a.Country, a.GitHubURL != "", a.Website != "")
 }
 
 // Close releases the browser process.
@@ -156,8 +269,18 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 		resumePath = a.tailorResume(ctx, job)
 	}
 
-	flags := FillFlags{DryRun: a.cfg.DryRun, Screenshot: a.cfg.Screenshots, Headful: a.cfg.Headful, Hold: a.cfg.Hold}
+	flags := FillFlags{
+		DryRun:       a.cfg.DryRun,
+		Screenshot:   a.cfg.Screenshots,
+		Headful:      a.cfg.Headful,
+		Hold:         a.cfg.Hold,
+		SimplifyWait: a.cfg.SimplifyWait,
+	}
 	if err := a.browser.FillApplication(ctx, job, a.cfg.Applicant, resumePath, flags); err != nil {
+		if errors.Is(err, ErrWindowClosed) {
+			res.Status = "skipped"
+			return res
+		}
 		log.Printf("[apply] %s: fill error: %v", rawURL, err)
 		res.Status = "error"
 		res.Error = err

@@ -104,6 +104,12 @@ func detectPlatform(rawURL string) string {
 		return "workday"
 	case strings.Contains(h, "bamboohr.com"):
 		return "bamboohr"
+	case strings.Contains(h, "personio.com") || strings.Contains(h, "personio.de"):
+		return "personio"
+	case strings.Contains(h, "workable.com"):
+		return "workable"
+	case strings.Contains(h, "recruitee.com"):
+		return "recruitee"
 	case strings.Contains(h, "icims.com"):
 		return "icims"
 	case strings.Contains(h, "smartrecruiters.com"):
