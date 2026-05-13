@@ -5,12 +5,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"Resume_Contacts_Scraper/internal/applier"
 )
@@ -29,25 +32,71 @@ Required flags:
   --name NAME      your full name
   --email EMAIL    your email address
 
-Flags:
+Address / contact (auto-extracted from CV when omitted):
+  --city, --state, --zip, --country, --website, --github
+
+Compensation / availability (auto-filled; override with these flags):
+  --salary VALUE              expected salary answer, e.g. "85000" or "80k-100k"
+                              (default: "Negotiable"; overrides the baked-in default)
+  --notice-period TEXT        notice-period answer, e.g. "immediately", "1 month"
+                              (default: "2 weeks")
+  --start-date YYYY-MM-DD     earliest start date for date-picker inputs
+                              (default: today + 14 days)
+
+Work eligibility:
+  --work-auth yes|no          answer to "authorized to work?" (default: yes)
+  --sponsorship yes|no        answer to "require sponsorship?" (default: no)
+
+Voluntary self-identification (EEO) — Ashby and other ATS platforms:
+  --gender VALUE
+      male | female | non-binary | decline (default: decline)
+      "decline" selects "Prefer not to answer" / "Decline to self-identify".
+
+  --ethnicity VALUE
+      white | black | hispanic | asian | american-indian |
+      pacific-islander | two-or-more | decline (default: decline)
+      "decline" selects "Prefer not to answer" / "Decline to self-identify".
+
+All flags:
 `)
 		fs.PrintDefaults()
 	}
 
 	var (
-		urlsFile   string
-		resumePath string
-		name       string
-		email      string
-		phone      string
-		linkedin   string
-		dryRun     bool
-		hold       bool
-		conc       int
-		headful    bool
-		shots      bool
-		tailor    bool
-		outputDir string
+		urlsFile      string
+		resumePath    string
+		name          string
+		email         string
+		phone         string
+		linkedin      string
+		dryRun        bool
+		hold          bool
+		conc          int
+		headful       bool
+		shots         bool
+		tailor        bool
+		outputDir     string
+		failedURLsFile string
+		logFile        string
+		// Extended applicant fields
+		city               string
+		state              string
+		zipCode            string
+		country            string
+		website            string
+		github             string
+		coverLetterPath    string
+		expectedSalary     string
+		noticePeriod       string
+		startDate          string
+		workAuth           string
+		requireSponsorship string
+		gender             string
+		ethnicity          string
+		// Simplify extension
+		profileDir   string
+		simplifyWait int
+		setup        bool
 	)
 
 	fs.StringVar(&urlsFile, "urls", "", "file with job URLs, one per line [required]")
@@ -66,8 +115,54 @@ Flags:
 	fs.BoolVar(&shots, "screenshots", false, "save a PNG screenshot after filling each form")
 	fs.BoolVar(&tailor, "tailor", false, "use the claude CLI to tailor the resume to each job before uploading")
 	fs.StringVar(&outputDir, "output-dir", "tailored_resumes", "directory for tailored resume PDFs")
+	fs.StringVar(&failedURLsFile, "failed-urls", "failed_urls.txt", "file to append URLs that failed to apply (empty string disables)")
+	fs.StringVar(&logFile, "log-file", "apply.log", "file to write all log output (appended; empty string disables)")
+	// Extended applicant details — auto-populated from the CV when omitted
+	fs.StringVar(&city, "city", "", "city (auto-extracted from CV when omitted)")
+	fs.StringVar(&state, "state", "", "state/province code or full name (auto-extracted from CV)")
+	fs.StringVar(&zipCode, "zip", "", "ZIP / postal code (auto-extracted from CV)")
+	fs.StringVar(&country, "country", "", "country (auto-extracted from CV)")
+	fs.StringVar(&website, "website", "", "personal website / portfolio URL (auto-extracted from CV)")
+	fs.StringVar(&github, "github", "", "GitHub profile URL (auto-extracted from CV)")
+	fs.StringVar(&coverLetterPath, "cover-letter", "", "path to a plain-text cover letter file")
+	fs.StringVar(&expectedSalary, "salary", "", `override expected salary answer (e.g. "85000", "80k-100k"); default: "Negotiable"`)
+	fs.StringVar(&noticePeriod, "notice-period", "2 weeks", `answer to "notice period" selects and text fields (e.g. "2 weeks", "immediately", "1 month")`)
+	fs.StringVar(&startDate, "start-date", time.Now().AddDate(0, 0, 14).Format("2006-01-02"),
+		"earliest start date (YYYY-MM-DD) for date-picker inputs; default: today + 14 days")
+	fs.StringVar(&workAuth, "work-auth", "yes", `"yes"/"no" answer to work-authorization questions`)
+	fs.StringVar(&requireSponsorship, "sponsorship", "no", `"yes"/"no" answer to visa-sponsorship questions`)
+	fs.StringVar(&gender, "gender", "decline",
+		`voluntary self-ID gender answer (Ashby and other EEO radio sections).
+	Accepted values: male | female | non-binary | decline
+	"decline" selects "Prefer not to answer" / "Decline to self-identify".`)
+	fs.StringVar(&ethnicity, "ethnicity", "decline",
+		`voluntary self-ID ethnicity/race answer (Ashby and other EEO radio sections).
+	Accepted values:
+	  white | black | hispanic | asian |
+	  american-indian | pacific-islander | two-or-more | decline
+	"decline" selects "Prefer not to answer" / "Decline to self-identify".`)
+	// Simplify extension
+	fs.StringVar(&profileDir, "profile-dir", defaultProfileDir(),
+		"persistent Firefox profile directory that holds the Simplify extension\n"+
+			"\t(created automatically; run with --setup once to install and log in)")
+	fs.IntVar(&simplifyWait, "simplify-wait", 0,
+		"seconds to pause after form load for the Simplify extension to auto-fill\n"+
+			"\t(set to 3 when using --profile-dir; 0 disables the pause)")
+	fs.BoolVar(&setup, "setup", false,
+		"open Firefox with --profile-dir so you can install and log into Simplify,\n"+
+			"\tthen close the window — no other flags required")
 
 	_ = fs.Parse(os.Args[2:])
+
+	// --setup: interactive one-time Simplify login — no other flags required.
+	if setup {
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+		if err := applier.RunSetup(ctx, profileDir); err != nil {
+			log.Fatalf("setup: %v", err)
+		}
+		return
+	}
 
 	var missing []string
 	if urlsFile == "" {
@@ -93,6 +188,21 @@ Flags:
 		os.Exit(1)
 	}
 
+	// Set up log file — tee all log output to both stderr and the file.
+	var logWriter io.Writer = os.Stderr
+	if logFile != "" {
+		lf, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not open log file %q: %v\n", logFile, err)
+		} else {
+			defer lf.Close()
+			logWriter = io.MultiWriter(os.Stderr, lf)
+			fmt.Fprintf(lf, "\n=== apply run started %s ===\n", time.Now().Format(time.RFC3339))
+		}
+	}
+	log.SetOutput(logWriter)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
 	urls, err := readLines(urlsFile)
 	if err != nil {
 		log.Fatalf("load URLs: %v", err)
@@ -102,12 +212,36 @@ Flags:
 		return
 	}
 
+	// Load cover letter text from file if supplied.
+	var coverLetterText string
+	if coverLetterPath != "" {
+		if data, err := os.ReadFile(coverLetterPath); err == nil {
+			coverLetterText = strings.TrimSpace(string(data))
+		} else {
+			log.Printf("warning: could not read cover-letter file %q: %v", coverLetterPath, err)
+		}
+	}
+
 	cfg := applier.Config{
 		Applicant: applier.ApplicantInfo{
-			Name:        name,
-			Email:       email,
-			Phone:       phone,
-			LinkedInURL: linkedin,
+			Name:               name,
+			Email:              email,
+			Phone:              phone,
+			LinkedInURL:        linkedin,
+			City:               city,
+			State:              state,
+			ZipCode:            zipCode,
+			Country:            country,
+			Website:            website,
+			GitHubURL:          github,
+			CoverLetter:        coverLetterText,
+			ExpectedSalary:     expectedSalary,
+			NoticePeriod:       noticePeriod,
+			EarliestStartDate:  startDate,
+			WorkAuthorized:     workAuth,
+			RequireSponsorship: requireSponsorship,
+			Gender:             gender,
+			Ethnicity:          ethnicity,
 		},
 		ResumePath:        resumePath,
 		DryRun:            dryRun,
@@ -117,6 +251,8 @@ Flags:
 		Screenshots:       shots,
 		TailorResumes:     tailor,
 		TailoredOutputDir: outputDir,
+		ProfileDir:        profileDir,
+		SimplifyWait:      time.Duration(simplifyWait) * time.Second,
 	}
 
 	mode := "live"
@@ -154,21 +290,81 @@ Flags:
 
 	results := app.Run(ctx, urls)
 
-	var applied, dryCnt, errCnt int
+	var applied, dryCnt, skippedCnt, errCnt int
 	for _, r := range results {
 		switch r.Status {
 		case "applied":
 			applied++
-			fmt.Printf("[+] %s @ %s\n", r.Title, r.Company)
+			line := fmt.Sprintf("[+] %s @ %s", r.Title, r.Company)
+			fmt.Println(line)
+			log.Print(line)
 		case "dry-run":
 			dryCnt++
-			fmt.Printf("[~] %s @ %s  (dry-run)\n", r.Title, r.Company)
+			line := fmt.Sprintf("[~] %s @ %s  (dry-run)", r.Title, r.Company)
+			fmt.Println(line)
+			log.Print(line)
+		case "skipped":
+			skippedCnt++
+			line := fmt.Sprintf("[-] %s  (window closed)", r.URL)
+			fmt.Println(line)
+			log.Print(line)
 		default:
 			errCnt++
-			fmt.Printf("[!] %s: %v\n", r.URL, r.Error)
+			line := fmt.Sprintf("[!] %s: %v", r.URL, r.Error)
+			fmt.Println(line)
+			log.Print(line)
 		}
 	}
-	fmt.Printf("\nDone. Applied: %d  Dry-run: %d  Errors: %d\n", applied, dryCnt, errCnt)
+	summary := fmt.Sprintf("Done. Applied: %d  Dry-run: %d  Skipped: %d  Errors: %d",
+		applied, dryCnt, skippedCnt, errCnt)
+	fmt.Println()
+	fmt.Println(summary)
+	log.Print(summary)
+
+	if errCnt > 0 && failedURLsFile != "" {
+		if err := appendFailedURLs(failedURLsFile, results); err != nil {
+			log.Printf("warning: could not save failed URLs: %v", err)
+		} else {
+			fmt.Printf("Failed URLs appended to: %s\n", failedURLsFile)
+		}
+	}
+}
+
+// appendFailedURLs appends the URL of every error-status result to path, one
+// per line.  The file is created if it does not exist; existing content is
+// preserved so successive runs accumulate a retry list.
+func appendFailedURLs(path string, results []applier.Result) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	for _, r := range results {
+		if r.Status == "error" {
+			fmt.Fprintln(w, r.URL)
+		}
+	}
+	return w.Flush()
+}
+
+// defaultProfileDir returns a Firefox profile path that is accessible inside
+// the snap sandbox on Ubuntu 22.04+ (where Firefox ships as a snap).
+// Snap Firefox silently ignores profile paths outside its sandbox and falls
+// back to the default profile, causing "Firefox is already running" errors.
+// ~/snap/firefox/common/ is always writable by the snap; for non-snap Firefox
+// it is just an ordinary directory that Firefox can access normally.
+func defaultProfileDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(".", "firefox-profile")
+	}
+	// If snap Firefox is installed, use its writable home directory.
+	snapBase := filepath.Join(home, "snap", "firefox")
+	if _, err := os.Stat(snapBase); err == nil {
+		return filepath.Join(snapBase, "common", "resume-scraper-profile")
+	}
+	return filepath.Join(home, ".mozilla", "resume-scraper-profile")
 }
 
 // readLines reads a file and returns non-blank, non-comment lines.
