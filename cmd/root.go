@@ -27,7 +27,7 @@ type runFlags struct {
 
 func Execute() {
 	if len(os.Args) < 2 {
-		printHelp()
+		runTUI()
 		os.Exit(0)
 	}
 
@@ -126,6 +126,7 @@ func printHelp() {
 	fmt.Printf(`Resume Contacts Scraper v%s
 
 Usage:
+  Resume_Contacts_Scraper                 Launch the interactive TUI (no arguments needed)
   Resume_Contacts_Scraper <command> [flags]
 
 Commands:
