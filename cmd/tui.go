@@ -1,0 +1,450 @@
+package cmd
+
+import (
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
+)
+
+func runTUI() {
+	st := loadTUIState()
+
+	// Fill seed / resume paths with disk-detected defaults when the saved
+	// state has an empty value (e.g. on first run or after a purge).
+	if st.Start.Seeds == "" {
+		st.Start.Seeds = tuiSeedsDefault()
+	}
+	if st.Pages.Seeds == "" {
+		st.Pages.Seeds = tuiSeedsDefault()
+	}
+	if st.Discover.Seeds == "" {
+		st.Discover.Seeds = tuiSeedsDefault()
+	}
+	if st.Apply.Resume == "" {
+		st.Apply.Resume = tuiResumeDefault()
+	}
+
+	app := tview.NewApplication()
+	var pendingAction func()
+
+	rightPages := tview.NewPages()
+	cmdList := tview.NewList().ShowSecondaryText(false)
+	focusList := func() { app.SetFocus(cmdList) }
+
+	addCmd := func(name string, f *tview.Form) {
+		cmdList.AddItem(name, "", 0, nil)
+		f.SetBorder(true).
+			SetTitle(" "+name+" ").
+			SetTitleAlign(tview.AlignLeft).
+			SetBorderColor(tcell.ColorDarkCyan)
+		f.SetCancelFunc(focusList)
+		rightPages.AddPage(name, f, true, false)
+	}
+
+	// ── Lifted form variables ────────────────────────────────────────────
+	// All sections live here so snapshot() can read them regardless of
+	// which Run button the user clicks.
+
+	// start
+	startConc := st.Start.Concurrency
+	startSeeds := st.Start.Seeds
+	startCountries := st.Start.Countries
+	startSMTP := st.Start.SMTPVerify
+
+	// pages
+	pgConc := st.Pages.Concurrency
+	pgSeeds := st.Pages.Seeds
+	pgCountries := st.Pages.Countries
+	pgSMTP := st.Pages.SMTPVerify
+
+	// discover
+	discConc := st.Discover.Concurrency
+	discSeeds := st.Discover.Seeds
+	discCountries := st.Discover.Countries
+	discHops := st.Discover.Hops
+
+	// apply
+	applyMode := st.Apply.Mode
+	applyURLs := st.Apply.URLsFile
+	applyResume := st.Apply.Resume
+	applyCoverLetter := st.Apply.CoverLetter
+	applyName := st.Apply.Name
+	applyEmail := st.Apply.Email
+	applyPhone := st.Apply.Phone
+	applyLinkedIn := st.Apply.LinkedIn
+	applyGitHub := st.Apply.GitHub
+	applyWebsite := st.Apply.Website
+	applyCity := st.Apply.City
+	applyState := st.Apply.State
+	applyZIP := st.Apply.ZIP
+	applyCountry := st.Apply.Country
+	applySalary := st.Apply.Salary
+	applyNoticePeriod := st.Apply.NoticePeriod
+	applyStartDate := st.Apply.StartDate
+	applyWorkAuthIdx := st.Apply.WorkAuthIdx
+	applySponsorIdx := st.Apply.SponsorshipIdx
+	applyGenderIdx := st.Apply.GenderIdx
+	applyEthnicityIdx := st.Apply.EthnicityIdx
+	applyHeadful := st.Apply.Headful
+	applyDryRun := st.Apply.DryRun
+	applyHold := st.Apply.Hold
+	applyShots := st.Apply.Screenshots
+	applyTailor := st.Apply.Tailor
+	applyConc := st.Apply.Concurrency
+	applySwait := st.Apply.SimplifyWait
+	applyOutputDir := st.Apply.OutputDir
+	applyFailedURLs := st.Apply.FailedURLs
+	applyLogFile := st.Apply.LogFile
+
+	// clean
+	cleanDir := st.Clean.Directory
+	cleanRegex := st.Clean.Regex
+	cleanDedup := st.Clean.Dedup
+
+	// snapshot captures the current value of every form variable.
+	snapshot := func() tuiSavedState {
+		return tuiSavedState{
+			Start: tuiStartSaved{startConc, startSeeds, startCountries, startSMTP},
+			Pages: tuiPagesSaved{pgConc, pgSeeds, pgCountries, pgSMTP},
+			Discover: tuiDiscoverSaved{discConc, discSeeds, discCountries, discHops},
+			Apply: tuiApplySaved{
+				Mode: applyMode, URLsFile: applyURLs, Resume: applyResume,
+				CoverLetter: applyCoverLetter, Name: applyName, Email: applyEmail,
+				Phone: applyPhone, LinkedIn: applyLinkedIn, GitHub: applyGitHub,
+				Website: applyWebsite, City: applyCity, State: applyState,
+				ZIP: applyZIP, Country: applyCountry, Salary: applySalary,
+				NoticePeriod: applyNoticePeriod, StartDate: applyStartDate,
+				WorkAuthIdx: applyWorkAuthIdx, SponsorshipIdx: applySponsorIdx,
+				GenderIdx: applyGenderIdx, EthnicityIdx: applyEthnicityIdx,
+				Headful: applyHeadful, DryRun: applyDryRun, Hold: applyHold,
+				Screenshots: applyShots, Tailor: applyTailor, Concurrency: applyConc,
+				SimplifyWait: applySwait, OutputDir: applyOutputDir,
+				FailedURLs: applyFailedURLs, LogFile: applyLogFile,
+			},
+			Clean: tuiCleanSaved{cleanDir, cleanRegex, cleanDedup},
+		}
+	}
+
+	// ── start ──────────────────────────────────────────────────────────────
+	{
+		f := tview.NewForm().
+			AddInputField("Concurrency", startConc, 6, acceptInt, func(t string) { startConc = t }).
+			AddInputField("Seeds file", startSeeds, 40, nil, func(t string) { startSeeds = t }).
+			AddInputField("Countries", startCountries, 40, nil, func(t string) { startCountries = t }).
+			AddCheckbox("SMTP-verify each address", startSMTP, func(c bool) { startSMTP = c }).
+			AddButton("Run", func() {
+				saveTUIState(snapshot())
+				pendingAction = func() { startup(tuiBuildFlags(startConc, startSeeds, startCountries, 0, startSMTP)) }
+				app.Stop()
+			})
+		addCmd("start", f)
+	}
+
+	// ── pages ──────────────────────────────────────────────────────────────
+	{
+		f := tview.NewForm().
+			AddInputField("Concurrency", pgConc, 6, acceptInt, func(t string) { pgConc = t }).
+			AddInputField("Seeds file", pgSeeds, 40, nil, func(t string) { pgSeeds = t }).
+			AddInputField("Countries", pgCountries, 40, nil, func(t string) { pgCountries = t }).
+			AddCheckbox("SMTP-verify each address", pgSMTP, func(c bool) { pgSMTP = c }).
+			AddButton("Run", func() {
+				saveTUIState(snapshot())
+				pendingAction = func() { appscan(tuiBuildFlags(pgConc, pgSeeds, pgCountries, 0, pgSMTP)) }
+				app.Stop()
+			})
+		addCmd("pages", f)
+	}
+
+	// ── discover ───────────────────────────────────────────────────────────
+	{
+		f := tview.NewForm().
+			AddInputField("Concurrency", discConc, 6, acceptInt, func(t string) { discConc = t }).
+			AddInputField("Seeds file", discSeeds, 40, nil, func(t string) { discSeeds = t }).
+			AddInputField("Countries", discCountries, 40, nil, func(t string) { discCountries = t }).
+			AddInputField("Hops", discHops, 6, acceptInt, func(t string) { discHops = t }).
+			AddButton("Run", func() {
+				hops, _ := strconv.Atoi(discHops)
+				if hops < 0 {
+					hops = 0
+				}
+				saveTUIState(snapshot())
+				flags := tuiBuildFlags(discConc, discSeeds, discCountries, hops, false)
+				pendingAction = func() { discoverSeeds(flags) }
+				app.Stop()
+			})
+		addCmd("discover", f)
+	}
+
+	// ── apply ──────────────────────────────────────────────────────────────
+	{
+		workAuthOpts := []string{"yes", "no"}
+		sponsorOpts := []string{"no", "yes"}
+		genderOpts := []string{"decline", "male", "female", "non-binary"}
+		ethnicityOpts := []string{"decline", "white", "black", "hispanic", "asian", "american-indian", "pacific-islander", "two-or-more"}
+
+		f := tview.NewForm().
+			// mode
+			AddDropDown("Mode", []string{"Run", "Setup (Simplify)"}, applyMode, func(_ string, i int) { applyMode = i }).
+			// files
+			AddInputField("URLs file", applyURLs, 40, nil, func(t string) { applyURLs = t }).
+			AddInputField("Resume PDF", applyResume, 40, nil, func(t string) { applyResume = t }).
+			AddInputField("Cover letter (txt, optional)", applyCoverLetter, 40, nil, func(t string) { applyCoverLetter = t }).
+			// identity
+			AddInputField("Name", applyName, 30, nil, func(t string) { applyName = t }).
+			AddInputField("Email", applyEmail, 30, nil, func(t string) { applyEmail = t }).
+			AddInputField("Phone", applyPhone, 20, nil, func(t string) { applyPhone = t }).
+			AddInputField("LinkedIn URL", applyLinkedIn, 40, nil, func(t string) { applyLinkedIn = t }).
+			AddInputField("GitHub URL", applyGitHub, 40, nil, func(t string) { applyGitHub = t }).
+			AddInputField("Website URL", applyWebsite, 40, nil, func(t string) { applyWebsite = t }).
+			// location
+			AddInputField("City", applyCity, 20, nil, func(t string) { applyCity = t }).
+			AddInputField("State / province", applyState, 20, nil, func(t string) { applyState = t }).
+			AddInputField("ZIP / postal code", applyZIP, 12, nil, func(t string) { applyZIP = t }).
+			AddInputField("Country", applyCountry, 20, nil, func(t string) { applyCountry = t }).
+			// compensation
+			AddInputField("Expected salary", applySalary, 20, nil, func(t string) { applySalary = t }).
+			AddInputField("Notice period", applyNoticePeriod, 20, nil, func(t string) { applyNoticePeriod = t }).
+			AddInputField("Earliest start date (YYYY-MM-DD)", applyStartDate, 14, nil, func(t string) { applyStartDate = t }).
+			// eligibility
+			AddDropDown("Work authorised?", workAuthOpts, applyWorkAuthIdx, func(_ string, i int) { applyWorkAuthIdx = i }).
+			AddDropDown("Require sponsorship?", sponsorOpts, applySponsorIdx, func(_ string, i int) { applySponsorIdx = i }).
+			// EEO
+			AddDropDown("Gender (EEO)", genderOpts, applyGenderIdx, func(_ string, i int) { applyGenderIdx = i }).
+			AddDropDown("Ethnicity (EEO)", ethnicityOpts, applyEthnicityIdx, func(_ string, i int) { applyEthnicityIdx = i }).
+			// browser
+			AddCheckbox("Headful (show browser)", applyHeadful, func(c bool) { applyHeadful = c }).
+			AddCheckbox("Dry run (no submit)", applyDryRun, func(c bool) { applyDryRun = c }).
+			AddCheckbox("Hold (keep window open)", applyHold, func(c bool) { applyHold = c }).
+			AddCheckbox("Screenshots", applyShots, func(c bool) { applyShots = c }).
+			AddCheckbox("Tailor resume with Claude", applyTailor, func(c bool) { applyTailor = c }).
+			AddInputField("Browser concurrency", applyConc, 4, acceptInt, func(t string) { applyConc = t }).
+			// output / simplify
+			AddInputField("Simplify wait (s)", applySwait, 6, acceptInt, func(t string) { applySwait = t }).
+			AddInputField("Tailored resumes dir", applyOutputDir, 30, nil, func(t string) { applyOutputDir = t }).
+			AddInputField("Failed-URLs file", applyFailedURLs, 30, nil, func(t string) { applyFailedURLs = t }).
+			AddInputField("Log file", applyLogFile, 30, nil, func(t string) { applyLogFile = t }).
+			AddButton("Run", func() {
+				saveTUIState(snapshot())
+				if applyMode == 1 {
+					pendingAction = func() {
+						os.Args = []string{os.Args[0], "apply", "--setup"}
+						applyJobs()
+					}
+					app.Stop()
+					return
+				}
+				args := []string{os.Args[0], "apply",
+					"--urls", applyURLs,
+					"--resume", applyResume,
+					"--name", applyName,
+					"--email", applyEmail,
+					"--notice-period", applyNoticePeriod,
+					"--start-date", applyStartDate,
+					"--work-auth", workAuthOpts[applyWorkAuthIdx],
+					"--sponsorship", sponsorOpts[applySponsorIdx],
+					"--gender", genderOpts[applyGenderIdx],
+					"--ethnicity", ethnicityOpts[applyEthnicityIdx],
+					"--concurrency", applyConc,
+					"--output-dir", applyOutputDir,
+				}
+				if applyCoverLetter != "" {
+					args = append(args, "--cover-letter", applyCoverLetter)
+				}
+				if applyPhone != "" {
+					args = append(args, "--phone", applyPhone)
+				}
+				if applyLinkedIn != "" {
+					args = append(args, "--linkedin", applyLinkedIn)
+				}
+				if applyGitHub != "" {
+					args = append(args, "--github", applyGitHub)
+				}
+				if applyWebsite != "" {
+					args = append(args, "--website", applyWebsite)
+				}
+				if applyCity != "" {
+					args = append(args, "--city", applyCity)
+				}
+				if applyState != "" {
+					args = append(args, "--state", applyState)
+				}
+				if applyZIP != "" {
+					args = append(args, "--zip", applyZIP)
+				}
+				if applyCountry != "" {
+					args = append(args, "--country", applyCountry)
+				}
+				if applySalary != "" {
+					args = append(args, "--salary", applySalary)
+				}
+				if applyHeadful {
+					args = append(args, "--headful")
+				}
+				if applyDryRun {
+					args = append(args, "--dry-run")
+				}
+				if applyHold {
+					args = append(args, "--hold")
+				}
+				if applyShots {
+					args = append(args, "--screenshots")
+				}
+				if applyTailor {
+					args = append(args, "--tailor")
+				}
+				if w, _ := strconv.Atoi(applySwait); w > 0 {
+					args = append(args, "--simplify-wait", applySwait, "--profile-dir", defaultProfileDir())
+				}
+				if applyFailedURLs != "" {
+					args = append(args, "--failed-urls", applyFailedURLs)
+				}
+				if applyLogFile != "" {
+					args = append(args, "--log-file", applyLogFile)
+				}
+				pendingAction = func() { os.Args = args; applyJobs() }
+				app.Stop()
+			})
+		addCmd("apply", f)
+	}
+
+	// ── clean ──────────────────────────────────────────────────────────────
+	{
+		f := tview.NewForm().
+			AddInputField("Directory", cleanDir, 30, nil, func(t string) { cleanDir = t }).
+			AddInputField("Filter regex (empty = none)", cleanRegex, 40, nil, func(t string) { cleanRegex = t }).
+			AddCheckbox("Deduplicate by email", cleanDedup, func(c bool) { cleanDedup = c }).
+			AddButton("Run", func() {
+				if cleanRegex == "" && !cleanDedup {
+					return
+				}
+				saveTUIState(snapshot())
+				args := []string{os.Args[0], "clean", "--dir", cleanDir}
+				if cleanRegex != "" {
+					args = append(args, "--filter-regex", cleanRegex)
+				}
+				if cleanDedup {
+					args = append(args, "--dedup")
+				}
+				pendingAction = func() { os.Args = args; cleanContacts() }
+				app.Stop()
+			})
+		addCmd("clean", f)
+	}
+
+	// ── purge ──────────────────────────────────────────────────────────────
+	{
+		f := tview.NewForm().
+			AddTextView("Warning", "Deletes all contacts, application pages,\nand discovered seeds. Cannot be undone.", 0, 2, false, false).
+			AddButton("Purge", func() {
+				pendingAction = purgeAll
+				app.Stop()
+			})
+		addCmd("purge", f)
+	}
+
+	// Show start by default.
+	rightPages.SwitchToPage("start")
+
+	cmdList.SetChangedFunc(func(_ int, main string, _ string, _ rune) {
+		rightPages.SwitchToPage(main)
+	})
+	cmdList.SetSelectedFunc(func(_ int, main string, _ string, _ rune) {
+		rightPages.SwitchToPage(main)
+		app.SetFocus(rightPages)
+	})
+	cmdList.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape ||
+			(event.Key() == tcell.KeyRune && event.Rune() == 'q') {
+			saveTUIState(snapshot())
+			app.Stop()
+			return nil
+		}
+		return event
+	})
+
+	// Ctrl+C can arrive while any widget has focus, so handle it globally.
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyCtrlC {
+			saveTUIState(snapshot())
+			app.Stop()
+			return nil
+		}
+		return event
+	})
+
+	cmdList.
+		SetBorder(true).
+		SetTitle(" Commands ").
+		SetTitleAlign(tview.AlignLeft).
+		SetBorderColor(tcell.ColorDarkCyan)
+
+	body := tview.NewFlex().
+		AddItem(cmdList, 14, 0, true).
+		AddItem(rightPages, 0, 1, false)
+
+	header := tview.NewTextView().
+		SetText(" Resume Contacts Scraper  v" + version).
+		SetTextColor(tcell.ColorYellow)
+
+	footer := tview.NewTextView().
+		SetText(" ↑↓ select   Enter  focus form   Tab  next field   Esc  back / quit   q  quit")
+
+	root := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(header, 1, 0, false).
+		AddItem(body, 0, 1, true).
+		AddItem(footer, 1, 0, false)
+
+	if err := app.SetRoot(root, true).EnableMouse(true).Run(); err != nil {
+		panic(err)
+	}
+
+	if pendingAction != nil {
+		pendingAction()
+	}
+}
+
+// acceptInt restricts an input field to digits only.
+func acceptInt(text string, _ rune) bool {
+	if text == "" {
+		return true
+	}
+	_, err := strconv.Atoi(text)
+	return err == nil
+}
+
+func tuiBuildFlags(concStr, seeds, countries string, hops int, smtpVerify bool) runFlags {
+	c, _ := strconv.Atoi(concStr)
+	if c < 1 {
+		c = 1
+	}
+	if c > maxConcurrency {
+		c = maxConcurrency
+	}
+	var cs []string
+	for _, tok := range strings.Split(countries, ",") {
+		tok = strings.TrimSpace(strings.ToLower(tok))
+		if tok != "" {
+			cs = append(cs, tok)
+		}
+	}
+	return runFlags{concurrency: c, seedsFile: seeds, countries: cs, hops: hops, smtpVerify: smtpVerify}
+}
+
+func tuiSeedsDefault() string {
+	if _, err := os.Stat(discoveredSeedsFile); err == nil {
+		return discoveredSeedsFile
+	}
+	return ""
+}
+
+func tuiResumeDefault() string {
+	for _, candidate := range []string{"cv.pdf", "resume.pdf", "CV.pdf"} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
