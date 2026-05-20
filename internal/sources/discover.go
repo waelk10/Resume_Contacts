@@ -3,6 +3,7 @@ package sources
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -314,6 +315,40 @@ type Result struct {
 	Source string
 }
 
+// candidate is an unvalidated job-board URL plus the page it was found on.
+type candidate struct {
+	rawURL string
+	source string
+}
+
+// ── Social-source JSON types ─────────────────────────────────────────────────
+
+type discoverRedditListing struct {
+	Data struct {
+		Children []struct {
+			Data struct {
+				ID       string `json:"id"`
+				Title    string `json:"title"`
+				Selftext string `json:"selftext"`
+			} `json:"data"`
+		} `json:"children"`
+	} `json:"data"`
+}
+
+type discoverLobstersStub struct {
+	ShortID string `json:"short_id"`
+}
+
+type discoverLobstersStory struct {
+	Description string                    `json:"description"`
+	Comments    []discoverLobstersComment `json:"comments"`
+}
+
+type discoverLobstersComment struct {
+	Comment  string                    `json:"comment"`
+	Comments []discoverLobstersComment `json:"comments"`
+}
+
 // Discoverer fetches meta-source pages, extracts candidate job-board URLs,
 // validates each with a lightweight HEAD request, and returns those that are
 // both reachable and not already present in the caller's existing seed list.
@@ -358,11 +393,6 @@ func (d *Discoverer) Run(ctx context.Context, existing []string) ([]Result, erro
 		if p, err := url.Parse(u); err == nil {
 			existingHosts[p.Hostname()] = true
 		}
-	}
-
-	type candidate struct {
-		rawURL string
-		source string
 	}
 
 	// visitedMeta prevents fetching the same meta-source page twice across hops.
@@ -434,6 +464,14 @@ func (d *Discoverer) Run(ctx context.Context, existing []string) ([]Result, erro
 		}
 		rand.Shuffle(len(nextFrontier), func(i, j int) { nextFrontier[i], nextFrontier[j] = nextFrontier[j], nextFrontier[i] })
 		frontier = nextFrontier
+	}
+
+	// Mine Reddit hiring subreddits and Lobste.rs "hiring" threads for job-board
+	// URLs and add them to the candidate pool before deduplication, so they
+	// benefit from the same liveness-probe validation as BFS candidates.
+	// Skipped when the context is already cancelled (e.g. early Ctrl+C).
+	if ctx.Err() == nil {
+		candidates = append(candidates, d.fetchSocialCandidates(ctx)...)
 	}
 
 	// Shuffle candidates before dedup so which hostname "wins" when two meta-sources
@@ -540,6 +578,137 @@ validLoop:
 		return partialResults(), ctx.Err()
 	}
 	return results, nil
+}
+
+// fetchSocialCandidates polls Reddit hiring subreddits and the Lobste.rs
+// "hiring" tag, extracts URLs from post bodies and comment text, and returns
+// those that pass looksLikeJobBoard — the same filter applied to BFS results.
+// Candidates are deduped by hostname within this call; the caller deduplicates
+// them again against the full existing-seed list.
+func (d *Discoverer) fetchSocialCandidates(ctx context.Context) []candidate {
+	seen := make(map[string]bool)
+	var out []candidate
+
+	add := func(rawURL, src string) {
+		p, err := url.Parse(rawURL)
+		if err != nil || p.Host == "" {
+			return
+		}
+		p.RawQuery, p.Fragment = "", ""
+		if !seen[p.Host] && looksLikeJobBoard(p) {
+			seen[p.Host] = true
+			out = append(out, candidate{rawURL: p.String(), source: src})
+		}
+	}
+
+	extractFrom := func(text, src string) {
+		for _, raw := range urlRe.FindAllString(text, -1) {
+			add(strings.TrimRight(raw, `.,;:!?)"'#`), src)
+		}
+	}
+
+	decode := func(resp *http.Response, dst any) error {
+		defer func() {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return fmt.Errorf("rate-limited (429)")
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		return json.NewDecoder(bufio.NewReaderSize(io.LimitReader(resp.Body, 512*1024), 32*1024)).Decode(dst)
+	}
+
+	// ── Reddit ───────────────────────────────────────────────────────────────
+	for _, sub := range []string{"forhire", "remotework", "hiring"} {
+		if ctx.Err() != nil {
+			break
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			fmt.Sprintf("https://www.reddit.com/r/%s/new.json?limit=100", sub), nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Resume_Contacts_Scraper/1.0")
+		resp, err := d.client.Do(req)
+		if err != nil {
+			log.Printf("[discover/reddit] r/%s: %v", sub, err)
+			continue
+		}
+		var listing discoverRedditListing
+		if err := decode(resp, &listing); err != nil {
+			log.Printf("[discover/reddit] r/%s: %v", sub, err)
+			continue
+		}
+		for _, child := range listing.Data.Children {
+			p := child.Data
+			src := fmt.Sprintf("https://www.reddit.com/r/%s/comments/%s/", sub, p.ID)
+			extractFrom(p.Title+"\n"+p.Selftext, src)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(2 * time.Second): // stay within Reddit's ~1 req/s guideline
+		}
+	}
+
+	// ── Lobste.rs ────────────────────────────────────────────────────────────
+	if ctx.Err() == nil {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			"https://lobste.rs/t/hiring.json", nil)
+		if err == nil {
+			resp, err := d.client.Do(req)
+			if err != nil {
+				log.Printf("[discover/lobsters] %v", err)
+			} else {
+				var stubs []discoverLobstersStub
+				if err := decode(resp, &stubs); err != nil {
+					log.Printf("[discover/lobsters] tag listing: %v", err)
+				} else {
+					for _, stub := range stubs {
+						if ctx.Err() != nil {
+							break
+						}
+						storyURL := "https://lobste.rs/s/" + stub.ShortID
+						req2, err := http.NewRequestWithContext(ctx, http.MethodGet,
+							storyURL+".json", nil)
+						if err != nil {
+							continue
+						}
+						resp2, err := d.client.Do(req2)
+						if err != nil {
+							log.Printf("[discover/lobsters] %s: %v", stub.ShortID, err)
+							continue
+						}
+						var story discoverLobstersStory
+						if err := decode(resp2, &story); err != nil {
+							log.Printf("[discover/lobsters] %s: %v", stub.ShortID, err)
+							continue
+						}
+						extractFrom(story.Description, storyURL)
+						var walk func([]discoverLobstersComment)
+						walk = func(comments []discoverLobstersComment) {
+							for _, c := range comments {
+								extractFrom(c.Comment, storyURL)
+								walk(c.Comments)
+							}
+						}
+						walk(story.Comments)
+						select {
+						case <-ctx.Done():
+						case <-time.After(time.Second):
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(out) > 0 {
+		log.Printf("[discover] social sources: %d job-board candidate(s) from Reddit/Lobste.rs", len(out))
+	}
+	return out
 }
 
 // urlRe matches http(s) URLs in plain text and Markdown link syntax.

@@ -83,6 +83,9 @@ All flags:
 		state              string
 		zipCode            string
 		country            string
+		school             string
+		degree             string
+		fieldOfStudy       string
 		website            string
 		github             string
 		coverLetterPath    string
@@ -122,6 +125,9 @@ All flags:
 	fs.StringVar(&state, "state", "", "state/province code or full name (auto-extracted from CV)")
 	fs.StringVar(&zipCode, "zip", "", "ZIP / postal code (auto-extracted from CV)")
 	fs.StringVar(&country, "country", "", "country (auto-extracted from CV)")
+	fs.StringVar(&school, "school", "", "university/school name for education fields (auto-extracted from CV)")
+	fs.StringVar(&degree, "degree", "", `degree level for education fields: bachelor | master | phd | associate (auto-extracted from CV)`)
+	fs.StringVar(&fieldOfStudy, "field-of-study", "", "field of study / major for education fields (auto-extracted from CV)")
 	fs.StringVar(&website, "website", "", "personal website / portfolio URL (auto-extracted from CV)")
 	fs.StringVar(&github, "github", "", "GitHub profile URL (auto-extracted from CV)")
 	fs.StringVar(&coverLetterPath, "cover-letter", "", "path to a plain-text cover letter file")
@@ -232,6 +238,9 @@ All flags:
 			State:              state,
 			ZipCode:            zipCode,
 			Country:            country,
+			School:             school,
+			Degree:             degree,
+			FieldOfStudy:       fieldOfStudy,
 			Website:            website,
 			GitHubURL:          github,
 			CoverLetter:        coverLetterText,
@@ -290,7 +299,7 @@ All flags:
 
 	results := app.Run(ctx, urls)
 
-	var applied, dryCnt, skippedCnt, errCnt int
+	var applied, dryCnt, skippedCnt, errCnt, pendingCnt int
 	for _, r := range results {
 		switch r.Status {
 		case "applied":
@@ -308,6 +317,11 @@ All flags:
 			line := fmt.Sprintf("[-] %s  (window closed)", r.URL)
 			fmt.Println(line)
 			log.Print(line)
+		case "pending":
+			// URL was never attempted (context cancelled before the worker
+			// reached it).  Not logged individually — captured in the summary
+			// and saved to remaining_urls.txt for the next run.
+			pendingCnt++
 		default:
 			errCnt++
 			line := fmt.Sprintf("[!] %s: %v", r.URL, r.Error)
@@ -315,8 +329,8 @@ All flags:
 			log.Print(line)
 		}
 	}
-	summary := fmt.Sprintf("Done. Applied: %d  Dry-run: %d  Skipped: %d  Errors: %d",
-		applied, dryCnt, skippedCnt, errCnt)
+	summary := fmt.Sprintf("Done. Applied: %d  Dry-run: %d  Skipped: %d  Errors: %d  Pending: %d",
+		applied, dryCnt, skippedCnt, errCnt, pendingCnt)
 	fmt.Println()
 	fmt.Println(summary)
 	log.Print(summary)
@@ -328,11 +342,25 @@ All flags:
 			fmt.Printf("Failed URLs appended to: %s\n", failedURLsFile)
 		}
 	}
+
+	// Save URLs that were never attempted (context cancelled) to a separate
+	// file so the next run can resume without re-processing already-tried URLs.
+	if pendingCnt > 0 {
+		const remainingFile = "remaining_urls.txt"
+		if err := appendRemainingURLs(remainingFile, results); err != nil {
+			log.Printf("warning: could not save remaining URLs: %v", err)
+		} else {
+			fmt.Printf("Remaining URLs (not attempted): %d → %s  (use as --urls to resume)\n",
+				pendingCnt, remainingFile)
+			log.Printf("remaining URLs: %d → %s", pendingCnt, remainingFile)
+		}
+	}
 }
 
 // appendFailedURLs appends the URL of every error-status result to path, one
-// per line.  The file is created if it does not exist; existing content is
-// preserved so successive runs accumulate a retry list.
+// per line.  "pending" results (never attempted) are excluded — they go to
+// remaining_urls.txt instead.  The file is created if it does not exist;
+// existing content is preserved so successive runs accumulate a retry list.
 func appendFailedURLs(path string, results []applier.Result) error {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -342,6 +370,23 @@ func appendFailedURLs(path string, results []applier.Result) error {
 	w := bufio.NewWriter(f)
 	for _, r := range results {
 		if r.Status == "error" {
+			fmt.Fprintln(w, r.URL)
+		}
+	}
+	return w.Flush()
+}
+
+// appendRemainingURLs appends URLs that were never attempted (status "pending")
+// to path so the next run can resume without re-processing already-tried URLs.
+func appendRemainingURLs(path string, results []applier.Result) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	for _, r := range results {
+		if r.Status == "pending" {
 			fmt.Fprintln(w, r.URL)
 		}
 	}

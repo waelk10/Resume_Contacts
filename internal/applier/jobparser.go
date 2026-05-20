@@ -116,6 +116,8 @@ func detectPlatform(rawURL string) string {
 		return "smartrecruiters"
 	case strings.Contains(h, "breezy.hr"):
 		return "breezy"
+	case strings.Contains(h, "jobvite.com"):
+		return "jobvite"
 	default:
 		return "generic"
 	}

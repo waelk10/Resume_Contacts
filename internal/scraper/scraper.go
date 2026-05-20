@@ -195,22 +195,24 @@ func New(cfg Config, onContact func(contact.Contact)) *Engine {
 	return &Engine{cfg: cfg, on: onContact}
 }
 
-// Run launches the HN source and the general web scraper concurrently.
-// It blocks until ctx is cancelled (e.g. SIGINT / SIGTERM).
+// Run launches all scraping sources concurrently and blocks until ctx is
+// cancelled (e.g. SIGINT / SIGTERM).
 func (e *Engine) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		e.runHN(ctx)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		e.runWeb(ctx)
-	}()
+	for _, fn := range []func(context.Context){
+		e.runWeb,
+		e.runHN,
+		e.runReddit,
+		e.runLobsters,
+	} {
+		fn := fn
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fn(ctx)
+		}()
+	}
 
 	wg.Wait()
 	return nil
@@ -405,9 +407,13 @@ func (e *Engine) newCollector(ctx context.Context, blocker *domainBlocker, queue
 	})
 
 	// Scan full page text for inline emails not wrapped in mailto links.
+	// Uses context-aware extraction: only keeps emails found near hiring
+	// keywords (recruiter, hr, careers, job, apply, …) to filter out the
+	// large volume of personal/unrelated emails that appear in team bios,
+	// investor pages, footers, and support sections.
 	c.OnHTML("body", func(el *colly.HTMLElement) {
 		src := el.Request.URL.String()
-		for _, em := range extractor.ExtractEmails(el.Text) {
+		for _, em := range extractor.ExtractEmailsFromBodyText(el.Text) {
 			e.on(contact.Contact{
 				Email:  em,
 				Org:    extractor.OrgFromEmail(em),

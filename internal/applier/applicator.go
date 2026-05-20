@@ -7,7 +7,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"Resume_Contacts_Scraper/internal/resume"
@@ -19,7 +21,8 @@ import (
 // submissions — a per-platform cooldown prevents the account from being flagged
 // and applications silently dropped.
 var platformCooldowns = map[string]time.Duration{
-	"ashby": 90 * time.Second,
+	"ashby":      90 * time.Second,
+	"greenhouse": 30 * time.Second, // baseline; email-verify forces 65 min
 }
 
 // ApplicantInfo holds the personal details typed into application forms.
@@ -39,6 +42,12 @@ type ApplicantInfo struct {
 	// Professional links — auto-extracted from CV when empty
 	Website   string // personal site / portfolio
 	GitHubURL string
+
+	// Education — auto-extracted from CV when empty.
+	// Degree is a normalised keyword: "bachelor", "master", "phd", "associate".
+	School       string
+	Degree       string
+	FieldOfStudy string
 
 	// Application text
 	CoverLetter string // plain text; injected into cover-letter textareas
@@ -102,9 +111,13 @@ type Result struct {
 	URL     string
 	Company string
 	Title   string
-	// Status is "applied", "dry-run", or "error".
+	// Status is "applied", "dry-run", "skipped", "pending", or "error".
 	Status string
 	Error  error
+	// Requeue signals Run() to push this URL back onto the work queue instead
+	// of finalising it.  Used when a temporary blocker (e.g. email verification
+	// cooldown) means the URL should be retried later in the same session.
+	Requeue bool
 }
 
 // Applicator drives browser-based job applications from a slice of URLs.
@@ -145,6 +158,9 @@ func New(cfg Config) (*Applicator, error) {
 	}
 	if a.EarliestStartDate == "" {
 		a.EarliestStartDate = time.Now().AddDate(0, 0, 14).Format("2006-01-02")
+	}
+	if a.CoverLetter == "" {
+		a.CoverLetter = "I am excited about this opportunity and believe my background and experience make me a strong fit for this role. I look forward to the chance to contribute and grow with your team."
 	}
 
 	if cfg.ProfileDir != "" {
@@ -189,9 +205,19 @@ func enrichFromResume(cfg *Config) {
 	if a.Website == "" {
 		a.Website = f.Website
 	}
+	if a.School == "" {
+		a.School = f.School
+	}
+	if a.Degree == "" {
+		a.Degree = f.Degree
+	}
+	if a.FieldOfStudy == "" {
+		a.FieldOfStudy = f.FieldOfStudy
+	}
 
-	log.Printf("[cv] fields extracted — city=%q state=%q zip=%q country=%q github=%v website=%v",
-		a.City, a.State, a.ZipCode, a.Country, a.GitHubURL != "", a.Website != "")
+	log.Printf("[cv] fields extracted — city=%q state=%q zip=%q country=%q github=%v website=%v school=%q degree=%q field=%q",
+		a.City, a.State, a.ZipCode, a.Country, a.GitHubURL != "", a.Website != "",
+		a.School, a.Degree, a.FieldOfStudy)
 }
 
 // Close releases the browser process.
@@ -199,6 +225,9 @@ func (a *Applicator) Close() { a.browser.Close() }
 
 // Run processes each URL and returns one Result per URL.
 // Concurrency is capped at cfg.Concurrency (minimum 1).
+//
+// When a platform cooldown is active the URL is re-queued so that other URLs
+// can be processed in the meantime; workers never block idle on a cooldown.
 func (a *Applicator) Run(ctx context.Context, urls []string) []Result {
 	conc := a.cfg.Concurrency
 	if conc < 1 {
@@ -206,25 +235,124 @@ func (a *Applicator) Run(ctx context.Context, urls []string) []Result {
 	}
 
 	results := make([]Result, len(urls))
-	sem := make(chan struct{}, conc)
-	var wg sync.WaitGroup
-
-	for i, u := range urls {
-		wg.Add(1)
-		// Launch immediately; each goroutine competes for a semaphore slot or
-		// exits right away when the context is cancelled — no blocking in the
-		// main loop means Ctrl+C is felt instantly.
-		go func(idx int, rawURL string) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-				results[idx] = a.processOne(ctx, rawURL)
-			case <-ctx.Done():
-				results[idx] = Result{URL: rawURL, Status: "error", Error: ctx.Err()}
-			}
-		}(i, u)
+	if len(urls) == 0 {
+		return results
 	}
+
+	// outstanding counts items that have not yet been completed (applied/error/
+	// pending/dry-run).  allDone is closed when it reaches zero — that is the
+	// sole signal for workers to stop.
+	var outstanding atomic.Int64
+	outstanding.Store(int64(len(urls)))
+	allDone := make(chan struct{})
+
+	completeOne := func(idx int, r Result) {
+		results[idx] = r
+		if outstanding.Add(-1) == 0 {
+			close(allDone)
+		}
+	}
+
+	// queue is open (never closed by Run).  Its capacity is len(urls)+conc so
+	// that in-flight re-queues from goroutines never block when workers are busy.
+	// Shuffling the order reduces the chance of hitting the same ATS platform
+	// back-to-back and triggering rate limits or spam filters.
+	queue := make(chan int, len(urls)+conc)
+	indices := rand.Perm(len(urls))
+	for _, i := range indices {
+		queue <- i
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < conc; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-allDone:
+					return
+				case idx := <-queue:
+					if ctx.Err() != nil {
+						completeOne(idx, Result{URL: urls[idx], Status: "pending"})
+						continue
+					}
+
+					// Check platform cooldown before consuming this application slot.
+					// If a wait is needed, re-queue the URL and let this worker pick
+					// up another one instead of blocking idle.
+					platform := detectPlatform(urls[idx])
+					if cd, ok := platformCooldowns[platform]; ok {
+						a.cooldownMu.Lock()
+						wait := cd - time.Since(a.lastRun[platform])
+						a.cooldownMu.Unlock()
+						if wait > 0 {
+							// Only log on the first sight of this cooldown (wait ≈ full
+							// cooldown duration) to avoid flooding the log every 500 ms.
+							if wait > cd-2*time.Second {
+								log.Printf("[apply] %s cooldown — re-queuing %s, %.0fs remaining",
+									platform, urls[idx], wait.Seconds())
+							}
+							go func(i int, w time.Duration) {
+								// Back-off capped at 500 ms so other URLs get picked
+								// up quickly; the item will cycle through again until
+								// the cooldown has actually elapsed.
+								sleep := w
+								if sleep > 500*time.Millisecond {
+									sleep = 500 * time.Millisecond
+								}
+								select {
+								case <-ctx.Done():
+									completeOne(i, Result{URL: urls[i], Status: "pending"})
+									return
+								case <-time.After(sleep):
+								}
+								select {
+								case queue <- i:
+								case <-allDone:
+									// Defensive: allDone should not fire while this
+									// item is still outstanding, but handle cleanly.
+									completeOne(i, Result{URL: urls[i], Status: "pending"})
+								}
+							}(idx, wait)
+							continue
+						}
+						// Cooldown elapsed — stamp lastRun before the application starts.
+						a.cooldownMu.Lock()
+						a.lastRun[platform] = time.Now()
+						a.cooldownMu.Unlock()
+					}
+
+					r := a.processOne(ctx, urls[idx])
+					if r.Requeue && ctx.Err() == nil {
+						// Temporary blocker (e.g. email verification cooldown).
+						// Push the URL back onto the queue; the cooldown check
+						// at the top of the loop will delay it until ready.
+						go func(i int) {
+							select {
+							case <-ctx.Done():
+								completeOne(i, Result{URL: urls[i], Status: "pending"})
+								return
+							case <-time.After(500 * time.Millisecond):
+							}
+							select {
+							case queue <- i:
+							case <-allDone:
+								completeOne(i, Result{URL: urls[i], Status: "pending"})
+							}
+						}(idx)
+					} else if r.Requeue {
+						// Context cancelled while requeue was requested.
+						completeOne(idx, Result{URL: urls[idx], Status: "pending"})
+					} else {
+						completeOne(idx, r)
+					}
+				}
+			}
+		}()
+	}
+
+	<-allDone
 	wg.Wait()
 	return results
 }
@@ -243,26 +371,6 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 	res.Title = job.Title
 	log.Printf("[apply] %q @ %s  platform=%s", job.Title, job.Company, job.ATSPlatform)
 
-	// Enforce per-platform cooldown before starting this application.
-	// We hold the lock only for the timestamp check/update; the actual sleep
-	// happens without the lock so other platforms aren't blocked.
-	if cd, ok := platformCooldowns[job.ATSPlatform]; ok {
-		a.cooldownMu.Lock()
-		wait := cd - time.Since(a.lastRun[job.ATSPlatform])
-		if wait > 0 {
-			a.cooldownMu.Unlock()
-			log.Printf("[apply] %s cooldown — waiting %.0fs before next application", job.ATSPlatform, wait.Seconds())
-			select {
-			case <-ctx.Done():
-				return Result{URL: rawURL, Status: "error", Error: ctx.Err()}
-			case <-time.After(wait):
-			}
-			a.cooldownMu.Lock()
-		}
-		a.lastRun[job.ATSPlatform] = time.Now()
-		a.cooldownMu.Unlock()
-	}
-
 	// Determine which resume PDF to upload.
 	resumePath := a.cfg.ResumePath
 	if a.cfg.TailorResumes {
@@ -280,6 +388,40 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 		if errors.Is(err, ErrWindowClosed) {
 			res.Status = "skipped"
 			return res
+		}
+		// Context cancelled mid-fill — URL was partially or not attempted;
+		// treat as pending so it is not written to failed_urls.txt.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return Result{URL: rawURL, Status: "pending"}
+		}
+		if errors.Is(err, ErrCaptcha) {
+			// CAPTCHA inside the form means the platform is rate-limiting us.
+			// Force a much longer cooldown so subsequent URLs on the same platform
+			// are not immediately blocked too.
+			const captchaCooldown = 10 * time.Minute
+			a.cooldownMu.Lock()
+			a.lastRun[job.ATSPlatform] = time.Now().Add(captchaCooldown - platformCooldowns[job.ATSPlatform])
+			a.cooldownMu.Unlock()
+			log.Printf("[apply] %s captcha — enforcing %v cooldown before next %s application",
+				job.ATSPlatform, captchaCooldown, job.ATSPlatform)
+			res.Status = "error"
+			res.Error = err
+			return res
+		}
+		if errors.Is(err, ErrEmailVerification) {
+			// Greenhouse sent a one-time code to the applicant's email.
+			// We cannot enter it programmatically; enforce a 65-minute cooldown
+			// so ALL remaining Greenhouse URLs (including this one) are delayed.
+			// Requeue=true tells Run() to push this URL back onto the work
+			// queue rather than marking it as an error — it will be retried
+			// automatically once the cooldown expires.
+			const emailVerifyCooldown = 65 * time.Minute
+			a.cooldownMu.Lock()
+			a.lastRun[job.ATSPlatform] = time.Now().Add(emailVerifyCooldown - platformCooldowns[job.ATSPlatform])
+			a.cooldownMu.Unlock()
+			log.Printf("[apply] %s email verification — enforcing %v cooldown, re-queuing %s",
+				job.ATSPlatform, emailVerifyCooldown, rawURL)
+			return Result{URL: rawURL, Requeue: true}
 		}
 		log.Printf("[apply] %s: fill error: %v", rawURL, err)
 		res.Status = "error"

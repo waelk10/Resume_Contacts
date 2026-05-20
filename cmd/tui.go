@@ -81,6 +81,9 @@ func runTUI() {
 	applyState := st.Apply.State
 	applyZIP := st.Apply.ZIP
 	applyCountry := st.Apply.Country
+	applySchool := st.Apply.School
+	applyDegree := st.Apply.Degree
+	applyFieldOfStudy := st.Apply.FieldOfStudy
 	applySalary := st.Apply.Salary
 	applyNoticePeriod := st.Apply.NoticePeriod
 	applyStartDate := st.Apply.StartDate
@@ -94,6 +97,7 @@ func runTUI() {
 	applyShots := st.Apply.Screenshots
 	applyTailor := st.Apply.Tailor
 	applyConc := st.Apply.Concurrency
+	applySimplify := st.Apply.UseSimplify
 	applySwait := st.Apply.SimplifyWait
 	applyOutputDir := st.Apply.OutputDir
 	applyFailedURLs := st.Apply.FailedURLs
@@ -115,13 +119,15 @@ func runTUI() {
 				CoverLetter: applyCoverLetter, Name: applyName, Email: applyEmail,
 				Phone: applyPhone, LinkedIn: applyLinkedIn, GitHub: applyGitHub,
 				Website: applyWebsite, City: applyCity, State: applyState,
-				ZIP: applyZIP, Country: applyCountry, Salary: applySalary,
+				ZIP: applyZIP, Country: applyCountry,
+				School: applySchool, Degree: applyDegree, FieldOfStudy: applyFieldOfStudy,
+				Salary: applySalary,
 				NoticePeriod: applyNoticePeriod, StartDate: applyStartDate,
 				WorkAuthIdx: applyWorkAuthIdx, SponsorshipIdx: applySponsorIdx,
 				GenderIdx: applyGenderIdx, EthnicityIdx: applyEthnicityIdx,
 				Headful: applyHeadful, DryRun: applyDryRun, Hold: applyHold,
 				Screenshots: applyShots, Tailor: applyTailor, Concurrency: applyConc,
-				SimplifyWait: applySwait, OutputDir: applyOutputDir,
+				UseSimplify: applySimplify, SimplifyWait: applySwait, OutputDir: applyOutputDir,
 				FailedURLs: applyFailedURLs, LogFile: applyLogFile,
 			},
 			Clean: tuiCleanSaved{cleanDir, cleanRegex, cleanDedup},
@@ -204,6 +210,10 @@ func runTUI() {
 			AddInputField("State / province", applyState, 20, nil, func(t string) { applyState = t }).
 			AddInputField("ZIP / postal code", applyZIP, 12, nil, func(t string) { applyZIP = t }).
 			AddInputField("Country", applyCountry, 20, nil, func(t string) { applyCountry = t }).
+			// education (auto-extracted from CV; override here if needed)
+			AddInputField("School / university", applySchool, 40, nil, func(t string) { applySchool = t }).
+			AddInputField("Degree (bachelor/master/phd/associate)", applyDegree, 20, nil, func(t string) { applyDegree = t }).
+			AddInputField("Field of study / major", applyFieldOfStudy, 30, nil, func(t string) { applyFieldOfStudy = t }).
 			// compensation
 			AddInputField("Expected salary", applySalary, 20, nil, func(t string) { applySalary = t }).
 			AddInputField("Notice period", applyNoticePeriod, 20, nil, func(t string) { applyNoticePeriod = t }).
@@ -221,7 +231,8 @@ func runTUI() {
 			AddCheckbox("Screenshots", applyShots, func(c bool) { applyShots = c }).
 			AddCheckbox("Tailor resume with Claude", applyTailor, func(c bool) { applyTailor = c }).
 			AddInputField("Browser concurrency", applyConc, 4, acceptInt, func(t string) { applyConc = t }).
-			// output / simplify
+			// simplify / output
+			AddCheckbox("Use Simplify autofill", applySimplify, func(c bool) { applySimplify = c }).
 			AddInputField("Simplify wait (s)", applySwait, 6, acceptInt, func(t string) { applySwait = t }).
 			AddInputField("Tailored resumes dir", applyOutputDir, 30, nil, func(t string) { applyOutputDir = t }).
 			AddInputField("Failed-URLs file", applyFailedURLs, 30, nil, func(t string) { applyFailedURLs = t }).
@@ -277,6 +288,15 @@ func runTUI() {
 				if applyCountry != "" {
 					args = append(args, "--country", applyCountry)
 				}
+				if applySchool != "" {
+					args = append(args, "--school", applySchool)
+				}
+				if applyDegree != "" {
+					args = append(args, "--degree", applyDegree)
+				}
+				if applyFieldOfStudy != "" {
+					args = append(args, "--field-of-study", applyFieldOfStudy)
+				}
 				if applySalary != "" {
 					args = append(args, "--salary", applySalary)
 				}
@@ -295,8 +315,10 @@ func runTUI() {
 				if applyTailor {
 					args = append(args, "--tailor")
 				}
-				if w, _ := strconv.Atoi(applySwait); w > 0 {
-					args = append(args, "--simplify-wait", applySwait, "--profile-dir", defaultProfileDir())
+				if applySimplify {
+					if w, _ := strconv.Atoi(applySwait); w > 0 {
+						args = append(args, "--simplify-wait", applySwait, "--profile-dir", defaultProfileDir())
+					}
 				}
 				if applyFailedURLs != "" {
 					args = append(args, "--failed-urls", applyFailedURLs)

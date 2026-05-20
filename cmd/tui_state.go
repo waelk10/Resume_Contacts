@@ -51,6 +51,9 @@ type tuiApplySaved struct {
 	State          string `json:"state"`
 	ZIP            string `json:"zip"`
 	Country        string `json:"country"`
+	School         string `json:"school"`
+	Degree         string `json:"degree"`
+	FieldOfStudy   string `json:"field_of_study"`
 	Salary         string `json:"salary"`
 	NoticePeriod   string `json:"notice_period"`
 	StartDate      string `json:"start_date"`
@@ -64,6 +67,7 @@ type tuiApplySaved struct {
 	Screenshots    bool   `json:"screenshots"`
 	Tailor         bool   `json:"tailor"`
 	Concurrency    string `json:"concurrency"`
+	UseSimplify    bool   `json:"use_simplify"`
 	SimplifyWait   string `json:"simplify_wait"`
 	OutputDir      string `json:"output_dir"`
 	FailedURLs     string `json:"failed_urls"`

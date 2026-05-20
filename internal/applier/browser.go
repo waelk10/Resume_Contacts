@@ -47,6 +47,12 @@ func NewBrowser(headful bool, profileDir string) (*Browser, error) {
 				profileDir,
 			)
 		}
+		// Remove stale lock files left by a previously killed Firefox process.
+		// If these files exist Firefox opens a profile-recovery dialog instead of
+		// navigating to the job page, causing all WebDriver commands to hang.
+		for _, f := range []string{"lock", ".parentlock"} {
+			_ = os.Remove(filepath.Join(profileDir, f))
+		}
 	}
 
 	geckodriverPath, err := exec.LookPath("geckodriver")
@@ -156,6 +162,29 @@ func (b *Browser) Close() {
 // "skipped" rather than "error" so the URL is not added to the failure list.
 var ErrWindowClosed = fmt.Errorf("window closed by user")
 
+// isInstantSkipError reports whether err represents a condition the user cannot
+// act on in headful mode (dead job page, auth wall, HTTP error), so the normal
+// 10-second headful pause is skipped — saving time during bulk runs.
+func isInstantSkipError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, phrase := range []string{
+		"no application form found",
+		"sign-in required",
+		"http 4", "http 5",
+		"job posting unavailable",
+		"page redirected to error",
+		"workday requires",
+	} {
+		if strings.Contains(msg, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 // isWindowClosedErr reports whether a WebDriver error indicates the browser
 // session or window was closed (by the user or by the browser crashing).
 func isWindowClosedErr(err error) bool {
@@ -212,9 +241,14 @@ func (b *Browser) FillApplication(
 				log.Printf("[hold] error — close the Firefox window to continue: %v", retErr)
 				waitForWindowClose(ctx, wd)
 				retErr = nil
-			} else if flags.Headful {
+			} else if flags.Headful && !isInstantSkipError(retErr) {
+				// Skip the pause for errors the user cannot act on (dead pages,
+				// auth walls, HTTP errors) — only pause when the filled form is
+				// worth inspecting.
 				log.Printf("[apply] headful error — keeping browser open 10 s: %v", retErr)
 				time.Sleep(10 * time.Second)
+			} else if flags.Headful {
+				log.Printf("[apply] headful skip (auto): %v", retErr)
 			}
 		}
 		_ = wd.Quit()
@@ -230,6 +264,19 @@ func (b *Browser) FillApplication(
 	}
 	// Give JavaScript-heavy ATS pages time to finish rendering.
 	time.Sleep(2 * time.Second)
+
+	// iCIMS: job-description URLs (ending in /job) need ?mode=apply to load
+	// the application form directly.  Navigate there now so the form is ready
+	// before cookie / captcha / pre-apply handling runs.
+	if job.ATSPlatform == "icims" && !strings.Contains(strings.ToLower(job.URL), "mode=apply") {
+		sep := "?"
+		if strings.Contains(job.URL, "?") {
+			sep = "&"
+		}
+		if gerr := wd.Get(job.URL + sep + "mode=apply"); gerr == nil {
+			time.Sleep(2 * time.Second)
+		}
+	}
 
 	// Dismiss any bot-protection challenge before trying to interact with the form.
 	// In headful mode this blocks until the human solves it if auto-resolution fails.
@@ -251,6 +298,12 @@ func (b *Browser) FillApplication(
 	// Detect this pattern and click through before attempting to fill.
 	clickPreApplyIfNeeded(ctx, wd)
 
+	// European ATS platforms (Jobvite, SmartRecruiters, etc.) gate the application
+	// form behind a GDPR/data-processing consent page or modal.  Accept it so the
+	// real form renders.  If the wall cannot be dismissed the existing form-ready
+	// check below will catch the failure and return an error.
+	dismissDataConsentWall(ctx, wd)
+
 	// Verify a real application form is present.  Primary check uses
 	// appFormSelector (email / name inputs) because formReadySelector is too
 	// broad: a search bar or cookie banner already in the DOM satisfies it even
@@ -268,6 +321,18 @@ func (b *Browser) FillApplication(
 		formEls, _ = wd.FindElements(selenium.ByCSSSelector, formReadySelector)
 	}
 	if len(formEls) == 0 {
+		// Workday: detect the sign-in / create-account wall before falling
+		// through to the generic dead-page check.  Workday's auth page has
+		// a "Sign In" button and/or a password input with data-automation-id
+		// attributes — neither of which matches appFormSelector.
+		if job.ATSPlatform == "workday" {
+			authEls, _ := wd.FindElements(selenium.ByCSSSelector,
+				`[data-automation-id="signIn"], [data-automation-id="createAccount"], [data-automation-id="password"]`)
+			if len(authEls) > 0 {
+				return fmt.Errorf("workday: account sign-in required — use --profile-dir with saved Workday credentials to auto-apply")
+			}
+		}
+
 		// Only run phrase/status detection when there is no form — this avoids
 		// false positives on pages that have a "no longer available" notice in
 		// a footer or sidebar while still showing a live application form.
@@ -282,15 +347,22 @@ func (b *Browser) FillApplication(
 	// supplemental pass runs.
 	if flags.SimplifyWait > 0 {
 		if waitAndClickSimplify(ctx, wd, flags.SimplifyWait) {
-			// Simplify fills asynchronously — give it a moment to finish.
-			select {
-			case <-ctx.Done():
+			// Block until the DOM stops changing (Simplify done) rather than
+			// sleeping a fixed amount — cap at SimplifyWait so we don't stall
+			// indefinitely on broken pages.
+			waitForSimplifyDone(ctx, wd, flags.SimplifyWait)
+			if ctx.Err() != nil {
 				return ctx.Err()
-			case <-time.After(2 * time.Second):
 			}
 		} else {
 			log.Printf("[simplify] autofill button not found — continuing with standard fill")
 		}
+	}
+
+	// Check for an in-form CAPTCHA before filling — Ashby occasionally shows
+	// a Cloudflare Turnstile or hCaptcha widget right on the form page.
+	if err := detectInFormCaptcha(wd); err != nil {
+		return err
 	}
 
 	switch job.ATSPlatform {
@@ -299,13 +371,34 @@ func (b *Browser) FillApplication(
 	case "lever":
 		fillLever(ctx, wd, info, resumePath)
 	case "ashby":
-		fillAshby(ctx, wd, info, resumePath)
+		fillAshby(ctx, wd, info, resumePath, job)
+	case "workable":
+		fillWorkable(ctx, wd, info, resumePath)
 	case "bamboohr":
 		fillBambooHR(ctx, wd, info, resumePath)
 	case "personio":
 		fillPersonio(ctx, wd, info, resumePath)
+	case "workday":
+		fillWorkday(ctx, wd, info, resumePath)
+	case "icims":
+		fillICIMS(ctx, wd, info, resumePath)
+	case "jobvite":
+		fillGeneric(ctx, wd, info, resumePath)
 	default:
 		fillGeneric(ctx, wd, info, resumePath)
+	}
+
+	// Detect an email verification challenge — Greenhouse sends a one-time code
+	// to the applicant's email after recognising the address.  We cannot enter
+	// the code programmatically, so abort and let the caller apply a long cooldown.
+	if err := detectEmailVerification(wd); err != nil {
+		return err
+	}
+
+	// Re-check after filling — some platforms inject a CAPTCHA after field
+	// interaction (e.g. Ashby Turnstile that only appears on form submission).
+	if err := detectInFormCaptcha(wd); err != nil {
+		return err
 	}
 
 	if flags.Screenshot {
@@ -330,9 +423,55 @@ func (b *Browser) FillApplication(
 		}
 		return nil
 	}
+
+	// ── Universal required-field mop-up ──────────────────────────────────────
+	// Runs after all platform-specific fills to catch any remaining empty
+	// required fields — custom employer questions, consent checkboxes, radio
+	// groups, etc. — before attempting submission.
+	if n, err := wd.ExecuteScript(jsFillRequiredFields, []interface{}{
+		info.CoverLetter, info.ExpectedSalary, info.Phone, info.Website,
+	}); err == nil {
+		if cnt, ok := n.(float64); ok && cnt > 0 {
+			log.Printf("[apply] mop-up filled %d remaining required native field(s)", int(cnt))
+			time.Sleep(500 * time.Millisecond) // let React re-render after batch fills
+		}
+	}
+	// React Select / combobox mop-up — platform-agnostic
+	if res, err := wd.ExecuteScript(jsGetAllUnfilledRequiredComboboxIDs, nil); err == nil {
+		if ids, ok := res.([]interface{}); ok && len(ids) > 0 {
+			for _, idv := range ids {
+				if id, ok := idv.(string); ok && id != "" {
+					log.Printf("[apply] mop-up: filling required combobox #%s with first option", id)
+					fillGreenhouseComboboxByID(wd, id, "", 800)
+				}
+			}
+		}
+	}
+
+	// Ashby-specific submit retry loop: click submit → read the validation
+	// error banner → attempt targeted fixes → retry (up to 2 more times).
+	// Other platforms use a single submit attempt.
+	if job.ATSPlatform == "ashby" {
+		return submitWithAshbyRetry(ctx, wd, info, flags)
+	}
+
 	if err := clickSubmit(wd); err != nil {
 		return err
 	}
+	// Handle "Submit Application?" confirmation dialogs before waiting.
+	// Greenhouse (and some other ATS platforms) show a modal after the
+	// first Submit click that requires a second confirmation button click.
+	clickConfirmationModal(wd)
+
+	// Post-submit screenshot: capture the page state immediately after the
+	// submit+confirm sequence so failures are visible without --headful.
+	if flags.Screenshot {
+		if data, serr := wd.Screenshot(); serr == nil {
+			name := "screenshot_post_" + safeFilename(job.Company+"_"+job.Title) + ".png"
+			_ = os.WriteFile(name, data, 0o644)
+		}
+	}
+
 	return verifySubmission(ctx, wd, flags.Headful || flags.Hold)
 }
 
@@ -357,6 +496,464 @@ func waitForWindowClose(ctx context.Context, wd selenium.WebDriver) {
 }
 
 // ── Common extras filler ──────────────────────────────────────────────────────
+
+// jsGetUnfilledComboboxIDs returns the id attributes of all React Select
+// combobox inputs whose associated hidden required input is still empty (i.e.
+// no option has been selected yet).  Used by fillGreenhouse's mop-up pass to
+// discover job-specific dropdowns that weren't covered by label-pattern matching.
+const jsGetUnfilledComboboxIDs = `
+(function(){
+    var ids = [];
+    var inputs = document.querySelectorAll('input.select__input[role="combobox"]');
+    for (var i = 0; i < inputs.length; i++) {
+        var inp = inputs[i];
+        if (!inp.id) continue;
+        // Walk up to the nearest select-shell container and look for the
+        // hidden required sentinel that React Select uses for form validation.
+        var container = inp.closest('.select-shell');
+        if (!container) continue;
+        var hidden = container.querySelector('input[tabindex="-1"][aria-hidden="true"]');
+        if (!hidden || hidden.value !== '') continue; // not required or already filled
+        ids.push(inp.id);
+    }
+    return ids;
+})()
+`
+
+// jsGetUnfilledComboboxDetails returns [[id, labelText], ...] for every React
+// Select input (input.select__input[role="combobox"]) that still shows a
+// placeholder (nothing selected yet).  Unlike jsGetUnfilledComboboxIDs, this
+// does NOT require a .select-shell wrapper — it works with the new
+// job-boards.greenhouse.io format which uses different container classes.
+// The labelText field contains the lowercased text of the nearest <label> so
+// the caller can choose an answer (yes/no/first-option) per question.
+const jsGetUnfilledComboboxDetails = `
+try {
+    var _res = [];
+    var _seen = {};
+    var _inputs = document.querySelectorAll('input.select__input[role="combobox"]');
+    for (var _x = 0; _x < _inputs.length; _x++) {
+        var _inp = _inputs[_x];
+        if (!_inp.id || _seen[_inp.id]) continue;
+        var _unfilled = false;
+        var _p = _inp.parentElement;
+        for (var _i = 0; _i < 10 && _p; _i++) {
+            var _hid = _p.querySelector('input[aria-hidden="true"][tabindex="-1"]');
+            if (_hid) { _unfilled = (_hid.value === ''); break; }
+            var _ph = _p.querySelector('[class*="placeholder"]');
+            if (_ph && window.getComputedStyle(_ph).display !== 'none') {
+                var _sv = _p.querySelector('[class*="single-value"]');
+                if (!_sv) { _unfilled = true; break; }
+            }
+            _p = _p.parentElement;
+        }
+        if (!_unfilled) continue;
+        _seen[_inp.id] = true;
+        var _lbl = '';
+        var _c = _inp.parentElement;
+        for (var _d = 0; _d < 10 && _c; _d++) {
+            var _l = _c.querySelector('label');
+            if (_l) { _lbl = _l.textContent.trim().toLowerCase(); break; }
+            _c = _c.parentElement;
+        }
+        _res.push([_inp.id, _lbl]);
+    }
+    return _res;
+} catch(e) { return 'ERR:' + e.toString(); }
+`
+
+// jsGetAllUnfilledRequiredComboboxIDs finds React Select / Radix combobox inputs
+// that are required but still show no selection, across all ATS platforms.
+// Covers the Greenhouse .select-shell pattern, aria-required comboboxes, and
+// any platform that uses a hidden required sentinel inside the combobox wrapper.
+const jsGetAllUnfilledRequiredComboboxIDs = `
+(function(){
+    var ids = [];
+    function add(id) { if (id && ids.indexOf(id) === -1) ids.push(id); }
+
+    // Greenhouse: .select-shell wrapper with hidden required sentinel
+    document.querySelectorAll('.select-shell').forEach(function(shell) {
+        var inp = shell.querySelector('input[role="combobox"]');
+        var hid = shell.querySelector('input[aria-hidden="true"][tabindex="-1"]');
+        if (inp && inp.id && hid && hid.value === '') add(inp.id);
+    });
+
+    // Generic: hidden required input whose value is still empty
+    document.querySelectorAll('input[required][aria-hidden="true"],input[aria-required="true"][aria-hidden="true"]').forEach(function(hid) {
+        if (hid.value !== '') return;
+        var p = hid.parentElement;
+        for (var i = 0; i < 6 && p; i++) {
+            var cb = p.querySelector('[role="combobox"]');
+            if (cb && cb.id) { add(cb.id); break; }
+            p = p.parentElement;
+        }
+    });
+
+    // aria-required comboboxes that still have an empty value
+    document.querySelectorAll('[role="combobox"][aria-required="true"]').forEach(function(el) {
+        if (!el.id || el.value) return;
+        // Confirm the container shows a placeholder (nothing selected)
+        var p = el.parentElement;
+        for (var i = 0; i < 4 && p; i++) {
+            if (p.querySelector('[class*="placeholder"]') && !p.querySelector('[class*="single-value"]')) {
+                add(el.id); break;
+            }
+            p = p.parentElement;
+        }
+    });
+
+    return ids;
+})()
+`
+
+// jsFillRequiredFields sweeps every visible, still-empty required native field
+// (input, textarea, select, radio group, checkbox) and fills it with the best
+// synthetic value available.  React Select comboboxes are excluded — they need
+// WebDriver click+pick and are handled by the combobox mop-up.
+// args: coverLetter, salary, phone, website
+const jsFillRequiredFields = `
+(function(coverLetter, salary, phone, website) {
+    var nSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    var tSet = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    var filled = 0;
+
+    function fire(el) {
+        ['input','change','blur'].forEach(function(ev) {
+            el.dispatchEvent(new Event(ev, {bubbles:true}));
+        });
+    }
+
+    function labelCtx(el) {
+        var t = '';
+        if (el.id) {
+            var l = document.querySelector('label[for="'+el.id+'"]');
+            if (l) t = l.textContent;
+        }
+        if (!t) {
+            var p = el.parentElement;
+            for (var i = 0; i < 5 && p; i++) {
+                var ls = p.querySelectorAll('label');
+                if (ls.length) { t = ls[0].textContent; break; }
+                p = p.parentElement;
+            }
+        }
+        return (t+' '+(el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')).toLowerCase();
+    }
+
+    function synthVal(el) {
+        var c = labelCtx(el);
+        // Skip fields we already fill specifically — returning '' skips the element
+        if (/\b(name|email|linkedin)\b/.test(c)) return '';
+        if (/phone|mobile|tel/.test(c)) return phone;
+        if (/salary|compensation|ctc|pay|wage|remunerat/.test(c)) return salary;
+        if (/year|yrs\b|experience|how.?long|seniority/.test(c)) return '5';
+        if (/notice|start.?date|availab|when.?can.?you|earliest/.test(c)) return '2 weeks';
+        if (/why|motivat|interest|excit|passion|tell.?us|about.?your|cover|letter|message|note|comment|additional/.test(c)) return coverLetter;
+        if (/url|website|portfolio|github/.test(c)) return website || '';
+        if (/city|locat|where.?are.?you|address/.test(c)) return '';   // location handler owns these
+        if (el.type === 'number') return '5';
+        if (el.type === 'url') return website || '';
+        if (el.type === 'date') return '';  // date pickers need specialised handling
+        return 'N/A';
+    }
+
+    function vis(el) {
+        if (el.type === 'hidden') return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    }
+
+    // 1. Text-like inputs (exclude comboboxes — they're handled separately)
+    var inputSel = [
+        'input[required]:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=file]):not([role=combobox]):not([aria-hidden=true])',
+        'input[aria-required=true]:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=file]):not([role=combobox]):not([aria-hidden=true])'
+    ].join(',');
+    Array.from(document.querySelectorAll(inputSel)).forEach(function(el) {
+        if (el.disabled || !vis(el) || el.value.trim()) return;
+        var v = synthVal(el);
+        if (!v) return;
+        nSet.call(el, v); fire(el); filled++;
+    });
+
+    // 2. Textareas
+    Array.from(document.querySelectorAll('textarea[required],textarea[aria-required=true]')).forEach(function(el) {
+        if (el.disabled || !vis(el) || el.value.trim()) return;
+        tSet.call(el, coverLetter); fire(el); filled++;
+    });
+
+    // 3. Native selects
+    Array.from(document.querySelectorAll('select[required],select[aria-required=true]')).forEach(function(el) {
+        if (el.disabled || !vis(el)) return;
+        if (el.value && el.selectedIndex > 0) return;
+        for (var i = 1; i < el.options.length; i++) {
+            if (el.options[i].value && !el.options[i].disabled) {
+                el.selectedIndex = i; fire(el); filled++; break;
+            }
+        }
+    });
+
+    // 4. Radio groups — select first option in any group with nothing checked
+    var rg = {};
+    Array.from(document.querySelectorAll('input[type=radio][required],input[type=radio][aria-required=true]')).forEach(function(r) {
+        var k = r.name || r.id;
+        if (!rg[k]) rg[k] = [];
+        rg[k].push(r);
+    });
+    Object.keys(rg).forEach(function(k) {
+        var rs = rg[k];
+        if (rs.some(function(r){return r.checked;})) return;
+        var first = rs.find(function(r){return !r.disabled && vis(r);});
+        if (first) { first.click(); fire(first); filled++; }
+    });
+
+    // 5. Required unchecked checkboxes (consent / terms)
+    Array.from(document.querySelectorAll('input[type=checkbox][required],input[type=checkbox][aria-required=true]')).forEach(function(el) {
+        if (!el.disabled && vis(el) && !el.checked) { el.click(); fire(el); filled++; }
+    });
+
+    // 6. Blank <select> elements — covers both visible and hidden-overlay selects.
+    //    New ATS platforms (e.g. job-boards.greenhouse.io) hide the native <select>
+    //    behind a custom UI overlay; the select has non-zero options but fails the
+    //    visibility check.  We skip only aria-hidden sentinels and disabled elements.
+    Array.from(document.querySelectorAll('select')).forEach(function(el) {
+        if (el.disabled) return;
+        if (el.getAttribute('aria-hidden') === 'true' || el.tabIndex === -1) return;
+        if (el.value || el.selectedIndex > 0) return;
+        for (var i = 1; i < el.options.length; i++) {
+            if (el.options[i].value && !el.options[i].disabled) {
+                el.selectedIndex = i; fire(el); filled++; break;
+            }
+        }
+    });
+
+    return filled;
+})(arguments[0], arguments[1], arguments[2], arguments[3])
+`
+
+// jsReadAshbyValidationErrors collects the field-level error messages that
+// Ashby surfaces in a sticky banner at the top of the form after a failed
+// submission attempt.  The banner lists each problematic field by label text
+// so we can attempt targeted fixes before the next retry.
+// Returns an array of lowercase strings (one per error item), or [] when no
+// errors are visible.
+const jsReadAshbyValidationErrors = `
+(function(){
+    var msgs = [];
+    // Ashby renders a red summary banner with role="alert" or a class like
+    // "_error" / "errorSummary" / "validation-errors".  Each item is in an
+    // <li> or a <p> / <span> with the field label.
+    var selectors = [
+        '[role="alert"] li',
+        '[role="alert"] p',
+        '[class*="error" i][class*="summar" i] li',
+        '[class*="error" i][class*="summar" i] p',
+        '[class*="validat" i][class*="error" i] li',
+        '[class*="errorList" i] li',
+        '[class*="errorList" i] span',
+        '[data-qa*="error" i] li',
+        '[data-qa*="error" i] span',
+        // Fallback: any visible li inside a red/alert container
+        '[class*="alert" i] li',
+    ];
+    var seen = {};
+    selectors.forEach(function(sel) {
+        try {
+            document.querySelectorAll(sel).forEach(function(el) {
+                var t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                if (t && t.length > 2 && t.length < 300 && !seen[t]) {
+                    seen[t] = true;
+                    msgs.push(t);
+                }
+            });
+        } catch(e) {}
+    });
+    // If the selectors above missed it, look for any element with role=alert
+    // that has non-trivial text.
+    if (msgs.length === 0) {
+        document.querySelectorAll('[role="alert"]').forEach(function(el) {
+            var t = (el.innerText || '').trim().toLowerCase();
+            if (t && t.length > 5 && !seen[t]) {
+                seen[t] = true;
+                msgs.push(t);
+            }
+        });
+    }
+    return msgs;
+})()
+`
+
+// jsHandleAshbyYesNo clicks the "Yes" or "No" styled button inside a
+// Boolean field group whose surrounding label text contains labelNeedle.
+// Ashby renders Boolean questions as a pair of <button> elements labelled
+// "Yes" and "No" (not radio inputs), so the standard radio/select handlers
+// don't reach them.
+// arguments[0] = label needle (case-insensitive substring)
+// arguments[1] = "yes" or "no"
+const jsHandleAshbyYesNo = `
+(function(needle, answer) {
+    needle = needle.toLowerCase();
+    var wantYes = answer.toLowerCase() === 'yes';
+    var targetText = wantYes ? 'yes' : 'no';
+
+    // Walk all visible containers that contain the needle in their text.
+    var containers = Array.from(document.querySelectorAll(
+        '[class*="field" i],[class*="question" i],[class*="form-group" i],[class*="input" i],[data-qa]'
+    ));
+    for (var i = 0; i < containers.length; i++) {
+        var c = containers[i];
+        var ct = (c.textContent || '').toLowerCase();
+        if (ct.indexOf(needle) === -1) continue;
+
+        // Find button children whose label matches "Yes" or "No" exactly.
+        var btns = Array.from(c.querySelectorAll('button'));
+        for (var j = 0; j < btns.length; j++) {
+            var btn = btns[j];
+            var t = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+            if (t === targetText) {
+                btn.scrollIntoView({block: 'center'});
+                btn.click();
+                return true;
+            }
+        }
+    }
+
+    // Wider fallback: any button pair labelled Yes/No near the needle.
+    var allBtns = Array.from(document.querySelectorAll('button'));
+    for (var k = 0; k < allBtns.length; k++) {
+        var b = allBtns[k];
+        var bt = (b.innerText || b.textContent || '').trim().toLowerCase();
+        if (bt !== targetText) continue;
+        // Walk up to 6 ancestors to find one that contains the needle.
+        var p = b.parentElement;
+        for (var d = 0; d < 6 && p; d++) {
+            if ((p.textContent || '').toLowerCase().indexOf(needle) !== -1) {
+                b.scrollIntoView({block: 'center'});
+                b.click();
+                return true;
+            }
+            p = p.parentElement;
+        }
+    }
+    return false;
+})(arguments[0], arguments[1])
+`
+
+// jsClickFirstMultiValueOption finds the first unchecked checkbox or the first
+// clickable option inside a multi-value select widget whose label contains
+// needle, and clicks it.  Ashby's "How did you hear about us?" field uses this
+// pattern: it is a multi-select backed by checkboxes, not a native <select>.
+// arguments[0] = label needle (case-insensitive substring to find the field)
+const jsClickFirstMultiValueOption = `
+(function(needle) {
+    needle = needle.toLowerCase();
+
+    // 1. Try clicking the combobox to open the dropdown first.
+    var labels = document.querySelectorAll('label');
+    for (var i = 0; i < labels.length; i++) {
+        var l = labels[i];
+        if (l.textContent.toLowerCase().indexOf(needle) === -1) continue;
+        // Try to open the dropdown widget.
+        var fid = l.getAttribute('for');
+        var trigger = fid ? document.getElementById(fid) : null;
+        if (!trigger) trigger = l.querySelector('[role="combobox"], [role="button"], button, input');
+        if (!trigger) {
+            var sib = l.nextElementSibling;
+            while (sib) {
+                trigger = sib.querySelector('[role="combobox"], [role="button"], button');
+                if (trigger) break;
+                if (sib.tagName === 'LABEL') break;
+                sib = sib.nextElementSibling;
+            }
+        }
+        if (trigger) { trigger.click(); break; }
+    }
+
+    // 2. Wait a tick then click the first available option/checkbox.
+    // (Caller sleeps 1 s before running the post-click logic.)
+    var opts = document.querySelectorAll('[role="option"],[role="menuitem"],[role="listbox"] [role="option"]');
+    for (var j = 0; j < opts.length; j++) {
+        var r = opts[j].getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) { opts[j].click(); return true; }
+    }
+
+    // 3. Fallback: an unchecked checkbox inside the container.
+    var allCbs = document.querySelectorAll('input[type="checkbox"]:not(:checked)');
+    for (var k = 0; k < allCbs.length; k++) {
+        var cb = allCbs[k];
+        var p = cb.parentElement;
+        for (var d = 0; d < 6 && p; d++) {
+            if ((p.textContent || '').toLowerCase().indexOf(needle) !== -1) {
+                cb.click(); return true;
+            }
+            p = p.parentElement;
+        }
+    }
+    return false;
+})(arguments[0])
+`
+
+// jsSelectRadioContaining finds the radio group whose container text includes
+// groupNeedle, then clicks the radio whose label text includes optionNeedle
+// (both case-insensitive substrings).  Used for multi-option radio questions
+// like "nature of right to work" that have no yes/no answers.
+// arguments[0] = group label needle  (e.g. "nature of your right to work")
+// arguments[1] = option text needle  (e.g. "unlimited", "citizen", "sponsorship")
+const jsSelectRadioContaining = `
+(function(groupNeedle, optionNeedle) {
+    groupNeedle  = groupNeedle.toLowerCase();
+    optionNeedle = optionNeedle.toLowerCase();
+
+    function tryContainer(c) {
+        if ((c.textContent || '').toLowerCase().indexOf(groupNeedle) === -1) return false;
+        var radios = c.querySelectorAll('input[type="radio"]');
+        for (var i = 0; i < radios.length; i++) {
+            var r = radios[i];
+            if (r.disabled) continue;
+            var lbl = document.querySelector('label[for="' + r.id + '"]') || r.closest('label');
+            var t = (lbl ? lbl.textContent : (r.getAttribute('aria-label') || r.value || '')).toLowerCase();
+            if (t.indexOf(optionNeedle) !== -1) {
+                r.scrollIntoView({block: 'center'});
+                r.click();
+                r.dispatchEvent(new Event('change', {bubbles: true}));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    var done = false;
+    document.querySelectorAll('fieldset').forEach(function(fs) { if (!done) done = tryContainer(fs); });
+    if (done) return true;
+    var CONT = '[class*="question" i],[class*="field" i],[class*="form-group" i],[class*="group" i],[data-qa]';
+    document.querySelectorAll(CONT).forEach(function(d) { if (!done) done = tryContainer(d); });
+    return done;
+})(arguments[0], arguments[1])
+`
+
+// jsForceClickSubmit dispatches a synthetic mouse click on the best submit
+// candidate regardless of its disabled state, giving React's onClick handler
+// a chance to fire (and display field-level validation errors if anything is
+// still missing).  Used as a last-resort after clickSubmit fails.
+const jsForceClickSubmit = `
+(function(){
+    var WORDS = /\b(submit|apply|send|complete|finish|confirm)\b/i;
+    var candidates = Array.from(document.querySelectorAll(
+        'button[type="submit"], input[type="submit"], button, [role="button"]'
+    ));
+    for (var i = 0; i < candidates.length; i++) {
+        var el = candidates[i];
+        var r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        var lbl = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+        if (el.type === 'submit' || WORDS.test(lbl)) {
+            el.scrollIntoView({block: 'center'});
+            el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+            return true;
+        }
+    }
+    return false;
+})()
+`
 
 // jsSelectOption picks the best-matching option in the first visible <select>
 // that matches the CSS selector.  Tries (1) exact value, (2) exact text,
@@ -646,12 +1243,14 @@ const jsHandleOptionalSelects = `
 `
 
 // jsAcceptPrivacyConsent ticks any unchecked checkbox whose label mentions
-// privacy, data processing, GDPR / DSGVO, or application consent.  Personio
-// and several other ATS platforms make this checkbox mandatory; leaving it
-// unticked prevents the Submit button from becoming active.
+// privacy, data processing, GDPR / DSGVO, application consent, or is a bare
+// "I agree" / "I accept" acknowledgement.  Personio and several other ATS
+// platforms make this checkbox mandatory; leaving it unticked prevents the
+// Submit button from becoming active.  Ashby uses "I agree" with no further
+// wording.
 const jsAcceptPrivacyConsent = `
 (function(){
-    var CONSENT = /\b(privacy|data\s*(?:processing|protection|policy)|gdpr|dsgvo|datenschutz|personal\s+data|application\s+terms|consent\s+to\s+(?:the\s*)?(?:processing|collection))\b/i;
+    var CONSENT = /\b(privacy|data\s*(?:processing|protection|policy)|gdpr|dsgvo|datenschutz|personal\s+data|application\s+terms|consent\s+to\s+(?:the\s*)?(?:processing|collection)|i\s+agree|i\s+accept|ich\s+stimme\s+zu|ich\s+akzeptiere)\b/i;
     var cbs = document.querySelectorAll('input[type="checkbox"]:not(:checked)');
     for (var i = 0; i < cbs.length; i++) {
         var cb = cbs[i];
@@ -822,11 +1421,167 @@ func trySetSelectByLabel(wd selenium.WebDriver, labelText, optionValue string) b
 	return err == nil && res == true
 }
 
+// jsTypeCombobox finds the text input associated with a label containing
+// needle and types val into it, triggering the React synthetic event chain.
+// Used for custom combobox/react-select dropdowns (e.g. Ashby location).
+// Returns a truthy string when an element was found and typed into.
+const jsTypeCombobox = `
+var needle=arguments[0].toLowerCase(), val=arguments[1];
+var labels=document.querySelectorAll('label');
+for(var i=0;i<labels.length;i++){
+    var l=labels[i];
+    if(l.textContent.trim().toLowerCase().indexOf(needle)===-1) continue;
+    var inp=null;
+    var fid=l.getAttribute('for');
+    if(fid) inp=document.getElementById(fid);
+    if(!inp) inp=l.querySelector('input:not([type="hidden"])');
+    if(!inp){var p=l.parentElement;if(p) inp=p.querySelector('input:not([type="hidden"])');}
+    if(!inp){
+        var sib=l.nextElementSibling;
+        while(sib){
+            if(sib.tagName==='INPUT'&&sib.type!=='hidden'){inp=sib;break;}
+            var inner=sib.querySelector('input:not([type="hidden"])');
+            if(inner){inp=inner;break;}
+            sib=sib.nextElementSibling;
+        }
+    }
+    if(!inp||inp.disabled) continue;
+    inp.click(); inp.focus();
+    var setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+    setter.call(inp,val);
+    inp.dispatchEvent(new Event('input',{bubbles:true}));
+    inp.dispatchEvent(new Event('change',{bubbles:true}));
+    return 'ok';
+}
+return null;
+`
+
+// fillComboboxByLabel types value into a custom combobox whose label contains
+// labelText, then waits for the listbox to open and clicks the first option
+// that contains value.  This handles React-Select / Ashby-style dropdowns
+// where there is no native <select> element.
+func fillComboboxByLabel(wd selenium.WebDriver, labelText, value string) bool {
+	if value == "" {
+		return false
+	}
+	res, err := wd.ExecuteScript(jsTypeCombobox, []interface{}{labelText, value})
+	if err != nil || res == nil {
+		return false
+	}
+	time.Sleep(1200 * time.Millisecond) // wait for listbox to render
+	for _, sel := range []string{
+		`[role="listbox"] [role="option"]`,
+		`[role="option"]`,
+	} {
+		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+		if err != nil || len(els) == 0 {
+			continue
+		}
+		valLow := strings.ToLower(value)
+		for _, el := range els {
+			text, _ := el.Text()
+			if strings.Contains(strings.ToLower(text), valLow) {
+				_ = el.Click()
+				time.Sleep(300 * time.Millisecond)
+				return true
+			}
+		}
+		// No text match — click the first visible option rather than leaving
+		// the dropdown open with nothing selected.
+		if err := els[0].Click(); err == nil {
+			time.Sleep(300 * time.Millisecond)
+			return true
+		}
+	}
+	// No listbox appeared at all — close any open dropdown so it does not
+	// intercept clicks meant for the next field.
+	if inps, e := wd.FindElements(selenium.ByCSSSelector, `input[role="combobox"][aria-expanded="true"]`); e == nil {
+		for _, inp := range inps {
+			inp.SendKeys(selenium.EscapeKey) //nolint:errcheck
+		}
+	}
+	return false
+}
+
+// fillSalutation selects "Mr" / "Herr" in salutation/title fields that appear
+// on European ATS forms (onlyfy, Personio, etc.).  It tries native <select>
+// elements first (by name/id), then label-based select lookup, then radio
+// buttons, then plain text inputs.
+func fillSalutation(wd selenium.WebDriver) {
+	const mr = "Mr"
+	const herr = "Herr"
+
+	// Native <select> by name/id pattern (salut, anrede, honorific).
+	// "title" is intentionally excluded here — too broad; see label-based pass.
+	for _, sel := range []string{
+		`select[name*="salut" i]`, `select[id*="salut" i]`,
+		`select[name*="anrede" i]`, `select[id*="anrede" i]`,
+		`select[name*="honorific" i]`, `select[id*="honorific" i]`,
+	} {
+		if trySetSelect(wd, sel, mr) || trySetSelect(wd, sel, herr) {
+			return
+		}
+	}
+
+	// Label-based <select> (covers cases where name/id is generic).
+	for _, lbl := range []string{"salutation", "anrede", "honorific", "salut"} {
+		if trySetSelectByLabel(wd, lbl, mr) || trySetSelectByLabel(wd, lbl, herr) {
+			return
+		}
+	}
+
+	// Radio buttons — click the first option whose visible text is "Mr" or "Herr".
+	res, err := wd.ExecuteScript(`
+try {
+    var radios = document.querySelectorAll('input[type="radio"]');
+    for (var i = 0; i < radios.length; i++) {
+        var r = radios[i];
+        var nm = (r.name || r.id || '').toLowerCase();
+        if (!/salut|anrede|honorific|gender_title/.test(nm)) {
+            var lbl = document.querySelector('label[for="'+r.id+'"]');
+            if (!lbl) continue;
+            var txt = lbl.textContent.trim().toLowerCase();
+            if (!/salut|anrede|honorific/.test(txt)) continue;
+        }
+        var lbl2 = document.querySelector('label[for="'+r.id+'"]');
+        var val = (r.value || (lbl2 && lbl2.textContent) || '').trim().toLowerCase();
+        if (val === 'mr' || val === 'herr' || val === 'mr.' || val === 'mister') {
+            r.click();
+            return true;
+        }
+    }
+    return false;
+} catch(e) { return false; }
+`, nil)
+	if ok, _ := res.(bool); ok {
+		return
+	}
+	_ = err
+
+	// Text input fallback (rare, but some forms use a free-text title field).
+	for _, sel := range []string{
+		`input[name*="salut" i]`, `input[id*="salut" i]`,
+		`input[name*="anrede" i]`, `input[id*="anrede" i]`,
+	} {
+		if trySetInput(wd, sel, mr) {
+			return
+		}
+	}
+	tryFillByLabel(wd, "salutation", mr)
+	tryFillByLabel(wd, "anrede", herr)
+}
+
 // fillCommonExtras fills the form fields that are common across all ATS
 // platforms but are not covered by the ATS-specific fillers: address,
 // professional links, cover letter, work authorization, EEO, and "how did
 // you hear".  It is called after every ATS-specific filler.
 func fillCommonExtras(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo) {
+	// ── Salutation / title ────────────────────────────────────────────────────
+	// Many European ATS forms (onlyfy, etc.) require a salutation.  We always
+	// answer "Mr" / "Herr" (German).  "title" is kept narrow (must also match
+	// "salut" or "anrede" siblings) to avoid clobbering job-title fields.
+	fillSalutation(wd)
+
 	// ── City ─────────────────────────────────────────────────────────────────
 	if info.City != "" {
 		for _, sel := range []string{
@@ -891,8 +1646,13 @@ func fillCommonExtras(ctx context.Context, wd selenium.WebDriver, info Applicant
 		if !trySetSelect(wd, countrySelectors, info.Country) {
 			trySetSelectByLabel(wd, "country", info.Country)
 		}
+		// Exclude role="combobox" inputs: setting their value via JS fires the
+		// React input event which opens the React Select dropdown without then
+		// clicking an option, leaving the dropdown open and the field empty.
+		// Those are handled below by fillComboboxByLabel.
 		for _, sel := range []string{
-			`input[name*="country" i]`, `input[id*="country" i]`,
+			`input[name*="country" i]:not([role="combobox"])`,
+			`input[id*="country" i]:not([role="combobox"])`,
 			`input[autocomplete="country-name"]`,
 		} {
 			if trySetInput(wd, sel, info.Country) {
@@ -903,6 +1663,10 @@ func fillCommonExtras(ctx context.Context, wd selenium.WebDriver, info Applicant
 		trySetSelectByLabel(wd, "land", info.Country)
 		tryFillByLabel(wd, "land", info.Country)
 		trySetSelectByLabel(wd, "heimatland", info.Country)
+		// NOTE: React Select combobox fills (location, country) are intentionally
+		// omitted here.  Greenhouse handles them in fillGreenhouse before calling
+		// fillCommonExtras; Ashby handles them in fillAshby.  Adding generic
+		// combobox fills here causes double-fills that visibly re-open dropdowns.
 	}
 
 	// ── Website / portfolio ───────────────────────────────────────────────────
@@ -954,17 +1718,17 @@ func fillCommonExtras(ctx context.Context, wd selenium.WebDriver, info Applicant
 	}
 
 	// ── Work authorization & sponsorship ──────────────────────────────────────
-	if info.WorkAuthorized != "" || info.RequireSponsorship != "" {
-		authAns := info.WorkAuthorized
-		sponsorAns := info.RequireSponsorship
-		if authAns == "" {
-			authAns = "yes" // safe default: authorised; skip if not set
-		}
-		if sponsorAns == "" {
-			sponsorAns = "no" // safe default: no sponsorship needed
-		}
-		wd.ExecuteScript(jsHandleWorkEligibility, []interface{}{authAns, sponsorAns}) //nolint:errcheck
+	// Always answer — required on Ashby and many other platforms, leaving it
+	// blank keeps the Submit button disabled even when every other field is set.
+	authAns := info.WorkAuthorized
+	if authAns == "" {
+		authAns = "yes"
 	}
+	sponsorAns := info.RequireSponsorship
+	if sponsorAns == "" {
+		sponsorAns = "no"
+	}
+	wd.ExecuteScript(jsHandleWorkEligibility, []interface{}{authAns, sponsorAns}) //nolint:errcheck
 
 	// ── EEO radio buttons (gender + ethnicity — Ashby and others) ────────────
 	genderVal := info.Gender
@@ -1074,6 +1838,315 @@ func fillCommonExtras(ctx context.Context, wd selenium.WebDriver, info Applicant
 
 // ── ATS-specific form fillers ─────────────────────────────────────────────────
 
+// dialCodeToISO maps international dial prefixes (longest first) to ISO 3166-1
+// alpha-2 codes.  Used to infer the Greenhouse phone-country-select value from
+// an E.164-formatted phone number (e.g. "+972…" → "IL").
+var dialCodeToISO = map[string]string{
+	// 3-digit codes
+	"+212": "MA", "+213": "DZ", "+216": "TN", "+218": "LY",
+	"+220": "GM", "+221": "SN", "+234": "NG", "+254": "KE",
+	"+255": "TZ", "+256": "UG", "+260": "ZM", "+263": "ZW",
+	"+351": "PT", "+352": "LU", "+353": "IE", "+354": "IS",
+	"+356": "MT", "+358": "FI", "+359": "BG",
+	"+370": "LT", "+371": "LV", "+372": "EE", "+374": "AM",
+	"+375": "BY", "+380": "UA", "+381": "RS", "+382": "ME",
+	"+385": "HR", "+386": "SI", "+387": "BA", "+389": "MK",
+	"+420": "CZ", "+421": "SK",
+	"+852": "HK", "+853": "MO", "+855": "KH", "+856": "LA",
+	"+880": "BD", "+886": "TW",
+	"+961": "LB", "+962": "JO", "+963": "SY", "+964": "IQ",
+	"+965": "KW", "+966": "SA", "+967": "YE", "+968": "OM",
+	"+971": "AE", "+972": "IL", "+973": "BH", "+974": "QA",
+	"+977": "NP",
+	// 2-digit codes
+	"+20": "EG", "+27": "ZA", "+30": "GR", "+31": "NL",
+	"+32": "BE", "+33": "FR", "+34": "ES", "+36": "HU",
+	"+39": "IT", "+40": "RO", "+41": "CH", "+43": "AT",
+	"+44": "GB", "+45": "DK", "+46": "SE", "+47": "NO",
+	"+48": "PL", "+49": "DE",
+	"+51": "PE", "+52": "MX", "+54": "AR", "+55": "BR",
+	"+56": "CL", "+57": "CO", "+58": "VE",
+	"+60": "MY", "+61": "AU", "+62": "ID", "+63": "PH",
+	"+64": "NZ", "+65": "SG", "+66": "TH",
+	"+81": "JP", "+82": "KR", "+84": "VN", "+86": "CN",
+	"+90": "TR", "+91": "IN", "+92": "PK", "+93": "AF",
+	"+94": "LK", "+95": "MM", "+98": "IR",
+	// 1-digit codes
+	"+1": "US", "+7": "RU",
+}
+
+// countryNameToISO maps lowercase country names to ISO 3166-1 alpha-2 codes.
+var countryNameToISO = map[string]string{
+	"israel": "IL", "afghanistan": "AF", "albania": "AL", "algeria": "DZ",
+	"argentina": "AR", "armenia": "AM", "australia": "AU", "austria": "AT",
+	"azerbaijan": "AZ", "bahrain": "BH", "bangladesh": "BD", "belarus": "BY",
+	"belgium": "BE", "bolivia": "BO", "bosnia": "BA", "brazil": "BR",
+	"bulgaria": "BG", "cambodia": "KH", "canada": "CA", "chile": "CL",
+	"china": "CN", "colombia": "CO", "croatia": "HR", "czech republic": "CZ",
+	"czechia": "CZ", "denmark": "DK", "ecuador": "EC", "egypt": "EG",
+	"estonia": "EE", "ethiopia": "ET", "finland": "FI", "france": "FR",
+	"georgia": "GE", "germany": "DE", "ghana": "GH", "greece": "GR",
+	"hong kong": "HK", "hungary": "HU", "iceland": "IS", "india": "IN",
+	"indonesia": "ID", "iran": "IR", "iraq": "IQ", "ireland": "IE",
+	"italy": "IT", "japan": "JP", "jordan": "JO", "kazakhstan": "KZ",
+	"kenya": "KE", "south korea": "KR", "korea": "KR", "kuwait": "KW",
+	"latvia": "LV", "lebanon": "LB", "libya": "LY", "lithuania": "LT",
+	"luxembourg": "LU", "malaysia": "MY", "malta": "MT", "mexico": "MX",
+	"moldova": "MD", "montenegro": "ME", "morocco": "MA", "myanmar": "MM",
+	"nepal": "NP", "netherlands": "NL", "new zealand": "NZ", "nigeria": "NG",
+	"north macedonia": "MK", "norway": "NO", "oman": "OM", "pakistan": "PK",
+	"peru": "PE", "philippines": "PH", "poland": "PL", "portugal": "PT",
+	"qatar": "QA", "romania": "RO", "russia": "RU", "saudi arabia": "SA",
+	"senegal": "SN", "serbia": "RS", "singapore": "SG", "slovakia": "SK",
+	"slovenia": "SI", "south africa": "ZA", "spain": "ES", "sri lanka": "LK",
+	"sweden": "SE", "switzerland": "CH", "syria": "SY", "taiwan": "TW",
+	"tanzania": "TZ", "thailand": "TH", "tunisia": "TN", "turkey": "TR",
+	"türkiye": "TR", "ukraine": "UA", "united arab emirates": "AE", "uae": "AE",
+	"united kingdom": "GB", "uk": "GB", "england": "GB",
+	"united states": "US", "usa": "US", "u.s.a.": "US", "u.s.": "US",
+	"uruguay": "UY", "uzbekistan": "UZ", "venezuela": "VE", "vietnam": "VN",
+	"yemen": "YE", "zambia": "ZM", "zimbabwe": "ZW",
+}
+
+// phoneCountryISO returns the ISO 3166-1 alpha-2 code for the applicant's
+// phone country.  It first tries to infer from the E.164 dial prefix of
+// info.Phone ("+972…" → "IL"), then falls back to info.Country.
+func phoneCountryISO(info ApplicantInfo) string {
+	if strings.HasPrefix(info.Phone, "+") {
+		// Try longest dial code first (4 chars including "+", then 3, then 2).
+		for _, n := range []int{4, 3, 2} {
+			if len(info.Phone) >= n {
+				if iso, ok := dialCodeToISO[info.Phone[:n]]; ok {
+					return iso
+				}
+			}
+		}
+	}
+	if info.Country != "" {
+		cl := strings.ToLower(strings.TrimSpace(info.Country))
+		if iso, ok := countryNameToISO[cl]; ok {
+			return iso
+		}
+		// Caller may have passed a 2-letter ISO code directly.
+		if len(info.Country) == 2 {
+			return strings.ToUpper(info.Country)
+		}
+	}
+	return ""
+}
+
+// countryDisplayName returns the human-readable country name for a React Select
+// combobox (e.g. "Israel", "United States").  If info.Country is a 2-letter ISO
+// code it is reverse-looked-up in countryNameToISO; otherwise it is returned
+// as-is so user-supplied full names pass through unchanged.
+func countryDisplayName(info ApplicantInfo) string {
+	c := info.Country
+	if c == "" {
+		// Infer from phone prefix.
+		iso := phoneCountryISO(info)
+		if iso == "" {
+			return ""
+		}
+		for name, code := range countryNameToISO {
+			if code == iso {
+				return titleWords(name)
+			}
+		}
+		return iso
+	}
+	if len(c) == 2 {
+		cu := strings.ToUpper(c)
+		for name, code := range countryNameToISO {
+			if code == cu {
+				return titleWords(name)
+			}
+		}
+	}
+	return c
+}
+
+// titleWords upper-cases the first letter of each word (ASCII-safe replacement
+// for the deprecated strings.Title).
+func titleWords(s string) string {
+	words := strings.Fields(s)
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
+}
+
+// fillGreenhouseComboboxByID interacts with a Greenhouse React Select combobox
+// by id: clicks it to open the menu, optionally types value to filter, then
+// clicks the best-matching option.  When value is "" the dropdown is opened
+// without typing and the first option is selected (mop-up mode for unknown
+// dropdowns).  waitMs controls how long to wait for options to appear after
+// the click/type — use a larger value for async-fetched lists such as the
+// Google Places location field.
+func fillGreenhouseComboboxByID(wd selenium.WebDriver, id, value string, waitMs int) bool {
+	inp, err := wd.FindElement(selenium.ByCSSSelector, "#"+id)
+	if err != nil {
+		log.Printf("[greenhouse] combobox #%s not found", id)
+		return false
+	}
+	if err := inp.Click(); err != nil {
+		return false
+	}
+	time.Sleep(200 * time.Millisecond)
+	// Clear any previously typed text (e.g. from a prior failed fill attempt).
+	// inp.Clear() is safer than Ctrl+A+Delete, which React Select can intercept
+	// to close the dropdown — causing the first typed character to be swallowed
+	// by the re-open event instead of landing in the filter input.
+	_ = inp.Clear()
+	if value != "" {
+		if err := inp.SendKeys(value); err != nil {
+			return false
+		}
+	}
+	time.Sleep(time.Duration(waitMs) * time.Millisecond)
+
+	for _, sel := range []string{
+		`[role="listbox"] [role="option"]`,
+		`[role="option"]`,
+	} {
+		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+		if err != nil || len(els) == 0 {
+			continue
+		}
+		valLow := strings.ToLower(value)
+		for _, el := range els {
+			text, _ := el.Text()
+			if strings.Contains(strings.ToLower(text), valLow) {
+				if err := el.Click(); err == nil {
+					log.Printf("[greenhouse] combobox #%s: selected %q", id, strings.TrimSpace(text))
+					time.Sleep(300 * time.Millisecond)
+					return true
+				}
+			}
+		}
+		// No text match — click first option as fallback.
+		if err := els[0].Click(); err == nil {
+			text, _ := els[0].Text()
+			log.Printf("[greenhouse] combobox #%s: first-option fallback %q", id, strings.TrimSpace(text))
+			time.Sleep(300 * time.Millisecond)
+			return true
+		}
+	}
+	inp.SendKeys(selenium.EscapeKey) //nolint:errcheck
+	log.Printf("[greenhouse] combobox #%s: no options appeared for %q", id, value)
+	return false
+}
+
+// fillGreenhouseComboboxOrOther is like fillGreenhouseComboboxByID but inserts
+// an "Other" selection attempt between the value-match pass and the first-option
+// fallback.  Use this for school, degree, and field-of-study comboboxes: the
+// user's value may not appear in the ATS's curated database list, and blindly
+// picking the first option would silently fill the field with wrong data.
+//
+// Priority order:
+//  1. Option whose text contains the typed value (exact data match).
+//  2. Option whose text is exactly "Other" / "Other…" (safe unknown catch-all).
+//  3. First available option (last resort, same as fillGreenhouseComboboxByID).
+func fillGreenhouseComboboxOrOther(wd selenium.WebDriver, id, value string, waitMs int) bool {
+	// openAndType clicks the input, clears it, types needle, waits, and returns
+	// all visible option elements — or nil when none are found.
+	openAndType := func(needle string, wait int) []selenium.WebElement {
+		inp, err := wd.FindElement(selenium.ByCSSSelector, "#"+id)
+		if err != nil {
+			return nil
+		}
+		if err := inp.Click(); err != nil {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+		_ = inp.Clear()
+		if needle != "" {
+			_ = inp.SendKeys(needle)
+		}
+		time.Sleep(time.Duration(wait) * time.Millisecond)
+		for _, sel := range []string{`[role="listbox"] [role="option"]`, `[role="option"]`} {
+			if els, err := wd.FindElements(selenium.ByCSSSelector, sel); err == nil && len(els) > 0 {
+				return els
+			}
+		}
+		return nil
+	}
+
+	// Phase 1: search for the actual value.
+	if els := openAndType(value, waitMs); els != nil {
+		valLow := strings.ToLower(value)
+		for _, el := range els {
+			text, _ := el.Text()
+			if strings.Contains(strings.ToLower(text), valLow) {
+				if err := el.Click(); err == nil {
+					log.Printf("[greenhouse] combobox #%s: selected %q", id, strings.TrimSpace(text))
+					time.Sleep(300 * time.Millisecond)
+					return true
+				}
+			}
+		}
+	}
+
+	// Phase 2: value not found — search specifically for "Other".
+	if els := openAndType("other", 700); els != nil {
+		for _, el := range els {
+			text, _ := el.Text()
+			low := strings.ToLower(strings.TrimSpace(text))
+			if low == "other" || strings.HasPrefix(low, "other ") || strings.HasSuffix(low, " other") {
+				if err := el.Click(); err == nil {
+					log.Printf("[greenhouse] combobox #%s: %q not in list — fell back to \"Other\"", id, value)
+					time.Sleep(300 * time.Millisecond)
+					return true
+				}
+			}
+		}
+	}
+
+	// Phase 3: no "Other" option either — first-option fallback.
+	if els := openAndType(value, waitMs/2); els != nil {
+		if err := els[0].Click(); err == nil {
+			text, _ := els[0].Text()
+			log.Printf("[greenhouse] combobox #%s: first-option fallback %q", id, strings.TrimSpace(text))
+			time.Sleep(300 * time.Millisecond)
+			return true
+		}
+	}
+
+	if inp, err := wd.FindElement(selenium.ByCSSSelector, "#"+id); err == nil {
+		inp.SendKeys(selenium.EscapeKey) //nolint:errcheck
+	}
+	log.Printf("[greenhouse] combobox #%s: no options appeared for %q", id, value)
+	return false
+}
+
+// clickGreenhouseCoverLetterManual looks for an "Enter manually" button inside
+// a cover-letter upload widget and clicks it so that a plain-text textarea is
+// revealed.  This allows fillGreenhouse to inject cover-letter text into forms
+// (e.g. Tailscale on job-boards.greenhouse.io) that require a cover letter but
+// offer a text-entry alternative to a file upload.
+func clickGreenhouseCoverLetterManual(wd selenium.WebDriver) {
+	_, _ = wd.ExecuteScript(`
+(function(){
+    var btns = document.querySelectorAll('button,a,[role="button"]');
+    for (var i = 0; i < btns.length; i++) {
+        var t = (btns[i].innerText || btns[i].textContent || '').trim().toLowerCase();
+        if (t === 'enter manually' || t === 'enter text manually') {
+            // Make sure this button is inside a cover-letter section
+            var p = btns[i].parentElement;
+            for (var d = 0; d < 8 && p; d++) {
+                if ((p.textContent || '').toLowerCase().indexOf('cover') !== -1) {
+                    btns[i].click(); return true;
+                }
+                p = p.parentElement;
+            }
+        }
+    }
+    return false;
+})()
+`, nil)
+}
+
 func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
 	waitForElement(ctx, wd, "#first_name", 8*time.Second)
 	first, last := splitName(info.Name)
@@ -1086,14 +2159,332 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 	if !trySetInput(wd, "#email", info.Email) {
 		tryFillByLabel(wd, "email", info.Email)
 	}
+
+	// Phone country — React Select combobox (id="country"); there is no native
+	// <select> in the new Greenhouse form.  We type the country display name
+	// (e.g. "Israel") so the autocomplete can filter and we click the match.
+	if name := countryDisplayName(info); name != "" {
+		fillGreenhouseComboboxByID(wd, "country", name, 800)
+	}
 	if !trySetInput(wd, "#phone", info.Phone) {
 		tryFillByLabel(wd, "phone", info.Phone)
 	}
-	if !trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
-		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
+
+	// Location — Google Places-backed async combobox.  The old boards.greenhouse.io
+	// format uses id="candidate-location"; the new job-boards.greenhouse.io format
+	// may omit this field, use a different id, or embed it as a custom question.
+	// Try multiple IDs, then fall back to label-based combobox matching.
+	locVal := info.City
+	if locVal == "" {
+		locVal = countryDisplayName(info)
 	}
+	if locVal != "" {
+		if !fillGreenhouseComboboxByID(wd, "candidate-location", locVal, 2000) {
+			if !fillGreenhouseComboboxByID(wd, "location", locVal, 2000) {
+				fillComboboxByLabel(wd, "location", locVal)
+			}
+		}
+	}
+
+	// LinkedIn — required on most Greenhouse forms.
+	if info.LinkedInURL != "" {
+		if !trySetInput(wd, `input[aria-label*="linkedin" i]`, info.LinkedInURL) &&
+			!trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
+			tryFillByLabel(wd, "linkedin", info.LinkedInURL)
+		}
+	}
+
 	uploadResume(wd, resumePath)
+
+	// Cover letter — some Greenhouse forms (e.g. Tailscale) require a separate
+	// cover letter file upload.  When only text is available, click "Enter
+	// manually" to reveal a textarea and fill it with the cover letter text.
+	if info.CoverLetter != "" {
+		clickGreenhouseCoverLetterManual(wd)
+		time.Sleep(500 * time.Millisecond)
+		tryFillByLabel(wd, "cover letter", info.CoverLetter)
+	}
+
 	fillCommonExtras(ctx, wd, info)
+
+	// ── Greenhouse React Select combobox pass ─────────────────────────────────
+	// All Greenhouse custom question dropdowns use React Select comboboxes.
+	// fillCommonExtras handles radio buttons and native <select>; these need
+	// label-pattern matching.  Needles are purposely specific so they don't
+	// accidentally match the phone-country combobox (id="country", label="Country").
+
+	country := countryDisplayName(info)
+	authAns := info.WorkAuthorized
+	if authAns == "" {
+		authAns = "yes"
+	}
+	sponsorAns := info.RequireSponsorship
+	if sponsorAns == "" {
+		sponsorAns = "no"
+	}
+
+	// Country / residence selection questions (phrasing varies per employer)
+	fillComboboxByLabel(wd, "country in which you are located", country)
+	fillComboboxByLabel(wd, "country of residence", country)
+	fillComboboxByLabel(wd, "current country", country)
+	fillComboboxByLabel(wd, "please choose the country", country)
+
+	// Work eligibility
+	fillComboboxByLabel(wd, "eligible to work", authAns)
+	fillComboboxByLabel(wd, "authorized to work", authAns)
+	fillComboboxByLabel(wd, "right to work", authAns)
+
+	// Visa sponsorship (multiple phrasings used by different companies).
+	// fillComboboxByLabel handles React Select comboboxes; trySetSelectByLabel
+	// covers forms that embed a native <select> (some older Greenhouse variants).
+	// Any remaining unfilled dropdowns are caught by the mop-up at the end.
+	fillComboboxByLabel(wd, "require sponsorship", sponsorAns)
+	fillComboboxByLabel(wd, "sponsorship for a visa", sponsorAns)
+	fillComboboxByLabel(wd, "visa to remain", sponsorAns)
+	trySetSelectByLabel(wd, "require sponsorship", sponsorAns)
+	trySetSelectByLabel(wd, "visa sponsorship", sponsorAns)
+	trySetSelectByLabel(wd, "sponsorship to work", sponsorAns)
+
+	// Prior employment and legal restrictions
+	fillComboboxByLabel(wd, "previously worked at", "no")
+	fillComboboxByLabel(wd, "previously worked for", "no")
+	fillComboboxByLabel(wd, "employment agreement", "no")
+	fillComboboxByLabel(wd, "post-employment restriction", "no")
+
+	// Location eligibility — two common phrasings with different expected answers.
+	// "based in the following [locations/countries]" → yes (user qualifies)
+	// "based in the United States or Canada" → no (user is outside NA)
+	// "located in or willing to relocate to the United States" → no for non-US applicants.
+	// Both React combobox and native <select> variants are covered.
+	fillComboboxByLabel(wd, "based in the following", "yes")
+	fillComboboxByLabel(wd, "united states or canada", "no")
+	fillComboboxByLabel(wd, "willing to relocate to the united states", "no")
+	fillComboboxByLabel(wd, "located in or willing to relocate", "no")
+	trySetSelectByLabel(wd, "willing to relocate to the united states", "no")
+	trySetSelectByLabel(wd, "located in or willing to relocate", "no")
+	trySetSelectByLabel(wd, "reside in the united states", "no")
+
+	// EEO/demographics — "wish to answer" matches the standard Greenhouse decline
+	// phrase "I don't wish to answer" as well as "I prefer not to answer" variants.
+	// Covers both numeric IDs (Grafana: 4000681004) and named IDs (GitLab: gender).
+	const eeoDecline = "wish to answer"
+	fillComboboxByLabel(wd, "gender", eeoDecline)
+	fillComboboxByLabel(wd, "hispanic", eeoDecline)
+	fillComboboxByLabel(wd, "race", eeoDecline)
+	fillComboboxByLabel(wd, "ethnicity", eeoDecline)
+	fillComboboxByLabel(wd, "veteran", eeoDecline)
+	fillComboboxByLabel(wd, "disability", eeoDecline)
+	fillComboboxByLabel(wd, "transgender", eeoDecline)
+
+	// Free-text custom questions common on Greenhouse forms.
+	tryFillByLabel(wd, "country and time zone", info.Country)
+	// "How did you hear" may be a React Select combobox (new Greenhouse) or a
+	// native text input.  Try combobox first; fall back to plain text injection.
+	if !fillComboboxByLabel(wd, "how did you hear", "job board") {
+		tryFillByLabel(wd, "how did you hear", "Online job board")
+	}
+
+	// ── Education ─────────────────────────────────────────────────────────────
+	// Greenhouse education fields come in two forms:
+	//   • React Select comboboxes (new job-boards.greenhouse.io format)
+	//   • Native <select> elements (older boards.greenhouse.io format)
+	// The mop-up below catches the combobox variant; handle native <select>
+	// and text inputs here so both formats are covered.
+	if info.School != "" {
+		// Combobox: try exact school name; fall back to "Other" if not in list.
+		fillGreenhouseComboboxOrOther(wd, "school_name_0", info.School, 1200)
+		// Native <select> and text-input variants (older Greenhouse format).
+		if !trySetSelect(wd, `select[id*="school" i], select[name*="school" i]`, info.School) {
+			trySetSelectByLabel(wd, "school", info.School)
+		}
+		tryFillByLabel(wd, "school", info.School)
+		tryFillByLabel(wd, "institution", info.School)
+	}
+	if info.Degree != "" {
+		degreeTerms := map[string][]string{
+			"bachelor":  {"bachelor"},
+			"master":    {"master"},
+			"phd":       {"doctoral", "ph.d", "doctor"},
+			"associate": {"associate"},
+		}
+		for _, term := range degreeTerms[info.Degree] {
+			if fillGreenhouseComboboxOrOther(wd, "degree_0", term, 1000) {
+				break
+			}
+		}
+		for _, term := range degreeTerms[info.Degree] {
+			if trySetSelect(wd, `select[id*="degree" i], select[name*="degree" i]`, term) {
+				break
+			}
+			if trySetSelectByLabel(wd, "degree", term) {
+				break
+			}
+		}
+	}
+	if info.FieldOfStudy != "" {
+		// Combobox: try field name; fall back to "Other" if not in list.
+		fillGreenhouseComboboxOrOther(wd, "discipline_0", info.FieldOfStudy, 1000)
+		tryFillByLabel(wd, "field of study", info.FieldOfStudy)
+		tryFillByLabel(wd, "major", info.FieldOfStudy)
+		tryFillByLabel(wd, "discipline", info.FieldOfStudy)
+		trySetSelectByLabel(wd, "field of study", info.FieldOfStudy)
+		trySetSelectByLabel(wd, "major", info.FieldOfStudy)
+	}
+
+	// Mop-up pass: find every remaining unfilled React Select combobox using
+	// the visible-placeholder heuristic (works with both the old .select-shell
+	// pattern and the new job-boards.greenhouse.io format that uses different
+	// container classes).  For each, choose a value based on its label text.
+	fillGreenhouseAllUnfilledDropdowns(wd, sponsorAns, authAns, info)
+}
+
+// fillGreenhouseEEODecline selects the "decline to answer" option from an EEO
+// React Select combobox.  Different ATS instances phrase the decline option
+// differently ("I don't wish to answer", "Prefer not to say", "Decline to
+// self-identify", etc.), so we try several needles.  If none match, we open
+// the dropdown with all options visible and click the last one — Greenhouse EEO
+// forms always place the decline option last.
+func fillGreenhouseEEODecline(wd selenium.WebDriver, id string) {
+	for _, needle := range []string{
+		"decline",       // "Decline To Self Identify" (most common Greenhouse phrasing)
+		"wish to answer", // "I don't wish to answer"
+		"prefer not",   // "I prefer not to answer"
+		"no response",
+		"not to disclose",
+		"choose not",
+	} {
+		if fillGreenhouseComboboxByID(wd, id, needle, 800) {
+			return
+		}
+	}
+	// All typed needles failed — open the dropdown with no filter text and
+	// click the last visible option (always the decline entry in GH EEO forms).
+	inp, err := wd.FindElement(selenium.ByCSSSelector, "#"+id)
+	if err != nil {
+		return
+	}
+	if err := inp.Click(); err != nil {
+		return
+	}
+	// Clear + no typing = show all options
+	_ = inp.Clear()
+	time.Sleep(800 * time.Millisecond)
+	for _, sel := range []string{`[role="listbox"] [role="option"]`, `[role="option"]`} {
+		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+		if err != nil || len(els) == 0 {
+			continue
+		}
+		last := els[len(els)-1]
+		if err := last.Click(); err == nil {
+			text, _ := last.Text()
+			log.Printf("[greenhouse] EEO combobox #%s: last-option decline %q", id, strings.TrimSpace(text))
+			time.Sleep(300 * time.Millisecond)
+			return
+		}
+	}
+	inp.SendKeys(selenium.EscapeKey) //nolint:errcheck
+}
+
+// fillGreenhouseAllUnfilledDropdowns finds every React Select combobox on the
+// page that still shows a placeholder (= nothing selected) and fills it with
+// an answer chosen by label-text matching.  This covers both the old
+// boards.greenhouse.io format (.select-shell wrappers) and the new
+// job-boards.greenhouse.io format (no .select-shell, different container class)
+// which was previously missed by jsGetUnfilledComboboxIDs.
+func fillGreenhouseAllUnfilledDropdowns(wd selenium.WebDriver, sponsorAns, authAns string, info ApplicantInfo) {
+	res, err := wd.ExecuteScript(jsGetUnfilledComboboxDetails, nil)
+	if err != nil || res == nil {
+		return
+	}
+	pairs, ok := res.([]interface{})
+	if !ok || len(pairs) == 0 {
+		return
+	}
+
+	const eeoDecline = "wish to answer"
+
+	// Map normalised degree keyword → search term that matches Greenhouse's
+	// degree dropdown options (e.g. "bachelor" matches "Bachelor's Degree").
+	degreeSearch := map[string]string{
+		"bachelor":  "bachelor",
+		"master":    "master",
+		"phd":       "doctoral",
+		"associate": "associate",
+	}
+
+	for _, item := range pairs {
+		pair, ok := item.([]interface{})
+		if !ok || len(pair) < 2 {
+			continue
+		}
+		id, _ := pair[0].(string)
+		lbl, _ := pair[1].(string)
+		if id == "" {
+			continue
+		}
+
+		var value string
+		switch {
+		case strings.Contains(lbl, "relocat") ||
+			strings.Contains(lbl, "reside") ||
+			strings.Contains(lbl, "located in") ||
+			strings.Contains(lbl, "united states or canada") ||
+			strings.Contains(lbl, "north america"):
+			value = "no"
+		case strings.Contains(lbl, "sponsor") ||
+			strings.Contains(lbl, "visa") ||
+			strings.Contains(lbl, "immigration"):
+			value = sponsorAns
+		case strings.Contains(lbl, "authorized") ||
+			strings.Contains(lbl, "authorised") ||
+			strings.Contains(lbl, "right to work") ||
+			strings.Contains(lbl, "eligible to work"):
+			value = authAns
+		case strings.Contains(lbl, "gender") ||
+			strings.Contains(lbl, "sex ") ||
+			strings.Contains(lbl, "hispanic") ||
+			strings.Contains(lbl, "ethnicity") ||
+			strings.Contains(lbl, "race ") ||
+			strings.Contains(lbl, "racial") ||
+			strings.Contains(lbl, "veteran") ||
+			strings.Contains(lbl, "disability"):
+			log.Printf("[greenhouse] mop-up: EEO combobox #%s label=%q → decline", id, lbl)
+			fillGreenhouseEEODecline(wd, id)
+			continue
+
+		case strings.Contains(lbl, "school") ||
+			strings.Contains(lbl, "institution") ||
+			strings.Contains(lbl, "university") ||
+			strings.Contains(lbl, "college"):
+			v := info.School
+			log.Printf("[greenhouse] mop-up: school combobox #%s label=%q → %q (other fallback enabled)", id, lbl, v)
+			fillGreenhouseComboboxOrOther(wd, id, v, 1200)
+			continue
+
+		case strings.Contains(lbl, "degree") ||
+			strings.Contains(lbl, "qualification") ||
+			strings.Contains(lbl, "education level"):
+			term := degreeSearch[info.Degree] // "" when degree unknown → other fallback
+			log.Printf("[greenhouse] mop-up: degree combobox #%s label=%q → %q (other fallback enabled)", id, lbl, term)
+			fillGreenhouseComboboxOrOther(wd, id, term, 1000)
+			continue
+
+		case strings.Contains(lbl, "field of study") ||
+			strings.Contains(lbl, "major") ||
+			strings.Contains(lbl, "discipline") ||
+			strings.Contains(lbl, "area of study"):
+			v := info.FieldOfStudy
+			log.Printf("[greenhouse] mop-up: field combobox #%s label=%q → %q (other fallback enabled)", id, lbl, v)
+			fillGreenhouseComboboxOrOther(wd, id, v, 1000)
+			continue
+
+		default:
+			value = "" // first-option fallback
+		}
+
+		log.Printf("[greenhouse] mop-up: combobox #%s label=%q → %q", id, lbl, value)
+		fillGreenhouseComboboxByID(wd, id, value, 800)
+	}
 }
 
 func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -1121,7 +2512,105 @@ func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 	fillCommonExtras(ctx, wd, info)
 }
 
-func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+// jsGetAshbyUnfilledComboboxes returns [[inputId, labelText], ...] for every
+// visible Ashby combobox that currently has no selected value.  It detects the
+// empty state by checking whether the placeholder element is still visible
+// inside the combobox container (Ashby hides the placeholder once a value is
+// chosen) or whether the input value is empty.
+const jsGetAshbyUnfilledComboboxes = `
+try {
+    var res = [];
+    var seen = {};
+    var inputs = document.querySelectorAll('input[role="combobox"]');
+    for (var i = 0; i < inputs.length; i++) {
+        var inp = inputs[i];
+        if (!inp.id || seen[inp.id] || inp.disabled) continue;
+        // Walk up to find the combobox container (usually a div with a class
+        // that contains "select", "combobox", or "dropdown").
+        var unfilled = false;
+        var p = inp.parentElement;
+        for (var d = 0; d < 8 && p; d++) {
+            // Visible placeholder means no value selected.
+            var ph = p.querySelector('[class*="placeholder" i]');
+            if (ph) {
+                var st = window.getComputedStyle(ph);
+                if (st.display !== 'none' && parseFloat(st.opacity || '1') > 0.1) {
+                    unfilled = true;
+                    break;
+                }
+            }
+            // Also check: singleValue element absent means no selection.
+            var sv = p.querySelector('[class*="single-value" i], [class*="singleValue" i]');
+            if (sv && window.getComputedStyle(sv).display !== 'none') {
+                unfilled = false; // has a selected value
+                break;
+            }
+            p = p.parentElement;
+        }
+        if (!unfilled) continue;
+        seen[inp.id] = true;
+        // Climb from the input to find its label.
+        var lbl = '';
+        var c = inp.parentElement;
+        for (var j = 0; j < 12 && c; j++) {
+            var lel = c.querySelector('label');
+            if (lel) { lbl = lel.textContent.trim().toLowerCase(); break; }
+            c = c.parentElement;
+        }
+        res.push([inp.id, lbl]);
+    }
+    return res;
+} catch(e) { return []; }
+`
+
+// fillAshbyUnfilledComboboxes finds every Ashby combobox that still has no
+// selected value after the main fill pass and selects its first available
+// option.  This catches employer-specific custom questions whose label text
+// doesn't match any of the targeted patterns above.
+func fillAshbyUnfilledComboboxes(wd selenium.WebDriver) {
+	raw, err := wd.ExecuteScript(jsGetAshbyUnfilledComboboxes, nil)
+	if err != nil || raw == nil {
+		return
+	}
+	pairs, ok := raw.([]interface{})
+	if !ok {
+		return
+	}
+	for _, item := range pairs {
+		pair, ok := item.([]interface{})
+		if !ok || len(pair) < 2 {
+			continue
+		}
+		id, _ := pair[0].(string)
+		lbl, _ := pair[1].(string)
+		if id == "" {
+			continue
+		}
+		log.Printf("[ashby] mop-up: unfilled combobox #%s label=%q → first option", id, lbl)
+		inp, err := wd.FindElement(selenium.ByCSSSelector, "#"+id)
+		if err != nil {
+			continue
+		}
+		if err := inp.Click(); err != nil {
+			continue
+		}
+		time.Sleep(800 * time.Millisecond)
+		for _, sel := range []string{`[role="listbox"] [role="option"]`, `[role="option"]`} {
+			opts, err := wd.FindElements(selenium.ByCSSSelector, sel)
+			if err != nil || len(opts) == 0 {
+				continue
+			}
+			if err := opts[0].Click(); err == nil {
+				text, _ := opts[0].Text()
+				log.Printf("[ashby] mop-up: combobox #%s selected first option %q", id, strings.TrimSpace(text))
+				time.Sleep(300 * time.Millisecond)
+			}
+			break
+		}
+	}
+}
+
+func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string, job *JobInfo) {
 	// Wait for the name or email field — whichever appears first.
 	// Using a compound selector so we're not blocked on a single ID/name variant.
 	waitForElement(ctx, wd,
@@ -1142,19 +2631,220 @@ func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 		!trySetInput(wd, `input[autocomplete="email"]`, info.Email) {
 		tryFillByLabel(wd, "email", info.Email)
 	}
-	// Phone
-	if !trySetInput(wd, `input[name="phone"]`, info.Phone) &&
-		!trySetInput(wd, `input[type="tel"]`, info.Phone) &&
-		!trySetInput(wd, `input[autocomplete="tel"]`, info.Phone) {
-		tryFillByLabel(wd, "phone", info.Phone)
+	// Phone — Ashby uses UUID-named tel inputs that may ignore the native JS
+	// value setter (custom phone component).  Use WebDriver SendKeys first so
+	// real key events are dispatched; fall back to JS-setter approaches.
+	{
+		phoneFilled := false
+		if phoneEls, _ := wd.FindElements(selenium.ByCSSSelector, `input[type="tel"]`); len(phoneEls) > 0 {
+			if err := phoneEls[0].Click(); err == nil {
+				_ = phoneEls[0].Clear()
+				if err2 := phoneEls[0].SendKeys(info.Phone); err2 == nil {
+					phoneFilled = true
+				}
+			}
+		}
+		if !phoneFilled {
+			if !trySetInput(wd, `input[name="phone"]`, info.Phone) &&
+				!trySetInput(wd, `input[autocomplete="tel"]`, info.Phone) {
+				tryFillByLabel(wd, "phone number", info.Phone)
+				tryFillByLabel(wd, "phone", info.Phone)
+			}
+		}
 	}
 	// LinkedIn
 	if !trySetInput(wd, `input[placeholder*="LinkedIn" i]`, info.LinkedInURL) &&
 		!trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
-	uploadResume(wd, resumePath)
+	// Location — Ashby uses a React-Select combobox.  Several label phrasings
+	// are tried in order; Pleo uses "Where are you currently located?" (needle
+	// "currently located") while others use plain "Location" or "Country".
+	locVal := info.City
+	if locVal == "" {
+		locVal = info.Country
+	}
+	if locVal != "" {
+		if !fillComboboxByLabel(wd, "currently located", locVal) &&
+			!fillComboboxByLabel(wd, "where are you currently", locVal) &&
+			!fillComboboxByLabel(wd, "location", locVal) {
+			fillComboboxByLabel(wd, "country", locVal)
+		}
+	}
 	fillCommonExtras(ctx, wd, info)
+
+	// ── Ashby React Select comboboxes ─────────────────────────────────────────
+	// jsHandleWorkEligibility (called via fillCommonExtras) handles native
+	// <select> and radio buttons.  Ashby also renders work-auth and sponsorship
+	// as React Select comboboxes, which need the click+type approach.
+	authAns := info.WorkAuthorized
+	if authAns == "" {
+		authAns = "yes"
+	}
+	sponsorAns := info.RequireSponsorship
+	if sponsorAns == "" {
+		sponsorAns = "no"
+	}
+	fillComboboxByLabel(wd, "eligible to work", authAns)
+	fillComboboxByLabel(wd, "authorized to work", authAns)
+	fillComboboxByLabel(wd, "legally allowed to work", authAns)
+	fillComboboxByLabel(wd, "right to work", authAns)
+	// EU / country-specific work auth phrasing.
+	fillComboboxByLabel(wd, "eligible to work in germany", authAns)
+	fillComboboxByLabel(wd, "right to work in germany", authAns)
+	fillComboboxByLabel(wd, "eligible to work in the eu", authAns)
+	fillComboboxByLabel(wd, "right to work in the eu", authAns)
+	fillComboboxByLabel(wd, "eligible to work in the uk", authAns)
+	fillComboboxByLabel(wd, "right to work in the uk", authAns)
+	fillComboboxByLabel(wd, "require sponsorship", sponsorAns)
+	fillComboboxByLabel(wd, "sponsorship for a visa", sponsorAns)
+	fillComboboxByLabel(wd, "require a visa", sponsorAns)
+	fillComboboxByLabel(wd, "need sponsorship", sponsorAns)
+	fillComboboxByLabel(wd, "require work permit", sponsorAns)
+	fillComboboxByLabel(wd, "require a work permit", sponsorAns)
+
+	// jobInIsrael is used later for "nature of right to work" radio selection.
+	descLow := strings.ToLower(job.Description + " " + job.Title)
+	jobInIsrael := strings.Contains(descLow, "israel") ||
+		strings.Contains(descLow, "tel aviv") ||
+		strings.Contains(descLow, "jerusalem") ||
+		strings.Contains(descLow, "haifa") ||
+		strings.Contains(descLow, "nazareth")
+
+	// "Which location are you applying for?" — employer-defined list of cities/
+	// regions.  The applicant may not be in any listed city, so pick "Other"
+	// which is always present as a catch-all and does not require sponsorship.
+	fillComboboxByLabel(wd, "location are you applying for", "other")
+	// Some Ashby forms reveal a free-text input after "Other" is selected.
+	// Give React 800 ms to render the conditional field, then fill it.
+	time.Sleep(800 * time.Millisecond)
+	fillLoc := info.City
+	if fillLoc == "" {
+		fillLoc = info.Country
+	}
+	tryFillByLabel(wd, "enter your location below", fillLoc)
+	tryFillByLabel(wd, "please enter your location", fillLoc)
+	tryFillByLabel(wd, "selected 'other'", fillLoc)
+
+	// "What state would you like to be based in?" — The Zebra and similar
+	// US-centric employers ask for an intra-country location via a city/region
+	// combobox.  Try the city first; "remote" and "other" are safe fallbacks.
+	if !fillComboboxByLabel(wd, "state would you like to be based", info.City) {
+		if !fillComboboxByLabel(wd, "state would you like to be based", "remote") {
+			fillComboboxByLabel(wd, "state would you like to be based", "other")
+		}
+	}
+
+	// "What is the nature of your right to work?" — some employers render this
+	// as a multi-option radio group (not a yes/no or combobox).  Pick the option
+	// whose text contains the appropriate needle.
+	var rtWNeedle string
+	switch {
+	case jobInIsrael:
+		rtWNeedle = "citizen of the country"
+	case sponsorAns == "yes":
+		rtWNeedle = "sponsorship"
+	default:
+		rtWNeedle = "unlimited"
+	}
+	wd.ExecuteScript(jsSelectRadioContaining, []interface{}{"nature of your right to work", rtWNeedle}) //nolint:errcheck
+
+	// Boolean Yes/No button-group fields — Ashby renders these as styled <button>
+	// pairs, not radio inputs.  jsHandleWorkEligibility handles native select/radio;
+	// jsHandleAshbyYesNo covers the button-group variant.
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"authorized to work", authAns})        //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"legally authorized to work", authAns}) //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"legally allowed to work", authAns})   //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"require sponsorship", sponsorAns})    //nolint:errcheck
+
+	// "How did you hear about us?" — Ashby MultiValueSelect (checkbox list).
+	// Click the combobox open and pick the first available option.
+	wd.ExecuteScript(jsClickFirstMultiValueOption, []interface{}{"how did you hear"}) //nolint:errcheck
+
+	// Required motivation / cover-letter textareas common on Ashby forms.
+	// Covers labels like "Why do you want to join X?", "Why this role?", etc.
+	// fillCommonExtras already handles `textarea[name*="cover"]`; these match
+	// the free-text motivation questions Ashby employers frequently make required.
+	for _, lbl := range []string{
+		"why do you want to join",
+		"why do you want to work",
+		"why are you excited",
+		"why are you interested",
+		"why this role",
+		"why this company",
+		"what motivates you",
+		"tell us about yourself",
+		"what interests you about",
+	} {
+		tryFillByLabel(wd, lbl, info.CoverLetter)
+	}
+
+	// Language proficiency — common on European/DACH-region roles (Munich, Berlin,
+	// Vienna, Zurich).  Default answer is "Fluent"; selecting the first available
+	// option covers custom scales the employer might use.
+	for _, lbl := range []string{
+		"german language",
+		"level of german",
+		"german proficiency",
+		"deutsch",
+		"sprachkenntnisse",
+		"english language",
+		"level of english",
+		"english proficiency",
+	} {
+		// Try "Fluent" first; fall through to first option via empty-string trick.
+		if !fillComboboxByLabel(wd, lbl, "fluent") {
+			fillComboboxByLabel(wd, lbl, "native")
+		}
+	}
+
+	// "Are you currently based in [country/region]?" — Boolean yes/no combobox
+	// or button-group.  Answer yes (user is assumed to be applying from within
+	// the region or willing to move; sponsorship=no covers no-visa scenarios).
+	for _, lbl := range []string{
+		"currently based in germany",
+		"currently located in germany",
+		"currently based in europe",
+		"currently located in europe",
+		"currently based in the eu",
+		"currently located in the eu",
+		"based in the uk",
+		"located in the uk",
+		"reside in germany",
+		"reside in the eu",
+		"currently reside in germany",
+	} {
+		fillComboboxByLabel(wd, lbl, "yes")
+		wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{lbl, "yes"}) //nolint:errcheck
+	}
+
+	// Mop-up: find any remaining required Ashby comboboxes that none of the
+	// targeted fills above matched, and select their first available option.
+	// This catches employer-specific custom questions with unusual phrasing.
+	fillAshbyUnfilledComboboxes(wd)
+
+	// Upload resume last — Ashby's React re-renders triggered by combobox fills
+	// can reset the file input widget if the upload happens earlier in the fill
+	// sequence.  Uploading after all other state changes prevents this reset.
+	//
+	// Ashby renders TWO <input type="file"> elements:
+	//   input 0  — visual React component (required=false); hit by uploadResume.
+	//   input#_systemfield_resume — form submission field (required=true); must
+	//   also be populated or Ashby's server-side validation rejects the submit.
+	uploadResume(wd, resumePath)
+	if resumePath != "" {
+		if absPath, err := filepath.Abs(resumePath); err == nil {
+			_, _ = wd.ExecuteScript(jsRevealFileInputs, nil)
+			time.Sleep(150 * time.Millisecond)
+			if sysEls, _ := wd.FindElements(selenium.ByCSSSelector, `input#_systemfield_resume`); len(sysEls) > 0 {
+				if kerr := sysEls[0].SendKeys(absPath); kerr == nil {
+					log.Printf("[upload] Ashby _systemfield_resume uploaded: %s", filepath.Base(absPath))
+				} else {
+					log.Printf("[upload] Ashby _systemfield_resume SendKeys failed: %v", kerr)
+				}
+			}
+		}
+	}
 }
 
 func fillBambooHR(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
@@ -1368,6 +3058,133 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 	fillCommonExtras(ctx, wd, info)
 }
 
+// fillWorkday fills Workday ATS application forms.
+// Workday uses data-automation-id attributes exclusively — standard name/id/type
+// selectors do not work.  This filler is only reached when the user has saved
+// Workday credentials in --profile-dir; otherwise the sign-in wall detection in
+// FillApplication returns an error before the switch is reached.
+func fillWorkday(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	waitForElement(ctx, wd,
+		`[data-automation-id="firstName"], [data-automation-id="lastName"]`,
+		12*time.Second)
+
+	first, last := splitName(info.Name)
+
+	trySetInput(wd, `[data-automation-id="firstName"]`, first)
+	trySetInput(wd, `[data-automation-id="lastName"]`, last)
+
+	// Email — only fill when there is no password field visible (application
+	// form context, not sign-in).  The sign-in page also has data-automation-id="email".
+	passEls, _ := wd.FindElements(selenium.ByCSSSelector, `[data-automation-id="password"]`)
+	if len(passEls) == 0 {
+		trySetInput(wd, `[data-automation-id="email"]`, info.Email)
+	}
+
+	trySetInput(wd, `[data-automation-id="phone-number"]`, info.Phone)
+	trySetInput(wd, `[data-automation-id="city"]`, info.City)
+	trySetInput(wd, `[data-automation-id="postalCode"]`, info.ZipCode)
+	trySetSelectByLabel(wd, "country", info.Country)
+
+	if info.LinkedInURL != "" {
+		trySetInput(wd, `[data-automation-id="linkedIn"]`, info.LinkedInURL)
+		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
+	}
+
+	uploadResume(wd, resumePath)
+	fillCommonExtras(ctx, wd, info)
+}
+
+// fillICIMS fills iCIMS ATS application forms.
+// iCIMS uses standard HTML inputs for text fields but often hides the resume
+// file input inside an iframe.  The ?mode=apply URL navigation in FillApplication
+// ensures we land directly on the form rather than the job description page.
+func fillICIMS(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	waitForElement(ctx, wd,
+		`input[type="email"], input[name*="email" i], input[id*="email" i]`,
+		10*time.Second)
+
+	first, last := splitName(info.Name)
+
+	// iCIMS field names vary by employer config; try the most common variants.
+	if !trySetInput(wd, `input[name="firstname"]`, first) &&
+		!trySetInput(wd, `input[name*="first" i]`, first) {
+		tryFillByLabel(wd, "first name", first)
+	}
+	if !trySetInput(wd, `input[name="lastname"]`, last) &&
+		!trySetInput(wd, `input[name*="last" i]`, last) {
+		tryFillByLabel(wd, "last name", last)
+	}
+	if !trySetInput(wd, `input[name="email"]`, info.Email) &&
+		!trySetInput(wd, `input[type="email"]`, info.Email) {
+		tryFillByLabel(wd, "email", info.Email)
+	}
+	if !trySetInput(wd, `input[name="phone"]`, info.Phone) &&
+		!trySetInput(wd, `input[type="tel"]`, info.Phone) {
+		tryFillByLabel(wd, "phone", info.Phone)
+	}
+	trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL)
+
+	uploadResume(wd, resumePath)
+	fillCommonExtras(ctx, wd, info)
+}
+
+// fillWorkable fills Workable ATS application forms.
+// Workable uses standard HTML inputs; the resume is uploaded via a styled
+// drag-drop zone that hides the real <input type="file">.  jsRevealFileInputs
+// in uploadResume handles the reveal.  Some Workable pages require clicking a
+// visible "Upload Resume" zone first to bring the hidden file input into the DOM.
+func fillWorkable(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	waitForElement(ctx, wd,
+		`input[type="email"], input[name*="email" i], input[id*="email" i]`,
+		10*time.Second)
+
+	first, last := splitName(info.Name)
+
+	if !trySetInput(wd, `input[name*="first" i]`, first) &&
+		!trySetInput(wd, `input[placeholder*="First" i]`, first) {
+		tryFillByLabel(wd, "first name", first)
+	}
+	if !trySetInput(wd, `input[name*="last" i]`, last) &&
+		!trySetInput(wd, `input[placeholder*="Last" i]`, last) {
+		tryFillByLabel(wd, "last name", last)
+	}
+	if !trySetInput(wd, `input[type="email"]`, info.Email) &&
+		!trySetInput(wd, `input[name*="email" i]`, info.Email) {
+		tryFillByLabel(wd, "email", info.Email)
+	}
+	if !trySetInput(wd, `input[type="tel"]`, info.Phone) &&
+		!trySetInput(wd, `input[name*="phone" i]`, info.Phone) {
+		tryFillByLabel(wd, "phone", info.Phone)
+	}
+	if info.LinkedInURL != "" {
+		if !trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
+			tryFillByLabel(wd, "linkedin", info.LinkedInURL)
+		}
+	}
+
+	// Workable sometimes renders a drag-drop upload zone that lazy-creates the
+	// real <input type="file"> only after the zone is clicked.  Attempt a click
+	// before the upload so the input is present when jsRevealFileInputs runs.
+	for _, sel := range []string{
+		`[class*="upload" i][class*="resume" i]`,
+		`[class*="resume" i] [class*="upload" i]`,
+		`[data-ui*="upload" i]`,
+		`button[class*="upload" i]`,
+		`.drop-zone`, `[class*="dropzone" i]`,
+		`[class*="file-upload" i]`,
+	} {
+		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+		if err == nil && len(els) > 0 {
+			_ = els[0].Click()
+			time.Sleep(400 * time.Millisecond)
+			break
+		}
+	}
+
+	uploadResume(wd, resumePath)
+	fillCommonExtras(ctx, wd, info)
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // jsAcceptCookies dismisses cookie consent banners in two passes:
@@ -1483,6 +3300,124 @@ func dismissCookieBanner(wd selenium.WebDriver) {
 		}
 		time.Sleep(400 * time.Millisecond) // wait for the overlay animation
 	}
+}
+
+// jsAcceptDataConsent accepts a GDPR / data-processing consent gate.
+// It differs from jsAcceptCookies in that it targets full-page or modal
+// consent forms that gate the application form itself (not just cookie
+// preference banners).  Strategy:
+//  1. Tick every unchecked checkbox whose label / surrounding text mentions
+//     data processing, privacy, GDPR, or application consent.
+//  2. Click the first visible proceed / continue / submit button inside a
+//     consent-scoped container.
+//  3. If no scoped container is found, look for a standalone proceed button
+//     whose text matches common consent-gate labels.
+const jsAcceptDataConsent = `
+(function(){
+    var CONSENT_RE = /\b(privacy|data\s*(?:processing|protection|policy|consent)|gdpr|dsgvo|datenschutz|personal\s+data|application\s+terms|consent\s+to\s+(?:the\s*)?(?:processing|collection)|i\s+agree|i\s+accept|ich\s+stimme|ich\s+akzeptiere|bewerbungsdaten|einwilligung)\b/i;
+    var PROCEED_WORDS = [
+        'continue','proceed','next','weiter','submit','confirm','accept',
+        'agree','ok','got it','ja','yes','fortfahren','bestätigen',
+    ];
+
+    function hasWord(text, words) {
+        var t = text.toLowerCase().trim();
+        for (var i = 0; i < words.length; i++) {
+            if (t === words[i] || t.indexOf(words[i]) !== -1) return true;
+        }
+        return false;
+    }
+    function isVisible(el) {
+        if (!el) return false;
+        var s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) < 0.1) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    }
+
+    // Step 1: tick required consent checkboxes.
+    var checked = 0;
+    var cbs = document.querySelectorAll('input[type="checkbox"]');
+    for (var i = 0; i < cbs.length; i++) {
+        var cb = cbs[i];
+        if (cb.checked || !isVisible(cb)) continue;
+        // Check the label text and surrounding container text.
+        var lbl = document.querySelector('label[for="'+cb.id+'"]');
+        var lblTxt = lbl ? lbl.textContent : '';
+        var parent = cb.parentElement;
+        var ctx = lblTxt;
+        for (var k = 0; k < 5 && parent; k++) { ctx += ' ' + (parent.textContent || ''); parent = parent.parentElement; }
+        if (CONSENT_RE.test(ctx)) {
+            cb.click();
+            checked++;
+        }
+    }
+
+    // Step 2: find a proceed/continue button in a consent-scoped container.
+    var CONSENT_CONTAINERS = [
+        // Jobvite GDPR consent form
+        '.jv-gdpr', '[class*="gdpr"]', '[id*="gdpr"]',
+        '[class*="consent"]', '[id*="consent"]',
+        '[class*="privacy"]', '[id*="privacy"]',
+        '[class*="datenschutz"]', '[id*="datenschutz"]',
+        // Generic modal overlays that gate the form
+        '[role="dialog"]', '.modal', '[class*="modal"]',
+        '[class*="overlay"]', '[class*="gate"]',
+    ];
+    for (var ci = 0; ci < CONSENT_CONTAINERS.length; ci++) {
+        var containers = document.querySelectorAll(CONSENT_CONTAINERS[ci]);
+        for (var cj = 0; cj < containers.length; cj++) {
+            var c = containers[cj];
+            if (!isVisible(c)) continue;
+            if (!CONSENT_RE.test(c.textContent)) continue;
+            var btns = c.querySelectorAll('button, input[type="submit"], a[role="button"]');
+            for (var bi = 0; bi < btns.length; bi++) {
+                var b = btns[bi];
+                if (!isVisible(b)) continue;
+                if (hasWord(b.textContent || b.value || b.innerText || '', PROCEED_WORDS)) {
+                    b.click();
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Step 3: standalone proceed button not inside a labelled container —
+    // only fire when we already ticked at least one consent checkbox (so we
+    // know we are on a consent gate, not a normal form).
+    if (checked > 0) {
+        var allBtns = document.querySelectorAll('button[type="submit"], input[type="submit"], button');
+        for (var ai = 0; ai < allBtns.length; ai++) {
+            var ab = allBtns[ai];
+            if (!isVisible(ab)) continue;
+            if (hasWord(ab.textContent || ab.value || '', PROCEED_WORDS)) {
+                ab.click();
+                return true;
+            }
+        }
+    }
+    return checked > 0; // true if we at least ticked boxes (caller will wait for form)
+})()
+`
+
+// dismissDataConsentWall detects and accepts GDPR / data-processing consent
+// gates that block the application form on European ATS platforms (Jobvite,
+// SmartRecruiters, and others).  It runs after clickPreApplyIfNeeded so the
+// application form URL is already loaded.  On success it waits briefly for
+// the real form to render; on failure it returns silently and lets the
+// downstream form-ready check produce an appropriate error.
+func dismissDataConsentWall(ctx context.Context, wd selenium.WebDriver) {
+	res, err := wd.ExecuteScript(jsAcceptDataConsent, nil)
+	if err != nil {
+		return
+	}
+	accepted, _ := res.(bool)
+	if !accepted {
+		return
+	}
+	log.Printf("[consent] data-consent gate detected — accepted, waiting for form")
+	// Wait up to 4 s for the form to appear after the consent gate dismisses.
+	waitForElement(ctx, wd, appFormSelector, 4*time.Second)
 }
 
 // deadPagePhrases is a normalised list of substrings that appear in page
@@ -1659,7 +3594,12 @@ const appFormSelector = `input[type="email"],` +
 	`input[autocomplete="family-name"],` +
 	`input[id*="email" i],` +
 	`input[id*="firstname" i],` +
-	`input[id*="first_name" i]`
+	`input[id*="first_name" i],` +
+	// Workday uses data-automation-id instead of standard name/type/id.
+	// firstName/lastName are unambiguous application-form fields (unlike "email"
+	// which also appears on the Workday sign-in page).
+	`[data-automation-id="firstName"],` +
+	`[data-automation-id="lastName"]`
 
 // clickPreApplyIfNeeded detects the "job description first, form second"
 // pattern: if the page has no form inputs yet it looks for an "Apply" trigger
@@ -1668,17 +3608,26 @@ const appFormSelector = `input[type="email"],` +
 // appeared — the caller's waitForElement inside the fill function will handle
 // the remaining wait).
 func clickPreApplyIfNeeded(ctx context.Context, wd selenium.WebDriver) bool {
-	// Fast exit only when application-form inputs are already VISIBLE in the
-	// viewport — not merely present in the DOM.  Many ATS platforms (BambooHR,
-	// Greenhouse) pre-render the application form below the job description or
-	// inside a hidden div; a plain FindElements call would match those hidden
-	// inputs and cause us to skip the "Apply Now" button entirely.
+	// Skip the Apply-button hunt only when application-form inputs are already
+	// visible INSIDE THE VIEWPORT — not merely present in the DOM.
+	//
+	// offsetParent !== null is NOT sufficient: platforms like job-boards.greenhouse.io
+	// render the full form below the job description on the same page. Those inputs
+	// have a non-null offsetParent (they're in the normal document flow, just off-
+	// screen), which caused the old check to bail out immediately and never click
+	// the "Apply for this job" CTA at the top of the page — leaving Simplify
+	// invoked without the form having been activated.
+	//
+	// getBoundingClientRect() measures position relative to the viewport, so an
+	// input below the fold returns top >= window.innerHeight and is correctly
+	// treated as not-yet-visible, triggering the Apply-button click.
 	res, _ := wd.ExecuteScript(`
 var els = document.querySelectorAll(arguments[0]);
 for (var i = 0; i < els.length; i++) {
     var e = els[i];
     if (e.disabled) continue;
-    if (e.offsetParent !== null || window.getComputedStyle(e).position === 'fixed') return true;
+    var r = e.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && r.top < window.innerHeight && r.bottom > 0) return true;
 }
 return false;`, []interface{}{appFormSelector})
 	if res == true {
@@ -1920,12 +3869,17 @@ func tryFillByLabel(wd selenium.WebDriver, labelText, value string) bool {
 // CSS/XPath attempts fail.
 const jsSubmit = `
 var WORDS = /\b(submit|apply|send|complete|finish|confirm)\b/i;
+function vis(el){
+    if(el.disabled) return false;
+    var r=el.getBoundingClientRect();
+    return r.width>0 && r.height>0 && r.bottom>0 && r.top<window.innerHeight;
+}
 var all = Array.from(document.querySelectorAll(
     'button[type="submit"], input[type="submit"], button, [role="button"]'
 ));
 for (var i = 0; i < all.length; i++) {
     var el = all[i];
-    if (el.disabled || el.offsetParent === null) continue;
+    if (!vis(el)) continue;
     var label = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
     if (el.type === 'submit' || WORDS.test(label)) {
         el.scrollIntoView({block: 'center'});
@@ -2026,10 +3980,9 @@ return inputs.length;
 `
 
 // uploadResume tries to upload path to any file input on the current page.
-// It first reveals all hidden file inputs (a common ATS pattern where the real
-// <input type="file"> is hidden behind a drag-drop zone), then walks through
-// uploadSelectors from most specific to most generic, attempting SendKeys on
-// every matching element until one succeeds.  Logs the outcome either way.
+// Pass 1: reveals hidden file inputs in the main frame and tries all selectors.
+// Pass 2: switches into each iframe and repeats — iCIMS and some other ATS
+// platforms host the real file input inside a sandboxed frame.
 func uploadResume(wd selenium.WebDriver, path string) bool {
 	if path == "" {
 		return false
@@ -2044,31 +3997,203 @@ func uploadResume(wd selenium.WebDriver, path string) bool {
 		return false
 	}
 
-	// Reveal all hidden file inputs before FindElements so geckodriver can
-	// reach them.  Ignore errors — reveal is best-effort.
-	if n, err2 := wd.ExecuteScript(jsRevealFileInputs, nil); err2 == nil {
-		if cnt, ok := n.(float64); ok && cnt > 0 {
-			time.Sleep(150 * time.Millisecond) // let CSS transitions settle
-		}
-	}
-
 	base := filepath.Base(absPath)
-	for _, sel := range uploadSelectors {
-		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
-		if err != nil || len(els) == 0 {
-			continue
+
+	// tryInCurrentFrame reveals hidden file inputs then walks uploadSelectors.
+	tryInCurrentFrame := func() bool {
+		if n, err2 := wd.ExecuteScript(jsRevealFileInputs, nil); err2 == nil {
+			if cnt, ok := n.(float64); ok && cnt > 0 {
+				time.Sleep(150 * time.Millisecond)
+			}
 		}
-		for _, el := range els {
-			if err := el.SendKeys(absPath); err != nil {
-				log.Printf("[upload] SendKeys failed on %q: %v", sel, err)
+		for _, sel := range uploadSelectors {
+			els, ferr := wd.FindElements(selenium.ByCSSSelector, sel)
+			if ferr != nil || len(els) == 0 {
 				continue
 			}
-			log.Printf("[upload] %q uploaded via selector %q", base, sel)
+			for _, el := range els {
+				if kerr := el.SendKeys(absPath); kerr != nil {
+					log.Printf("[upload] SendKeys failed on %q: %v", sel, kerr)
+					continue
+				}
+				log.Printf("[upload] %q uploaded via selector %q", base, sel)
+				return true
+			}
+		}
+		return false
+	}
+
+	// Pass 1: main frame.
+	if tryInCurrentFrame() {
+		return true
+	}
+
+	// Pass 2: iframes (iCIMS and others embed the file input inside a frame).
+	iframes, _ := wd.FindElements(selenium.ByCSSSelector, "iframe")
+	for _, iframe := range iframes {
+		if ferr := wd.SwitchFrame(iframe); ferr != nil {
+			continue
+		}
+		found := tryInCurrentFrame()
+		_ = wd.SwitchFrame(nil) // return to main frame
+		if found {
 			return true
 		}
 	}
 
 	log.Printf("[upload] WARNING: no file input found on page — resume not uploaded")
+	return false
+}
+
+// submitWithAshbyRetry clicks submit on an Ashby form, reads the validation
+// error banner that appears on failure, attempts targeted fixes for each
+// error, and retries — up to maxAshbyRetries additional times.
+//
+// Ashby validation errors contain the field label (e.g. "how did you hear
+// about us", "are you legally authorized to work in the united states?").
+// We match each error string against known fix patterns and call the
+// appropriate filler before re-attempting submission.
+func submitWithAshbyRetry(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, flags FillFlags) error {
+	const maxAshbyRetries = 2
+
+	authAns := info.WorkAuthorized
+	if authAns == "" {
+		authAns = "yes"
+	}
+	sponsorAns := info.RequireSponsorship
+	if sponsorAns == "" {
+		sponsorAns = "no"
+	}
+
+	for attempt := 0; attempt <= maxAshbyRetries; attempt++ {
+		// Re-accept consent checkboxes and scroll to bottom on every attempt.
+		// Ashby renders consent/privacy checkboxes at the very bottom of the form;
+		// they may only appear after other fields are filled, so we re-run here
+		// rather than relying solely on the earlier fillCommonExtras call.
+		_, _ = wd.ExecuteScript(jsAcceptPrivacyConsent, nil)
+		_, _ = wd.ExecuteScript(`window.scrollTo(0, document.body.scrollHeight);`, nil)
+		time.Sleep(400 * time.Millisecond)
+		_, _ = wd.ExecuteScript(jsAcceptPrivacyConsent, nil) // second pass after scroll reveals bottom
+
+		if err := clickSubmit(wd); err != nil {
+			return err
+		}
+		clickConfirmationModal(wd)
+
+		// Give React time to process the submit event and render any errors.
+		time.Sleep(1500 * time.Millisecond)
+
+		// Read validation errors from the Ashby error summary banner.
+		raw, err := wd.ExecuteScript(jsReadAshbyValidationErrors, nil)
+		if err != nil || raw == nil {
+			// Can't read errors — fall through to standard verify.
+			break
+		}
+		errItems, ok := raw.([]interface{})
+		if !ok || len(errItems) == 0 {
+			// No error banner — submission either succeeded or Ashby gave no signal.
+			break
+		}
+
+		if attempt == maxAshbyRetries {
+			// Exhausted retries — log remaining errors and let verifySubmission decide.
+			for _, e := range errItems {
+				log.Printf("[ashby] validation error (giving up): %v", e)
+			}
+			break
+		}
+
+		log.Printf("[ashby] %d validation error(s) after submit attempt %d — attempting fixes", len(errItems), attempt+1)
+
+		for _, ev := range errItems {
+			msg, _ := ev.(string)
+			if msg == "" {
+				continue
+			}
+			log.Printf("[ashby] error: %s", msg)
+
+			switch {
+			case contains(msg, "how did you hear", "hear about us", "source", "referral"):
+				// MultiValueSelect — open and pick first option.
+				wd.ExecuteScript(jsClickFirstMultiValueOption, []interface{}{"how did you hear"}) //nolint:errcheck
+				time.Sleep(1 * time.Second)
+				// Close dropdown by pressing Escape if still open.
+				if inps, e := wd.FindElements(selenium.ByCSSSelector, `[aria-expanded="true"]`); e == nil {
+					for _, inp := range inps {
+						inp.SendKeys(selenium.EscapeKey) //nolint:errcheck
+					}
+				}
+
+			case contains(msg, "authorized to work", "legally authorized", "work authorization", "eligible to work"):
+				wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"authorized to work", authAns})        //nolint:errcheck
+				wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"legally authorized to work", authAns}) //nolint:errcheck
+				fillComboboxByLabel(wd, "authorized to work", authAns)
+				fillComboboxByLabel(wd, "legally authorized to work", authAns)
+				fillComboboxByLabel(wd, "eligible to work", authAns)
+
+			case contains(msg, "sponsorship", "visa", "require a visa"):
+				wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"require sponsorship", sponsorAns}) //nolint:errcheck
+				fillComboboxByLabel(wd, "require sponsorship", sponsorAns)
+				fillComboboxByLabel(wd, "require a visa", sponsorAns)
+
+			case contains(msg, "state would you like", "state based", "location", "where are you based"):
+				if !fillComboboxByLabel(wd, "state would you like to be based", info.City) {
+					if !fillComboboxByLabel(wd, "state would you like to be based", "remote") {
+						fillComboboxByLabel(wd, "state would you like to be based", "other")
+					}
+				}
+				fillComboboxByLabel(wd, "location are you applying for", "other")
+
+			case contains(msg, "right to work", "nature of your right"):
+				fillComboboxByLabel(wd, "nature of your right to work", "unlimited")
+				fillComboboxByLabel(wd, "right to work", authAns)
+
+			case contains(msg, "gender", "ethnicity", "race", "disability", "veteran"):
+				wd.ExecuteScript(jsHandleEEORadios, []interface{}{"decline", "decline"}) //nolint:errcheck
+
+			case contains(msg, "language", "german", "english proficiency", "deutsch"):
+				for _, lbl := range []string{"german language", "level of german", "german proficiency", "deutsch", "english language", "level of english"} {
+					if fillComboboxByLabel(wd, lbl, "fluent") {
+						break
+					}
+					fillComboboxByLabel(wd, lbl, "native")
+				}
+
+			case contains(msg, "based in", "located in", "reside in", "currently in"):
+				for _, lbl := range []string{
+					"currently based in germany", "currently located in germany",
+					"currently based in europe", "currently located in europe",
+					"currently based in the eu", "reside in germany",
+				} {
+					fillComboboxByLabel(wd, lbl, "yes")
+					wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{lbl, "yes"}) //nolint:errcheck
+				}
+
+			default:
+				// Unknown field — run the generic mop-up, then also try to fill
+				// any remaining Ashby comboboxes with their first available option.
+				wd.ExecuteScript(jsFillRequiredFields, []interface{}{ //nolint:errcheck
+					info.CoverLetter, info.ExpectedSalary, info.Phone, info.Website,
+				})
+				fillAshbyUnfilledComboboxes(wd)
+			}
+		}
+
+		// Short pause for React to re-evaluate form validity after fixes.
+		time.Sleep(800 * time.Millisecond)
+	}
+
+	return verifySubmission(ctx, wd, flags.Headful || flags.Hold)
+}
+
+// contains reports whether s contains any of the substrings (case already
+// lowercased by the caller).
+func contains(s string, needles ...string) bool {
+	for _, n := range needles {
+		if strings.Contains(s, n) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -2093,7 +4218,21 @@ try {
         ‘you have applied’,’application complete’,
         ‘your application has been’,’application was submitted’,
         ‘submission confirmed’,’we received your application’,
-        ‘your application is complete’,’application is under review’
+        ‘your application is complete’,’application is under review’,
+        // Greenhouse / Lever specific
+        ‘thanks for applying’,’your application has been submitted’,
+        ‘you have successfully applied’,’application sent’,
+        // Workable / generic
+        ‘your application was sent’,’we got your application’,
+        ‘application acknowledged’,’congrats’,’you applied’,
+        ‘we have received’,’thank you for your interest’,
+        // German ATS
+        ‘bewerbung erhalten’,’bewerbung eingegangen’,
+        ‘vielen dank für ihre bewerbung’,’bewerbung erfolgreich’,
+        // Ashby duplicate / already-submitted
+        ‘you have already applied’,’already applied to this’,
+        ‘you already applied’,’your application has already been’,
+        ‘already submitted an application’
     ];
     for (var i = 0; i < ok.length; i++) {
         if (combined.indexOf(ok[i]) !== -1) return {success: true, phrase: ok[i]};
@@ -2130,13 +4269,14 @@ try {
 var successURLSegs = []string{
 	"thank", "thanks", "success", "confirm", "submitted",
 	"complete", "done", "received", "applied",
+	"/ty", "apply/ty", // Lever thank-you redirect
 }
 
 // errorURLSegs are path segments that indicate an error or failure page after
 // a form submission redirect.
 var errorURLSegs = []string{"/error", "/failed", "/failure", "/problem", "/oops"}
 
-// verifySubmission waits up to 10 s after submit for a confirmation signal:
+// verifySubmission waits up to 15 s after submit for a confirmation signal:
 // a URL redirect to a thank-you page, a success phrase in the page text, or
 // absence of validation errors.  On headful mode it keeps the window open an
 // extra 15 s when a form error is detected so the user can see what went wrong.
@@ -2144,7 +4284,7 @@ var errorURLSegs = []string{"/error", "/failed", "/failure", "/problem", "/oops"
 // detected (some ATS platforms give no visible feedback).
 func verifySubmission(ctx context.Context, wd selenium.WebDriver, headful bool) error {
 	originalURL, _ := wd.CurrentURL()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 
 	for time.Now().Before(deadline) {
 		select {
@@ -2229,6 +4369,59 @@ func verifySubmission(ctx context.Context, wd selenium.WebDriver, headful bool) 
 	return nil
 }
 
+// clickConfirmationModal handles "are you sure?" dialogs that some ATS platforms
+// (most notably Greenhouse) display after the first Submit click.  Greenhouse
+// shows a #application_confirm modal with an id="application_confirm" button.
+// The new job-boards.greenhouse.io format uses a <dialog> element or an
+// aria-modal container instead of the legacy role="dialog" div.
+// This runs after clickSubmit returns so the 2-second sleep has already passed.
+func clickConfirmationModal(wd selenium.WebDriver) {
+	// Allow up to 5 s — new Greenhouse React format may take longer to mount the dialog.
+	const maxWait = 5 * time.Second
+	const poll = 300 * time.Millisecond
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		for _, sel := range []string{
+			// Old Greenhouse boards format
+			`#application_confirm`,
+			`button[id*="confirm" i]`,
+			// New Greenhouse job-boards format uses <dialog> element
+			`dialog button[type="submit"]`,
+			`dialog button[type="button"]`,
+			`dialog button`,
+			// aria-modal containers (React portals)
+			`[aria-modal="true"] button[type="submit"]`,
+			`[aria-modal="true"] button[type="button"]`,
+			`[aria-modal="true"] button`,
+			// role=dialog / alertdialog (legacy + generic)
+			`[role="dialog"] button[type="submit"]`,
+			`[role="dialog"] button[type="button"]`,
+			`[role="alertdialog"] button`,
+			`.modal button[type="submit"]`,
+			`.modal-dialog button[type="submit"]`,
+		} {
+			els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+			if err != nil || len(els) == 0 {
+				continue
+			}
+			for _, el := range els {
+				text, _ := el.Text()
+				tl := strings.ToLower(strings.TrimSpace(text))
+				// Only click buttons whose label suggests confirmation.
+				if tl == "" || strings.Contains(tl, "submit") || strings.Contains(tl, "confirm") ||
+					strings.Contains(tl, "yes") || strings.Contains(tl, "ok") || strings.Contains(tl, "apply") {
+					if el.Click() == nil {
+						log.Printf("[apply] confirmation dialog clicked (%q)", tl)
+						time.Sleep(2 * time.Second)
+						return
+					}
+				}
+			}
+		}
+		time.Sleep(poll)
+	}
+}
+
 // submitButtonTexts covers the button labels used across ATS platforms.
 // Ordered from most specific to most generic to avoid false positives.
 var submitButtonTexts = []string{
@@ -2256,6 +4449,7 @@ func clickSubmit(wd selenium.WebDriver) error {
 	} {
 		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
 		if err == nil && len(els) > 0 {
+			_, _ = wd.ExecuteScript(`arguments[0].scrollIntoView({block:'center'})`, []interface{}{els[0]})
 			if cerr := els[0].Click(); cerr == nil {
 				time.Sleep(2 * time.Second)
 				return nil
@@ -2270,6 +4464,7 @@ func clickSubmit(wd selenium.WebDriver) error {
 			lowerXPath, phrase, lowerXPath, phrase)
 		els, err := wd.FindElements(selenium.ByXPATH, xpath)
 		if err == nil && len(els) > 0 {
+			_, _ = wd.ExecuteScript(`arguments[0].scrollIntoView({block:'center'})`, []interface{}{els[0]})
 			if cerr := els[0].Click(); cerr == nil {
 				time.Sleep(2 * time.Second)
 				return nil
@@ -2277,9 +4472,19 @@ func clickSubmit(wd selenium.WebDriver) error {
 		}
 	}
 
-	// 3. JS heuristic — last resort for non-standard markup.
+	// 3. JS heuristic — skips disabled buttons (prefers enabled ones).
 	res, err := wd.ExecuteScript(jsSubmit, nil)
 	if err == nil && res == true {
+		time.Sleep(2 * time.Second)
+		return nil
+	}
+
+	// 4. Force-dispatch a synthetic click event on the submit button even if
+	// it has the disabled attribute.  The mop-up pass should have enabled it,
+	// but React sometimes needs the click event to re-evaluate form state.
+	log.Printf("[apply] normal click failed — dispatching synthetic click on submit button")
+	res2, err2 := wd.ExecuteScript(jsForceClickSubmit, nil)
+	if err2 == nil && res2 == true {
 		time.Sleep(2 * time.Second)
 		return nil
 	}
@@ -2288,69 +4493,137 @@ func clickSubmit(wd selenium.WebDriver) error {
 }
 
 // jsClickSimplify finds and clicks the Simplify extension's injected autofill
-// button.  Simplify injects a floating panel into the page DOM (not a browser
-// popup) so it is reachable via document.querySelector.  We try three
-// strategies in order:
-//  1. Elements whose class or id contains "simplify" and that are themselves
-//     or contain a clickable button/role=button.
-//  2. Any visible button whose full text matches known Simplify autofill labels.
-//  3. Any button inside a fixed-position container (Simplify uses position:fixed
-//     for its floating panel) whose text suggests an autofill action.
+// button.  We fire a full synthetic mouse-event sequence (mouseover → mousedown
+// → mouseup → click) because React / Vue components often ignore a bare .click()
+// call that bypasses their synthetic event system.  Four strategies are tried in
+// order of specificity:
+//
+//  1. Elements whose class/id/data attribute contains "simplify" that are, or
+//     contain, a visible button or role=button element.
+//  2. Text match against known Simplify autofill label variants.
+//  3. Any visible button inside a fixed- or sticky-positioned ancestor whose
+//     text contains "simplify" or "autofill".
+//  4. Shadow-DOM pierce: walk every shadow root reachable from document.body
+//     and repeat strategies 1-3 inside each.
 const jsClickSimplify = `
 (function(){
-    function vis(el){
-        return el.offsetParent!==null || window.getComputedStyle(el).position==='fixed';
+    // Strategy 0: target the known Simplify shadow host directly.
+    // The extension injects <div class="simplify-jobs-shadow-root"> with an
+    // open shadow root — check it first before full DOM traversal.
+    var _host=document.querySelector('.simplify-jobs-shadow-root');
+    if(_host&&_host.shadowRoot){
+        var _btns=_host.shadowRoot.querySelectorAll('button,[role="button"]');
+        for(var _i=0;_i<_btns.length;_i++){
+            var _t=(_btns[_i].innerText||_btns[_i].textContent||_btns[_i].getAttribute('aria-label')||'').trim();
+            if(/autofill|simplify/i.test(_t)){
+                _btns[_i].scrollIntoView({block:'center'});
+                _btns[_i].click();
+                return true;
+            }
+        }
     }
-    function tryClick(el){
+
+    function vis(el){
+        if(!el) return false;
+        var s=window.getComputedStyle(el);
+        return s.display!=='none' && s.visibility!=='hidden' && s.opacity!=='0' &&
+               (el.offsetParent!==null || s.position==='fixed' || s.position==='sticky');
+    }
+    function fire(el){
         if(!el||el.disabled||!vis(el)) return false;
-        el.scrollIntoView({block:'center'});
+        el.scrollIntoView({block:'center',inline:'nearest'});
+        ['mouseover','mousedown','mouseup','click'].forEach(function(t){
+            el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));
+        });
         el.click();
         return true;
     }
+    function tryRoot(root){
+        // Strategy 1: simplify class/id/data attributes
+        var sel1=
+            'button[class*="simplify" i],button[id*="simplify" i],' +
+            '[class*="simplify" i] button,[id*="simplify" i] button,' +
+            '[class*="simplify" i][role="button"],[id*="simplify" i][role="button"],' +
+            '[data-simplify] button,[data-extension="simplify"] button,' +
+            '[class*="sj-"] button,[id*="sj-"] button';
+        var s1=root.querySelectorAll(sel1);
+        for(var i=0;i<s1.length;i++){ if(fire(s1[i])) return true; }
 
-    // Strategy 1: elements with "simplify" in class/id that are or contain buttons
-    var simplifyEls = document.querySelectorAll(
-        'button[class*="simplify" i], button[id*="simplify" i],' +
-        '[class*="simplify" i] button, [id*="simplify" i] button,' +
-        '[class*="simplify" i][role="button"], [id*="simplify" i][role="button"],' +
-        '[data-simplify] button, [data-extension="simplify"] button'
-    );
-    for(var i=0;i<simplifyEls.length;i++){
-        if(tryClick(simplifyEls[i])) return true;
-    }
-
-    // Strategy 2: text-based search — Simplify's button text variants
-    var FILL=/^\s*(autofill|fill\s+application|fill\s+form|apply\s+with\s+simplify|simplify\s+autofill|autofill\s+application)\s*$/i;
-    var btns=document.querySelectorAll('button,[role="button"]');
-    for(var j=0;j<btns.length;j++){
-        var t=(btns[j].innerText||btns[j].textContent||btns[j].getAttribute('aria-label')||'').trim();
-        if(FILL.test(t) && tryClick(btns[j])) return true;
-    }
-
-    // Strategy 3: any button in a fixed-position ancestor whose text includes
-    // "autofill" or "simplify" — covers future Simplify UI variants
-    var BROAD=/simplify|autofill/i;
-    for(var k=0;k<btns.length;k++){
-        var btn=btns[k];
-        if(!vis(btn)) continue;
-        var p=btn.parentElement;
-        var inFixed=false;
-        while(p){
-            if(window.getComputedStyle(p).position==='fixed'){inFixed=true;break;}
-            p=p.parentElement;
+        // Strategy 2: known Simplify autofill label text
+        var FILL=/^\s*(autofill|fill\s+application|fill\s+form|apply\s+with\s+simplify|simplify\s+autofill|autofill\s+application|auto-?fill)\s*$/i;
+        var btns=root.querySelectorAll('button,[role="button"]');
+        for(var j=0;j<btns.length;j++){
+            var t=(btns[j].innerText||btns[j].textContent||btns[j].getAttribute('aria-label')||'').trim();
+            if(FILL.test(t) && fire(btns[j])) return true;
         }
-        if(!inFixed) continue;
-        var bt=(btn.innerText||btn.textContent||btn.getAttribute('aria-label')||'').trim();
-        if(BROAD.test(bt) && tryClick(btn)) return true;
+
+        // Strategy 3: any button in a fixed/sticky ancestor with "simplify" or "autofill" text
+        var BROAD=/simplify|autofill/i;
+        for(var k=0;k<btns.length;k++){
+            var btn=btns[k];
+            if(!vis(btn)) continue;
+            var p=btn.parentElement,inFixed=false;
+            while(p){ var ps=window.getComputedStyle(p).position;
+                if(ps==='fixed'||ps==='sticky'){inFixed=true;break;} p=p.parentElement; }
+            if(!inFixed) continue;
+            var bt=(btn.innerText||btn.textContent||btn.getAttribute('aria-label')||'').trim();
+            if(BROAD.test(bt) && fire(btn)) return true;
+        }
+        return false;
     }
+
+    // Strategy 4: recurse into shadow roots.  Walk only direct children so
+    // each element is visited exactly once — querySelectorAll('*') would visit
+    // every descendant of every node, making this O(n²) on large DOMs.
+    function collectRoots(el,out){
+        if(el.shadowRoot) out.push(el.shadowRoot);
+        var ch=el.shadowRoot?el.shadowRoot.children:el.children;
+        for(var i=0;i<ch.length;i++) collectRoots(ch[i],out);
+    }
+
+    if(tryRoot(document)) return true;
+    var roots=[];
+    collectRoots(document.body,roots);
+    for(var r=0;r<roots.length;r++){ if(tryRoot(roots[r])) return true; }
     return false;
 })()
+`
+
+// jsWaitDOMStable is executed via ExecuteAsyncScript.  It installs a
+// MutationObserver and resolves (calls the Selenium callback) once the DOM has
+// had no mutations for stableMs milliseconds, or after maxMs at the latest.
+// Both values are passed as arguments[0] and arguments[1].
+const jsWaitDOMStable = `
+var stableMs=arguments[0], maxMs=arguments[1], done=arguments[arguments.length-1];
+var called=false;
+function finish(){if(called)return;called=true;obs.disconnect();done();}
+var timer=setTimeout(finish,stableMs);
+var obs=new MutationObserver(function(){
+    clearTimeout(timer);
+    timer=setTimeout(finish,stableMs);
+});
+obs.observe(document.body,{childList:true,subtree:true,attributes:true,characterData:true});
+setTimeout(function(){clearTimeout(timer);finish();},maxMs);
 `
 
 // waitAndClickSimplify polls for the Simplify extension's injected autofill
 // button for up to timeout, clicking it as soon as it appears.  Returns true
 // when the button was found and clicked.
+//
+// Two strategies run each poll tick in order:
+//  1. JavaScript in the page context — handles any button injected directly
+//     into the main DOM.
+//  2. WebDriver SwitchToFrame walk — Simplify renders its popup inside a
+//     moz-extension:// iframe that page-context JS cannot reach; WebDriver
+//     crosses that boundary where JS cannot.
 func waitAndClickSimplify(ctx context.Context, wd selenium.WebDriver, timeout time.Duration) bool {
+	// Give the extension ~1 s to inject its overlay after the form is detected.
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(time.Second):
+	}
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
@@ -2359,13 +4632,158 @@ func waitAndClickSimplify(ctx context.Context, wd selenium.WebDriver, timeout ti
 		default:
 		}
 		res, err := wd.ExecuteScript(jsClickSimplify, nil)
-		if err == nil && res == true {
-			log.Printf("[simplify] autofill button clicked")
+		if err != nil {
+			log.Printf("[simplify] jsClickSimplify error: %v", err)
+		} else if clicked, ok := res.(bool); ok && clicked {
+			log.Printf("[simplify] autofill button clicked (page context)")
 			return true
+		}
+		if clickSimplifyInFrames(wd) {
+			log.Printf("[simplify] autofill button clicked (extension iframe)")
+			return true
+		}
+		// On the last tick, dump a DOM snapshot so we can see what Simplify
+		// actually injected (custom elements, fixed overlays, shadow hosts).
+		if time.Until(deadline) < time.Second {
+			simplifyDOMDiag(wd)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	return false
+}
+
+// jsSimplifyDiag dumps any DOM elements that could be the Simplify overlay:
+// custom elements (tag contains "-"), elements with "simplify" in any
+// attribute, and all top-level fixed/absolute-positioned children of <body>.
+const jsSimplifyDiag = `
+(function(){
+    var out=[];
+    // 1. custom elements (non-standard tags contain a hyphen)
+    document.querySelectorAll('*').forEach(function(el){
+        if(el.tagName.indexOf('-')>-1){
+            var attrs=[].map.call(el.attributes,function(a){return a.name+'='+a.value}).join(' ');
+            out.push('custom-el: <'+el.tagName.toLowerCase()+'> '+attrs);
+        }
+    });
+    // 2. elements with "simplify" in any attribute value
+    document.querySelectorAll('*').forEach(function(el){
+        [].forEach.call(el.attributes,function(a){
+            if(/simplify/i.test(a.value)||/simplify/i.test(a.name)){
+                out.push('simplify-attr: <'+el.tagName.toLowerCase()+'> '+a.name+'='+a.value);
+            }
+        });
+    });
+    // 3. fixed/absolute top-level children of body
+    [].forEach.call(document.body.children,function(el){
+        var pos=window.getComputedStyle(el).position;
+        if(pos==='fixed'||pos==='absolute'||pos==='sticky'){
+            var cls=el.className||'', id=el.id||'', tag=el.tagName.toLowerCase();
+            out.push('overlay: <'+tag+'> id="'+id+'" class="'+cls+'"');
+        }
+    });
+    return out.join('\n');
+})()
+`
+
+func simplifyDOMDiag(wd selenium.WebDriver) {
+	res, err := wd.ExecuteScript(jsSimplifyDiag, nil)
+	if err != nil {
+		log.Printf("[simplify-diag] script error: %v", err)
+		return
+	}
+	dump, _ := res.(string)
+	if dump == "" {
+		log.Printf("[simplify-diag] no custom elements / overlays / simplify attributes found")
+		return
+	}
+	for _, line := range strings.Split(dump, "\n") {
+		log.Printf("[simplify-diag] %s", line)
+	}
+}
+
+// clickSimplifyInFrames iterates every iframe on the page via WebDriver
+// SwitchToFrame — which can access moz-extension:// frames that page JS
+// cannot — and clicks the Simplify autofill button if found inside one.
+// Always switches back to the default content before returning.
+func clickSimplifyInFrames(wd selenium.WebDriver) bool {
+	frames, err := wd.FindElements(selenium.ByCSSSelector, "iframe")
+	if err != nil {
+		log.Printf("[simplify] iframe lookup error: %v", err)
+		return false
+	}
+	if len(frames) == 0 {
+		return false
+	}
+	log.Printf("[simplify] scanning %d iframe(s) for autofill button", len(frames))
+	for i, frame := range frames {
+		clicked := func() bool {
+			src, _ := frame.GetAttribute("src")
+			if err := wd.SwitchFrame(frame); err != nil {
+				log.Printf("[simplify] frame[%d] src=%q switch error: %v", i, src, err)
+				return false
+			}
+			defer func() { _ = wd.SwitchFrame(nil) }()
+			btns, _ := wd.FindElements(selenium.ByCSSSelector, `button,[role="button"]`)
+			log.Printf("[simplify] frame[%d] src=%q buttons=%d", i, src, len(btns))
+			for _, btn := range btns {
+				text, _ := btn.Text()
+				aria, _ := btn.GetAttribute("aria-label")
+				label := strings.ToLower(strings.TrimSpace(text))
+				if label == "" {
+					label = strings.ToLower(strings.TrimSpace(aria))
+				}
+				if label != "" {
+					log.Printf("[simplify] frame[%d] button label=%q", i, label)
+				}
+				if isSimplifyFillLabel(label) {
+					if btn.Click() == nil {
+						return true
+					}
+				}
+			}
+			return false
+		}()
+		if clicked {
+			return true
+		}
+	}
+	return false
+}
+
+// isSimplifyFillLabel reports whether a button label matches known Simplify
+// autofill button text variants.
+func isSimplifyFillLabel(s string) bool {
+	for _, v := range []string{
+		"autofill", "fill application", "fill form",
+		"apply with simplify", "simplify autofill",
+		"autofill application", "auto-fill",
+	} {
+		if s == v {
+			return true
+		}
+	}
+	return strings.Contains(s, "autofill") || strings.Contains(s, "simplify")
+}
+
+// waitForSimplifyDone blocks until the page DOM has been quiet for 600 ms
+// (meaning Simplify has finished writing field values) or until maxWait elapses.
+// It calls ExecuteScriptAsync directly (no goroutine) so there is never a
+// leaked goroutine racing against subsequent WebDriver calls.  ctx is checked
+// before the call; if already cancelled we return immediately.
+func waitForSimplifyDone(ctx context.Context, wd selenium.WebDriver, maxWait time.Duration) {
+	if ctx.Err() != nil {
+		return
+	}
+	const stableMs = 600 // ms of DOM silence that counts as "done"
+	maxMs := int(maxWait.Milliseconds())
+	if maxMs <= 0 {
+		maxMs = 10_000
+	}
+	// Set browser-side async timeout so ExecuteScriptAsync returns on its own
+	// once maxMs elapses — no goroutine or select needed.
+	_ = wd.SetAsyncScriptTimeout(maxWait + 2*time.Second)
+	_, _ = wd.ExecuteScriptAsync(jsWaitDOMStable, []interface{}{stableMs, maxMs})
+	log.Printf("[simplify] DOM stable — proceeding with supplemental fill")
 }
 
 func splitName(full string) (first, last string) {

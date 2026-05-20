@@ -9,8 +9,22 @@ import (
 	"github.com/tebeka/selenium"
 )
 
+
 const challengeMaxWait = 30 * time.Second
 const challengePollInterval = 500 * time.Millisecond
+
+// ErrCaptcha is returned by FillApplication when an unsolvable CAPTCHA widget
+// is detected inside the application form itself (as opposed to a full-page WAF
+// wall that appears before the form loads).  The caller should treat this as a
+// signal to apply a longer platform cooldown.
+var ErrCaptcha = fmt.Errorf("captcha detected inside form")
+
+// ErrEmailVerification is returned by FillApplication when the ATS (most
+// commonly Greenhouse) has sent a verification code to the applicant's email
+// and is waiting for it to be entered before the application can proceed.
+// The caller should enforce a long cooldown (≥ 1 hour) so the platform does
+// not repeatedly trigger new verification codes on every attempt.
+var ErrEmailVerification = fmt.Errorf("email verification code required")
 
 // challengeTitles are page-title substrings that indicate a WAF challenge page.
 var challengeTitles = []string{
@@ -72,18 +86,7 @@ func waitForChallenge(wd selenium.WebDriver, headful bool) error {
 		}
 	}
 
-	// Auto-resolution timed out.
-	if headful {
-		fmt.Println("\n[captcha] Auto-resolution failed. Please solve the CAPTCHA in the Firefox window, then press nothing — the program will continue automatically once the page clears.")
-		for {
-			time.Sleep(challengePollInterval)
-			if !isChallengePage(wd) {
-				log.Printf("[captcha] challenge cleared by human — continuing")
-				return nil
-			}
-		}
-	}
-
+	log.Printf("[captcha] auto-resolution failed — skipping URL")
 	return fmt.Errorf("bot-protection challenge did not clear within %s", challengeMaxWait)
 }
 
@@ -170,6 +173,31 @@ func tryClickRecaptchaV2(wd selenium.WebDriver) {
 	)
 }
 
+// inFormCaptchaSelectors are DOM selectors that indicate a CAPTCHA widget
+// rendered inside an application form (not a full-page WAF wall).
+// Cloudflare Turnstile and hCaptcha are the two most common on Ashby.
+var inFormCaptchaSelectors = []string{
+	`iframe[src*="challenges.cloudflare.com"]`, // Cloudflare Turnstile widget
+	`iframe[src*="hcaptcha.com"]`,              // hCaptcha widget
+	`.cf-turnstile`,                            // Turnstile host element
+	`.h-captcha`,                               // hCaptcha host element
+	`[data-sitekey]`,                           // generic captcha container
+}
+
+// detectInFormCaptcha returns ErrCaptcha when a CAPTCHA widget is present
+// inside the page that is not part of a full-page WAF wall.  It is intentionally
+// distinct from isChallengePage, which targets full-page bot-protection screens.
+func detectInFormCaptcha(wd selenium.WebDriver) error {
+	for _, sel := range inFormCaptchaSelectors {
+		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+		if err == nil && len(els) > 0 {
+			log.Printf("[captcha] in-form captcha detected (%s) — aborting this URL", sel)
+			return ErrCaptcha
+		}
+	}
+	return nil
+}
+
 // switchAndClick finds the first iframe matching any selector in iframeSelectors,
 // switches into it, clicks the first element matching any selector in
 // innerSelectors, then switches back to the top-level frame.
@@ -197,4 +225,60 @@ func switchAndClick(wd selenium.WebDriver, iframeSelectors, innerSelectors []str
 			return
 		}
 	}
+}
+
+// jsDetectEmailVerification inspects the current page for signs that the ATS
+// has sent a verification code to the applicant's email and is waiting for it
+// to be entered.  Greenhouse triggers this when it recognises the email address
+// as belonging to an existing account or when it requires identity confirmation.
+const jsDetectEmailVerification = `
+(function(){
+    var txt = ((document.body && document.body.innerText) || '').toLowerCase();
+    var PHRASES = [
+        'verification code','verify your email','check your email',
+        'enter the code','enter your code','we sent a code',
+        'sent to your email','email verification','confirm your email',
+        'please verify','code sent to','sent you a','6-digit code',
+        'enter the 6','one-time code','otp sent',
+    ];
+    for (var i = 0; i < PHRASES.length; i++) {
+        if (txt.indexOf(PHRASES[i]) !== -1) return true;
+    }
+    // Detect a short numeric/OTP-style input (4–8 chars, name/id/label hinting at "code").
+    var inputs = document.querySelectorAll('input');
+    for (var j = 0; j < inputs.length; j++) {
+        var inp = inputs[j];
+        if (inp.disabled || inp.type === 'hidden') continue;
+        var nm = (inp.name || inp.id || inp.placeholder ||
+                  inp.getAttribute('aria-label') || '').toLowerCase();
+        if (/\b(verif|confirm.?code|token|otp|\bcode\b)/.test(nm)) return true;
+        var ml = parseInt(inp.getAttribute('maxlength') || '0', 10);
+        if (ml >= 4 && ml <= 8 && (inp.type === 'number' || inp.type === 'text' || inp.type === 'tel')) {
+            // Only flag if the surrounding container also mentions "code" or "verify".
+            var parent = inp.parentElement;
+            var ctx = '';
+            for (var k = 0; k < 3 && parent; k++) {
+                ctx += (parent.textContent || '').toLowerCase();
+                parent = parent.parentElement;
+            }
+            if (/verif|code|otp/.test(ctx)) return true;
+        }
+    }
+    return false;
+})()
+`
+
+// detectEmailVerification returns ErrEmailVerification when the current page
+// shows signs that the ATS has sent a one-time verification code to the
+// applicant's email and is waiting for input.
+func detectEmailVerification(wd selenium.WebDriver) error {
+	res, err := wd.ExecuteScript(jsDetectEmailVerification, nil)
+	if err != nil {
+		return nil // cannot determine — let the fill attempt continue
+	}
+	if detected, ok := res.(bool); ok && detected {
+		log.Printf("[apply] email verification code prompt detected — aborting this URL")
+		return ErrEmailVerification
+	}
+	return nil
 }
