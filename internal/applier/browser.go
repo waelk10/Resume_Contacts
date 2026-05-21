@@ -3,12 +3,12 @@ package applier
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tebeka/selenium"
@@ -24,22 +24,36 @@ type FillFlags struct {
 	SimplifyWait time.Duration // pause after form appears to let the Simplify extension auto-fill (0 = disabled)
 }
 
-// Browser manages a single geckodriver process and spawns one Firefox
-// WebDriver session per application.  Multiple goroutines may call
-// FillApplication concurrently; each gets its own independent session.
+// pooledSession pairs a live WebDriver session with the capabilities used to
+// create it so that returnSession can spawn an identical replacement if the
+// session dies.
+type pooledSession struct {
+	wd   selenium.WebDriver
+	caps selenium.Capabilities
+}
+
+// Browser manages a single geckodriver process and a fixed pool of persistent
+// Firefox sessions — one per concurrent worker.  FillApplication borrows a
+// session from the pool, uses it, then returns (or replaces) it when done.
+// This avoids spawning a new Firefox process per URL, which fails when Firefox
+// is already running (single-instance restriction or snap sandbox).
 type Browser struct {
-	service   *selenium.Service
-	baseURL   string
-	caps      selenium.Capabilities
-	sessionMu sync.Mutex // serialises session creation; geckodriver queues internally but concurrent POSTs can race
+	service *selenium.Service
+	baseURL string
+	pool    chan pooledSession // buffered; size == concurrency
 }
 
 // NewBrowser locates geckodriver in PATH, starts it on port 4444, and
-// configures Firefox capabilities.  profileDir, when non-empty, is passed as
-// the Firefox -profile argument so that extensions (e.g. Simplify) and their
-// authentication cookies persist across sessions.  Returns a clear error
-// message with install instructions when geckodriver is not found.
-func NewBrowser(headful bool, profileDir string) (*Browser, error) {
+// pre-creates concurrency Firefox sessions that are pooled and reused across
+// application fills.  When profileDir is non-empty and concurrency > 1, the
+// base profile is cloned into numbered sibling directories (profile-0,
+// profile-1, …) so each session has its own independent Firefox profile —
+// Simplify stays logged in on every slot.  Returns a clear error message when
+// geckodriver is not found.
+func NewBrowser(headful bool, profileDir string, concurrency int) (*Browser, error) {
+	if concurrency < 1 {
+		concurrency = 1
+	}
 	if profileDir != "" {
 		if _, err := os.Stat(filepath.Join(profileDir, "prefs.js")); os.IsNotExist(err) {
 			return nil, fmt.Errorf(
@@ -74,30 +88,129 @@ func NewBrowser(headful bool, profileDir string) (*Browser, error) {
 		return nil, fmt.Errorf("start geckodriver on :%d: %w\n(is port %d already in use?)", port, err, port)
 	}
 
+	// Do NOT set dom.webdriver.enabled or useAutomationExtension via Prefs —
+	// Firefox 75+ locks dom.webdriver.enabled and geckodriver will refuse to
+	// create the session with "Failed to set preferences".  The webdriver flag
+	// is already masked at runtime by injectStealthJS (Object.defineProperty).
+
+	// geckodriver speaks W3C WebDriver directly on /  — NOT the old /wd/hub path
+	// used by Selenium standalone server.
+	b := &Browser{
+		service: svc,
+		baseURL: fmt.Sprintf("http://localhost:%d", port),
+		pool:    make(chan pooledSession, concurrency),
+	}
+
+	// Pre-create sessions sequentially.  Each session gets its own Firefox
+	// profile directory (cloned from the base) so extensions and cookies are
+	// independent.  Staggering launches avoids a race where geckodriver tries
+	// to start multiple Firefox processes before the first one has initialised.
+	for i := 0; i < concurrency; i++ {
+		if i > 0 {
+			time.Sleep(1500 * time.Millisecond)
+		}
+
+		// Resolve the profile directory for this slot.
+		slotProfile := profileDir
+		if profileDir != "" && concurrency > 1 {
+			slotProfile = fmt.Sprintf("%s-%d", profileDir, i)
+			if err := prepareProfileClone(profileDir, slotProfile); err != nil {
+				for len(b.pool) > 0 {
+					_ = (<-b.pool).wd.Quit()
+				}
+				_ = svc.Stop()
+				return nil, fmt.Errorf("prepare profile clone %d: %w", i, err)
+			}
+		} else if slotProfile != "" {
+			for _, f := range []string{"lock", ".parentlock"} {
+				_ = os.Remove(filepath.Join(slotProfile, f))
+			}
+		}
+
+		caps := buildCaps(headful, slotProfile)
+		wd, err := selenium.NewRemote(caps, b.baseURL)
+		if err != nil {
+			for len(b.pool) > 0 {
+				_ = (<-b.pool).wd.Quit()
+			}
+			_ = svc.Stop()
+			return nil, fmt.Errorf("open Firefox session %d/%d: %w", i+1, concurrency, err)
+		}
+		_ = wd.SetPageLoadTimeout(30 * time.Second)
+		_ = wd.SetImplicitWaitTimeout(0)
+		_ = wd.Get("about:blank")
+		b.pool <- pooledSession{wd: wd, caps: caps}
+		log.Printf("[browser] session %d/%d ready", i+1, concurrency)
+	}
+
+	return b, nil
+}
+
+// buildCaps constructs Firefox WebDriver capabilities for the given headful
+// flag and optional profile directory.
+func buildCaps(headful bool, profileDir string) selenium.Capabilities {
 	var args []string
 	if !headful {
 		args = append(args, "-headless")
 	}
 	if profileDir != "" {
-		// Use the profile directory in-place so installed extensions and their
-		// session cookies survive between geckodriver invocations.
 		args = append(args, "-profile", profileDir)
 	}
-	// Do NOT set dom.webdriver.enabled or useAutomationExtension via Prefs —
-	// Firefox 75+ locks dom.webdriver.enabled and geckodriver will refuse to
-	// create the session with "Failed to set preferences".  The webdriver flag
-	// is already masked at runtime by injectStealthJS (Object.defineProperty).
 	ffCaps := firefox.Capabilities{Args: args}
 	caps := selenium.Capabilities{"browserName": "firefox"}
 	caps.AddFirefox(ffCaps)
+	return caps
+}
 
-	// geckodriver speaks W3C WebDriver directly on /  — NOT the old /wd/hub path
-	// used by Selenium standalone server.
-	return &Browser{
-		service: svc,
-		baseURL: fmt.Sprintf("http://localhost:%d", port),
-		caps:    caps,
-	}, nil
+// prepareProfileClone ensures dst is a ready-to-use copy of src.  If dst does
+// not exist it is created by recursively copying src.  If it already exists
+// (from a previous run) only stale lock files are removed — the existing clone
+// is reused so Simplify stays authenticated across runs.
+func prepareProfileClone(src, dst string) error {
+	if _, err := os.Stat(dst); os.IsNotExist(err) {
+		log.Printf("[browser] cloning profile %s → %s", src, dst)
+		if err := copyDir(src, dst); err != nil {
+			return fmt.Errorf("copy profile: %w", err)
+		}
+	}
+	for _, f := range []string{"lock", ".parentlock"} {
+		_ = os.Remove(filepath.Join(dst, f))
+	}
+	return nil
+}
+
+// copyDir recursively copies src into dst, creating dst when it does not exist.
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		return copyFile(path, target, info.Mode())
+	})
+}
+
+// copyFile copies a single file preserving permissions.
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
 }
 
 // RunSetup launches Firefox directly (without geckodriver) with profileDir as
@@ -152,9 +265,44 @@ func RunSetup(ctx context.Context, profileDir string) error {
 	return nil
 }
 
-// Close stops the geckodriver process.
+// Close quits all pooled sessions and stops the geckodriver process.
+// Sessions that are currently in use by workers will be terminated when
+// geckodriver exits.
 func (b *Browser) Close() {
-	_ = b.service.Stop()
+	for {
+		select {
+		case s := <-b.pool:
+			_ = s.wd.Quit()
+		default:
+			_ = b.service.Stop()
+			return
+		}
+	}
+}
+
+// returnSession navigates the session back to about:blank and returns it to
+// the pool.  If the session is dead (the Firefox window was closed or crashed),
+// it spawns a replacement in the background so the pool stays at its original
+// capacity.
+func (b *Browser) returnSession(s pooledSession) {
+	if err := s.wd.Get("about:blank"); err == nil {
+		_ = s.wd.DeleteAllCookies()
+		b.pool <- s
+		return
+	}
+	// Session is dead — replace it asynchronously so the caller is not blocked.
+	go func() {
+		fresh, err := selenium.NewRemote(s.caps, b.baseURL)
+		if err != nil {
+			log.Printf("[browser] could not replace dead session: %v — pool capacity reduced by 1", err)
+			return
+		}
+		_ = fresh.SetPageLoadTimeout(30 * time.Second)
+		_ = fresh.SetImplicitWaitTimeout(0)
+		_ = fresh.Get("about:blank")
+		b.pool <- pooledSession{wd: fresh, caps: s.caps}
+		log.Printf("[browser] dead session replaced")
+	}()
 }
 
 // ErrWindowClosed is returned by FillApplication when the user closes the
@@ -223,14 +371,16 @@ func (b *Browser) FillApplication(
 		return ctx.Err()
 	}
 
-	b.sessionMu.Lock()
-	wd, err := selenium.NewRemote(b.caps, b.baseURL)
-	b.sessionMu.Unlock()
-	if err != nil {
-		return fmt.Errorf("open Firefox session: %w", err)
+	// Acquire an exclusive session from the pool.  Block until one is
+	// available or the context is cancelled.
+	var s pooledSession
+	select {
+	case s = <-b.pool:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	// In headful/hold mode keep the browser visible long enough to be useful
-	// when an error occurs — otherwise defer wd.Quit() closes it instantly.
+	wd := s.wd
+
 	defer func() {
 		if retErr != nil {
 			// User closed the tab/window — not a failure, just skip.
@@ -251,7 +401,9 @@ func (b *Browser) FillApplication(
 				log.Printf("[apply] headful skip (auto): %v", retErr)
 			}
 		}
-		_ = wd.Quit()
+		// Return the session to the pool if it is still alive; otherwise
+		// spawn a replacement in the background so the pool stays full.
+		b.returnSession(s)
 	}()
 
 	_ = wd.SetPageLoadTimeout(30 * time.Second)
@@ -333,6 +485,11 @@ func (b *Browser) FillApplication(
 			}
 		}
 
+		// Check for email/2FA verification gate before other dead-page checks —
+		// these pages have no application form but are recoverable with a cooldown.
+		if err := detectEmailVerification(wd); err != nil {
+			return err
+		}
 		// Only run phrase/status detection when there is no form — this avoids
 		// false positives on pages that have a "no longer available" notice in
 		// a footer or sidebar while still showing a live application form.
@@ -2038,6 +2195,25 @@ func fillGreenhouseComboboxByID(wd selenium.WebDriver, id, value string, waitMs 
 	return false
 }
 
+// splitDualMajor splits "Computer Science and Mathematics" into
+// ["Computer Science", "Mathematics"].  Returns nil for a single major.
+// Recognises the separators "and", "&", "/", and "," (in that priority order).
+func splitDualMajor(field string) []string {
+	low := strings.ToLower(field)
+	for _, sep := range []string{" and ", " & ", " / ", ", "} {
+		idx := strings.Index(low, sep)
+		if idx < 0 {
+			continue
+		}
+		a := strings.TrimSpace(field[:idx])
+		b := strings.TrimSpace(field[idx+len(sep):])
+		if a != "" && b != "" {
+			return []string{a, b}
+		}
+	}
+	return nil
+}
+
 // fillGreenhouseComboboxOrOther is like fillGreenhouseComboboxByID but inserts
 // an "Other" selection attempt between the value-match pass and the first-option
 // fallback.  Use this for school, degree, and field-of-study comboboxes: the
@@ -2083,6 +2259,27 @@ func fillGreenhouseComboboxOrOther(wd selenium.WebDriver, id, value string, wait
 					log.Printf("[greenhouse] combobox #%s: selected %q", id, strings.TrimSpace(text))
 					time.Sleep(300 * time.Millisecond)
 					return true
+				}
+			}
+		}
+	}
+
+	// Phase 1b: dual major — try each component individually so "Computer Science
+	// and Mathematics" can still match "Computer Science" when the ATS only lists
+	// individual disciplines.
+	if parts := splitDualMajor(value); len(parts) > 0 {
+		for _, part := range parts {
+			if els := openAndType(part, waitMs); els != nil {
+				partLow := strings.ToLower(part)
+				for _, el := range els {
+					text, _ := el.Text()
+					if strings.Contains(strings.ToLower(text), partLow) {
+						if err := el.Click(); err == nil {
+							log.Printf("[greenhouse] combobox #%s: dual major — matched component %q (full: %q)", id, strings.TrimSpace(text), value)
+							time.Sleep(300 * time.Millisecond)
+							return true
+						}
+					}
 				}
 			}
 		}

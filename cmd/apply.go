@@ -228,6 +228,25 @@ All flags:
 		}
 	}
 
+	// Build a set of remaining URLs so we can remove each one from the input
+	// file as it completes, giving a live "work remaining" view at a glance.
+	remaining := make(map[string]bool, len(urls))
+	for _, u := range urls {
+		remaining[u] = true
+	}
+	var remainingMu sync.Mutex
+	removeFromURLsFile := func(r applier.Result) {
+		if r.Status == "pending" {
+			return // never attempted — leave in the file
+		}
+		remainingMu.Lock()
+		defer remainingMu.Unlock()
+		delete(remaining, r.URL)
+		if err := rewriteURLsFile(urlsFile, urls, remaining); err != nil {
+			log.Printf("warning: could not update %s: %v", urlsFile, err)
+		}
+	}
+
 	cfg := applier.Config{
 		Applicant: applier.ApplicantInfo{
 			Name:               name,
@@ -262,6 +281,7 @@ All flags:
 		TailoredOutputDir: outputDir,
 		ProfileDir:        profileDir,
 		SimplifyWait:      time.Duration(simplifyWait) * time.Second,
+		OnResult:          removeFromURLsFile,
 	}
 
 	mode := "live"
@@ -410,6 +430,34 @@ func defaultProfileDir() string {
 		return filepath.Join(snapBase, "common", "resume-scraper-profile")
 	}
 	return filepath.Join(home, ".mozilla", "resume-scraper-profile")
+}
+
+// rewriteURLsFile rewrites path to contain only the URLs in allURLs whose key
+// is still present in remaining.  Original ordering is preserved.  Writes are
+// performed atomically via a temp file + rename so a concurrent read always
+// sees a complete snapshot.
+func rewriteURLsFile(path string, allURLs []string, remaining map[string]bool) error {
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriter(f)
+	for _, u := range allURLs {
+		if remaining[u] {
+			fmt.Fprintln(w, u)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // readLines reads a file and returns non-blank, non-comment lines.

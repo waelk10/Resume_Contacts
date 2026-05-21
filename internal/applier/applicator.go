@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
-	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,6 +95,12 @@ type Config struct {
 	Screenshots bool // save a PNG after each form fill
 	Hold        bool // keep each window open until the user closes it
 
+	// OnResult, if non-nil, is called once for every URL that reaches a terminal
+	// status (anything except "pending" — URLs that were never attempted because
+	// the context was cancelled).  Called from worker goroutines; must be safe
+	// for concurrent use.
+	OnResult func(Result)
+
 	// Resume tailoring via the local claude CLI
 	TailorResumes     bool   // generate a position-specific resume PDF before applying
 	TailoredOutputDir string // directory for tailored PDFs (default: "tailored_resumes")
@@ -126,6 +133,8 @@ type Applicator struct {
 	browser    *Browser
 	cooldownMu sync.Mutex
 	lastRun    map[string]time.Time // platform → time we last started an application
+	inFlightMu sync.Mutex
+	inFlight   map[string]bool // keys: platform names and "co:<company>" — prevents parallel fills on the same platform/company
 }
 
 // New creates an Applicator and launches the underlying browser.
@@ -168,11 +177,15 @@ func New(cfg Config) (*Applicator, error) {
 			return nil, fmt.Errorf("create profile directory %q: %w", cfg.ProfileDir, err)
 		}
 	}
-	b, err := NewBrowser(cfg.Headful, cfg.ProfileDir)
+	conc := cfg.Concurrency
+	if conc < 1 {
+		conc = 1
+	}
+	b, err := NewBrowser(cfg.Headful, cfg.ProfileDir, conc)
 	if err != nil {
 		return nil, fmt.Errorf("browser init: %w", err)
 	}
-	return &Applicator{cfg: cfg, browser: b, lastRun: make(map[string]time.Time)}, nil
+	return &Applicator{cfg: cfg, browser: b, lastRun: make(map[string]time.Time), inFlight: make(map[string]bool)}, nil
 }
 
 // enrichFromResume parses the CV PDF and back-fills any ApplicantInfo fields
@@ -248,6 +261,9 @@ func (a *Applicator) Run(ctx context.Context, urls []string) []Result {
 
 	completeOne := func(idx int, r Result) {
 		results[idx] = r
+		if r.Status != "pending" && a.cfg.OnResult != nil {
+			a.cfg.OnResult(r)
+		}
 		if outstanding.Add(-1) == 0 {
 			close(allDone)
 		}
@@ -369,6 +385,34 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 	}
 	res.Company = job.Company
 	res.Title = job.Title
+
+	// Prevent two workers from filling forms on the same platform or company
+	// simultaneously — either can trigger rate-limiting / duplicate detection.
+	platformKey := job.ATSPlatform
+	companyKey := "co:" + strings.ToLower(strings.TrimSpace(job.Company))
+	acquired := false
+	a.inFlightMu.Lock()
+	if !a.inFlight[platformKey] && (job.Company == "" || !a.inFlight[companyKey]) {
+		a.inFlight[platformKey] = true
+		if job.Company != "" {
+			a.inFlight[companyKey] = true
+		}
+		acquired = true
+	}
+	a.inFlightMu.Unlock()
+	if !acquired {
+		log.Printf("[apply] %s/%s already in-flight — re-queuing %s", job.ATSPlatform, job.Company, rawURL)
+		return Result{URL: rawURL, Requeue: true}
+	}
+	defer func() {
+		a.inFlightMu.Lock()
+		delete(a.inFlight, platformKey)
+		if job.Company != "" {
+			delete(a.inFlight, companyKey)
+		}
+		a.inFlightMu.Unlock()
+	}()
+
 	log.Printf("[apply] %q @ %s  platform=%s", job.Title, job.Company, job.ATSPlatform)
 
 	// Determine which resume PDF to upload.
@@ -409,17 +453,15 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 			return res
 		}
 		if errors.Is(err, ErrEmailVerification) {
-			// Greenhouse sent a one-time code to the applicant's email.
+			// Greenhouse sent a one-time/2FA code to the applicant's email.
 			// We cannot enter it programmatically; enforce a 65-minute cooldown
-			// so ALL remaining Greenhouse URLs (including this one) are delayed.
-			// Requeue=true tells Run() to push this URL back onto the work
-			// queue rather than marking it as an error — it will be retried
-			// automatically once the cooldown expires.
+			// so ALL remaining Greenhouse URLs are delayed, then re-queue this
+			// URL so it is retried automatically once the cooldown expires.
 			const emailVerifyCooldown = 65 * time.Minute
 			a.cooldownMu.Lock()
 			a.lastRun[job.ATSPlatform] = time.Now().Add(emailVerifyCooldown - platformCooldowns[job.ATSPlatform])
 			a.cooldownMu.Unlock()
-			log.Printf("[apply] %s email verification — enforcing %v cooldown, re-queuing %s",
+			log.Printf("[apply] %s email/2FA verification — enforcing %v cooldown, re-queuing %s",
 				job.ATSPlatform, emailVerifyCooldown, rawURL)
 			return Result{URL: rawURL, Requeue: true}
 		}

@@ -240,6 +240,11 @@ const jsDetectEmailVerification = `
         'sent to your email','email verification','confirm your email',
         'please verify','code sent to','sent you a','6-digit code',
         'enter the 6','one-time code','otp sent',
+        // Two-factor / security-code variants (Greenhouse 2FA flow)
+        'two-factor','two factor','2-factor','2fa',
+        'two-step','two step','2-step',
+        'security code','enter your security',
+        'authentication code','authenticator',
     ];
     for (var i = 0; i < PHRASES.length; i++) {
         if (txt.indexOf(PHRASES[i]) !== -1) return true;

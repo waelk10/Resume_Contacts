@@ -45,8 +45,9 @@ var (
 			`associate(?:'s)?|a\.a\.?|a\.s\.?)\b`,
 	)
 	// "in Computer Science" / "of Computer Engineering" — field of study after degree.
+	// Character class includes "/" so "Computer Science / Mathematics" is captured whole.
 	reFieldOfStudy = regexp.MustCompile(
-		`(?i)\b(?:in|of)\s+([A-Z][A-Za-z\s&,()-]{2,50?})(?:\s*[,;|(]|\s*[-–]\s*\d|\s*$)`,
+		`(?i)\b(?:in|of)\s+([A-Z][A-Za-z\s&,()/-]{2,50?})(?:\s*[,;|(]|\s*[-–]\s*\d|\s*$)`,
 	)
 	// Institution name: a run of title-case words ending in a school-type noun.
 	reInstitution = regexp.MustCompile(
