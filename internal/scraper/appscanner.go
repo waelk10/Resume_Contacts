@@ -103,11 +103,15 @@ func isAppPageURL(raw string) bool {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return false
 	}
-	hostPath := strings.ToLower(u.Host + u.Path)
+	return isAppPageURLParsed(u, strings.ToLower(u.Host+u.Path))
+}
+
+// isAppPageURLParsed is the hot path used by OnHTML, which has already parsed
+// the URL.  hostPath must be strings.ToLower(u.Host + u.Path).
+func isAppPageURLParsed(u *url.URL, hostPath string) bool {
 	if appPageRe.MatchString(hostPath) {
 		return true
 	}
-	// Generic fallback: path ends at a clear apply action.
 	p := strings.ToLower(u.Path)
 	return strings.HasSuffix(p, "/apply") ||
 		strings.HasSuffix(p, "/apply-now") ||
@@ -118,20 +122,111 @@ func isAppPageURL(raw string) bool {
 // isFollowableJobURL returns true for pages likely to contain links to
 // application pages (job boards, ATS company listings, careers sections).
 func isFollowableJobURL(raw string) bool {
-	if isRelevantURL(raw) {
-		return true
-	}
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return false
 	}
-	return atsListingRe.MatchString(strings.ToLower(u.Host + u.Path))
+	return isFollowableJobURLParsed(u, strings.ToLower(u.Host+u.Path))
+}
+
+// isFollowableJobURLParsed is the hot path used by OnHTML.
+func isFollowableJobURLParsed(u *url.URL, hostPath string) bool {
+	if isRelevantURLParsed(u) {
+		return true
+	}
+	return atsListingRe.MatchString(hostPath)
 }
 
 // pendingItem is a URL that was deferred because its domain is rate-limited.
 type pendingItem struct {
 	rawURL string
 	domain string
+}
+
+// visitedSet is a mutex-backed URL set that replaces sync.Map for visited-URL
+// deduplication.  sync.Map's internal dirty-map promotions become expensive when
+// the set is large and Deletes are interspersed with Stores (our 429 retry path),
+// causing periodic GC pauses that manifest as high CPU.  A plain map + Mutex
+// avoids that entirely.
+type visitedSet struct {
+	mu sync.Mutex
+	m  map[string]struct{}
+}
+
+func newVisitedSet() *visitedSet {
+	return &visitedSet{m: make(map[string]struct{})}
+}
+
+// loadOrStore returns true if key was already present (abort needed); false if
+// it was newly stored (request may proceed).
+func (s *visitedSet) loadOrStore(key string) (loaded bool) {
+	s.mu.Lock()
+	_, loaded = s.m[key]
+	if !loaded {
+		s.m[key] = struct{}{}
+	}
+	s.mu.Unlock()
+	return
+}
+
+func (s *visitedSet) delete(key string) {
+	s.mu.Lock()
+	delete(s.m, key)
+	s.mu.Unlock()
+}
+
+// maxDeferredURLs is the maximum number of unique URLs that may accumulate in
+// the deferred set at one time.  A large job board with deep pagination can
+// generate tens of thousands of rate-limited URLs; without a cap the retry
+// rounds become very slow and memory usage balloons.
+const maxDeferredURLs = 50_000
+
+// retryMaxRounds caps how many retry rounds the scanner will attempt before
+// giving up on remaining rate-limited URLs.  Each round can wait up to
+// rlMaxBackoff (10 min), so 5 rounds ≈ up to ~24 min of waiting total.
+const retryMaxRounds = 5
+
+// deferredSet accumulates pending URLs with deduplication on insert.
+// It replaces the previous []pendingItem + sync.Mutex design which required an
+// O(n) dedup pass at the start of every retry round when the slice grew large.
+type deferredSet struct {
+	mu   sync.Mutex
+	seen map[string]struct{}
+	list []pendingItem
+}
+
+func newDeferredSet() *deferredSet {
+	return &deferredSet{seen: make(map[string]struct{})}
+}
+
+// add inserts rawURL/domain if not already present and the cap has not been hit.
+func (d *deferredSet) add(rawURL, domain string) {
+	d.mu.Lock()
+	if len(d.seen) < maxDeferredURLs {
+		if _, ok := d.seen[rawURL]; !ok {
+			d.seen[rawURL] = struct{}{}
+			d.list = append(d.list, pendingItem{rawURL: rawURL, domain: domain})
+		}
+	}
+	d.mu.Unlock()
+}
+
+// drain atomically takes all pending items and resets the set, ready for the
+// next retry round.
+func (d *deferredSet) drain() []pendingItem {
+	d.mu.Lock()
+	out := d.list
+	d.list = nil
+	d.seen = make(map[string]struct{})
+	d.mu.Unlock()
+	return out
+}
+
+func (d *deferredSet) size() int {
+	d.mu.Lock()
+	n := len(d.list)
+	d.mu.Unlock()
+	return n
 }
 
 // domainRateLimit tracks per-domain 429 backoffs.  Each consecutive 429 on the
@@ -231,27 +326,10 @@ func NewAppScanner(cfg Config, onURL func(string)) *AppScanner {
 func (s *AppScanner) Run(ctx context.Context) error {
 	blocker := newDomainBlocker(3)
 	rl := newDomainRateLimit()
-
-	// deferred accumulates URLs whose domains hit a 429 during the crawl.
-	// Protected by deferMu; drained in retry rounds after c.Wait().
-	var deferMu sync.Mutex
-	var deferred []pendingItem
-
-	addDeferred := func(rawURL, domain string) {
-		deferMu.Lock()
-		deferred = append(deferred, pendingItem{rawURL: rawURL, domain: domain})
-		deferMu.Unlock()
-	}
+	deferred := newDeferredSet()
+	visited := newVisitedSet()
 
 	par := s.cfg.appScanParallelism()
-
-	// visitedURLs replaces colly's built-in visited-URL deduplication.
-	// We disable colly's tracking (AllowURLRevisit) so that a URL that was
-	// deferred due to a rate-limit can be re-queued in the retry round without
-	// colly rejecting it as already-visited.  Our OnRequest hook uses
-	// LoadOrStore to enforce the same once-only guarantee and deletes the entry
-	// whenever a URL is sent to deferred so the retry round can re-mark it.
-	var visitedURLs sync.Map
 
 	c := colly.NewCollector(
 		// +2 so the path board(0)→listing(1)→job-detail(2)→apply-form(3) fits within the limit,
@@ -285,31 +363,22 @@ func (s *AppScanner) Run(ctx context.Context) error {
 	}
 
 	// OnRequest fires immediately before each HTTP dispatch — the last point at
-	// which we can cheaply abort a request without paying network RTT.  This is
-	// the primary synchronisation point: as soon as any worker records a
-	// rate-limit or block on a domain, every subsequent goroutine that would
-	// dispatch to that same FQDN is intercepted here and diverted to deferred.
+	// which we can cheaply abort a request without paying network RTT.
 	c.OnRequest(func(r *colly.Request) {
 		host := r.URL.Hostname()
 		rawURL := r.URL.String()
 
-		// Permanently blocked domains: abort without any retry.
 		if blocker.isBlocked(host) {
 			r.Abort()
 			return
 		}
-
-		// Rate-limited domain: defer for retry and abort immediately.
-		// Delete from visitedURLs so the retry round can re-mark and re-dispatch.
 		if !rl.isReady(host) {
-			visitedURLs.Delete(rawURL)
-			addDeferred(rawURL, host)
+			visited.delete(rawURL)
+			deferred.add(rawURL, host)
 			r.Abort()
 			return
 		}
-
-		// Deduplication: abort if another goroutine already dispatched this URL.
-		if _, loaded := visitedURLs.LoadOrStore(rawURL, struct{}{}); loaded {
+		if visited.loadOrStore(rawURL) {
 			r.Abort()
 		}
 	})
@@ -330,8 +399,9 @@ func (s *AppScanner) Run(ctx context.Context) error {
 		if abs == "" {
 			return
 		}
+		// Parse once; pass components to classifiers to avoid redundant parses.
 		u, err := url.Parse(abs)
-		if err != nil {
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 			return
 		}
 		host := u.Hostname()
@@ -339,33 +409,22 @@ func (s *AppScanner) Run(ctx context.Context) error {
 			return
 		}
 
-		// Classify the link before touching cooldown state so we only defer
-		// URLs we would actually visit.
-		isApp := isAppPageURL(abs)
-		isFollowable := !isApp && isFollowableJobURL(abs)
+		hostPath := strings.ToLower(u.Host + u.Path)
+		isApp := isAppPageURLParsed(u, hostPath)
+		isFollowable := !isApp && isFollowableJobURLParsed(u, hostPath)
 		isApplyBtn := !isApp && !isFollowable &&
 			applyTextRe.MatchString(strings.TrimSpace(el.Text)) && isATSDomain(host)
 
 		if !isApp && !isFollowable && !isApplyBtn {
 			return
 		}
-
-		// Role filter: applied only to individual application-page links.
-		// Listing pages (isFollowable) are always crawled — they may contain
-		// tech roles we cannot see until we fetch them.  Apply-CTA buttons sit
-		// on pages we are already visiting, so filtering them would be too late.
 		if isApp && !s.passesRoleFilter(strings.TrimSpace(el.Text)) {
 			return
 		}
-
-		// Fast path: if the domain is already in cooldown, defer without even
-		// queuing the URL in colly.  OnRequest is the authoritative check for
-		// URLs that slip through here while the rate-limit is being recorded.
 		if !rl.isReady(host) {
-			addDeferred(abs, host)
+			deferred.add(abs, host)
 			return
 		}
-
 		_ = c.Visit(abs)
 	})
 
@@ -379,7 +438,6 @@ func (s *AppScanner) Run(ctx context.Context) error {
 		rawURL := r.Request.URL.String()
 		switch r.StatusCode {
 		case http.StatusNotFound:
-			// A 404 means the listing was removed — don't penalise the domain.
 			log.Printf("[app] %s: 404 not found (skipped)", r.Request.URL)
 		case http.StatusTooManyRequests,
 			http.StatusForbidden,
@@ -387,10 +445,6 @@ func (s *AppScanner) Run(ctx context.Context) error {
 			http.StatusServiceUnavailable,
 			http.StatusBadGateway,
 			http.StatusGatewayTimeout:
-			// Any "go away" response: back off per-FQDN and defer for retry.
-			// Do NOT count against the permanent blocker — the domain is reachable.
-			// Use tryRecord so that concurrent in-flight requests returning the same
-			// status code don't each double the backoff (only the first wins).
 			if retryAt, fresh := rl.tryRecord(host); fresh {
 				log.Printf("[app] %s: blocked (%d) — retry after %s",
 					host, r.StatusCode, retryAt.Format("15:04:05"))
@@ -401,24 +455,20 @@ func (s *AppScanner) Run(ctx context.Context) error {
 					return
 				}
 			}
-			// Allow this URL to be re-dispatched in the retry round.
-			visitedURLs.Delete(rawURL)
-			addDeferred(rawURL, host)
+			visited.delete(rawURL)
+			deferred.add(rawURL, host)
 		default:
 			switch {
 			case err != nil && strings.Contains(err.Error(), "tls:"):
 				log.Printf("[app] %s: TLS error — skipping domain: %v", host, err)
 				blocker.blockNow(host)
 			case isNetworkTimeout(err):
-				// Timeout with no HTTP response (dial, response-header, or
-				// context deadline): the server is overloaded or throttling us.
-				// Treat identically to a 429 — back off and retry.
 				if retryAt, fresh := rl.tryRecord(host); fresh {
 					log.Printf("[app] %s: timeout — retry after %s",
 						host, retryAt.Format("15:04:05"))
 				}
-				visitedURLs.Delete(rawURL)
-				addDeferred(rawURL, host)
+				visited.delete(rawURL)
+				deferred.add(rawURL, host)
 			default:
 				log.Printf("[app] %s: %v", r.Request.URL, err)
 				blocker.recordFailure(host)
@@ -450,32 +500,21 @@ func (s *AppScanner) Run(ctx context.Context) error {
 	}
 	c.Wait()
 
-	// Retry loop: drain deferred URLs in rounds.  New 429s during a retry pass
-	// re-populate deferred, so we loop until it stabilises at empty or ctx is
-	// cancelled.  Each round spawns one goroutine per rate-limited domain;
-	// each goroutine sleeps (ctx-interruptible) until its own cooldown expires,
-	// then dispatches its URLs in bulk.  Total wait equals the longest single
-	// cooldown, not the sum of all cooldowns.
-	for {
-		deferMu.Lock()
-		batch := deferred
-		deferred = nil
-		deferMu.Unlock()
-
+	// Retry loop: drain deferred URLs in rounds.  Deduplication happens on
+	// insert (deferredSet), so no O(n) dedup pass is needed here.  At most
+	// retryMaxRounds are attempted; beyond that, remaining URLs are dropped
+	// with a log warning to prevent indefinite running when rate-limited
+	// domains keep generating new deferred URLs each round.
+	for round := 1; ; round++ {
+		batch := deferred.drain()
 		if len(batch) == 0 || ctx.Err() != nil {
 			break
 		}
-
-		// Deduplicate: the same URL can be linked from many pages.
-		seen := make(map[string]struct{}, len(batch))
-		unique := batch[:0]
-		for _, item := range batch {
-			if _, dup := seen[item.rawURL]; !dup {
-				seen[item.rawURL] = struct{}{}
-				unique = append(unique, item)
-			}
+		if round > retryMaxRounds {
+			log.Printf("[app] retry limit (%d rounds) reached; dropping %d remaining deferred URL(s)",
+				retryMaxRounds, len(batch))
+			break
 		}
-		batch = unique
 
 		// Group non-blocked URLs by domain for parallel dispatch.
 		domainURLs := make(map[string][]string)
@@ -484,8 +523,11 @@ func (s *AppScanner) Run(ctx context.Context) error {
 				domainURLs[item.domain] = append(domainURLs[item.domain], item.rawURL)
 			}
 		}
-		log.Printf("[app] retrying %d rate-limited URL(s) across %d domain(s)",
-			len(batch), len(domainURLs))
+		if len(domainURLs) == 0 {
+			break // all remaining domains are permanently blocked
+		}
+		log.Printf("[app] retry round %d/%d: %d URL(s) across %d domain(s)",
+			round, retryMaxRounds, len(batch), len(domainURLs))
 
 		var dispatchWg sync.WaitGroup
 		for domain, urls := range domainURLs {

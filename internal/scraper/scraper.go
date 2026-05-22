@@ -572,6 +572,29 @@ func isRelevantURL(raw string) bool {
 	return false
 }
 
+// isRelevantURLParsed is the hot-path variant of isRelevantURL for callers that
+// have already parsed the URL (avoids a redundant url.Parse call per link in
+// OnHTML).
+func isRelevantURLParsed(u *url.URL) bool {
+	for _, seg := range strings.Split(strings.ToLower(u.Path), "/") {
+		if seg == "" {
+			continue
+		}
+		for _, kw := range relevantSegKws {
+			if segMatchesKw(seg, kw) {
+				return true
+			}
+		}
+	}
+	q := strings.ToLower(u.RawQuery)
+	for _, kw := range []string{"job", "career", "vacancy", "stelle", "jobsuche", "bewerb"} {
+		if strings.Contains(q, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // segMatchesKw reports whether a URL path segment contains kw at a slug word
 // boundary: the segment equals kw, or kw appears at the start/end separated
 // by a hyphen or underscore.  This accepts "/people", "/our-people",
