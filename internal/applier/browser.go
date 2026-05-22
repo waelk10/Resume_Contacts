@@ -24,32 +24,32 @@ type FillFlags struct {
 	SimplifyWait time.Duration // pause after form appears to let the Simplify extension auto-fill (0 = disabled)
 }
 
-// pooledSession pairs a live WebDriver session with the capabilities used to
-// create it so that returnSession can spawn an identical replacement if the
-// session dies.
+// pooledSession owns one geckodriver process + one Firefox session.
+// Keeping the service per-slot lets Close() stop every geckodriver, and lets
+// returnSession() reconnect to the same geckodriver after a Firefox crash.
 type pooledSession struct {
-	wd   selenium.WebDriver
-	caps selenium.Capabilities
-}
-
-// Browser manages a single geckodriver process and a fixed pool of persistent
-// Firefox sessions — one per concurrent worker.  FillApplication borrows a
-// session from the pool, uses it, then returns (or replaces) it when done.
-// This avoids spawning a new Firefox process per URL, which fails when Firefox
-// is already running (single-instance restriction or snap sandbox).
-type Browser struct {
+	wd      selenium.WebDriver
+	caps    selenium.Capabilities
 	service *selenium.Service
-	baseURL string
-	pool    chan pooledSession // buffered; size == concurrency
+	baseURL string // http://localhost:<port> for this slot's geckodriver
 }
 
-// NewBrowser locates geckodriver in PATH, starts it on port 4444, and
-// pre-creates concurrency Firefox sessions that are pooled and reused across
-// application fills.  When profileDir is non-empty and concurrency > 1, the
-// base profile is cloned into numbered sibling directories (profile-0,
-// profile-1, …) so each session has its own independent Firefox profile —
-// Simplify stays logged in on every slot.  Returns a clear error message when
-// geckodriver is not found.
+// Browser holds a fixed pool of independent geckodriver+Firefox pairs, one per
+// concurrent worker.  Geckodriver only supports a single active session per
+// process, so each slot runs its own geckodriver on a distinct port
+// (4444, 4445, 4446 …).  FillApplication borrows a slot, uses it, and returns
+// it when done.
+type Browser struct {
+	pool chan pooledSession // buffered; size == concurrency
+}
+
+// NewBrowser starts concurrency independent geckodriver processes (on ports
+// 4444, 4445, …) each managing its own Firefox session, and pools them for
+// reuse.  Geckodriver only supports one active session per process, so a
+// separate process per slot is required for true parallelism.
+// When profileDir is set and concurrency > 1, the base profile is cloned into
+// numbered siblings (profile-0, profile-1, …) so each slot has its own
+// independent Firefox profile and Simplify stays logged in on every slot.
 func NewBrowser(headful bool, profileDir string, concurrency int) (*Browser, error) {
 	if concurrency < 1 {
 		concurrency = 1
@@ -61,31 +61,19 @@ func NewBrowser(headful bool, profileDir string, concurrency int) (*Browser, err
 				profileDir,
 			)
 		}
-		// Remove stale lock files left by a previously killed Firefox process.
-		// If these files exist Firefox opens a profile-recovery dialog instead of
-		// navigating to the job page, causing all WebDriver commands to hang.
-		for _, f := range []string{"lock", ".parentlock"} {
-			_ = os.Remove(filepath.Join(profileDir, f))
-		}
 	}
 
 	geckodriverPath, err := exec.LookPath("geckodriver")
 	if err != nil {
 		return nil, fmt.Errorf(
-			"geckodriver not found in PATH\n" +
-				"Install it for your platform:\n" +
-				"  Ubuntu/Debian : sudo apt install firefox-geckodriver\n" +
-				"  Fedora/RHEL   : sudo dnf install geckodriver\n" +
-				"  Arch Linux    : sudo pacman -S geckodriver\n" +
-				"  macOS         : brew install geckodriver\n" +
+			"geckodriver not found in PATH\n"+
+				"Install it for your platform:\n"+
+				"  Ubuntu/Debian : sudo apt install firefox-geckodriver\n"+
+				"  Fedora/RHEL   : sudo dnf install geckodriver\n"+
+				"  Arch Linux    : sudo pacman -S geckodriver\n"+
+				"  macOS         : brew install geckodriver\n"+
 				"  Manual        : https://github.com/mozilla/geckodriver/releases",
 		)
-	}
-
-	const port = 4444
-	svc, err := selenium.NewGeckoDriverService(geckodriverPath, port)
-	if err != nil {
-		return nil, fmt.Errorf("start geckodriver on :%d: %w\n(is port %d already in use?)", port, err, port)
 	}
 
 	// Do NOT set dom.webdriver.enabled or useAutomationExtension via Prefs —
@@ -93,32 +81,33 @@ func NewBrowser(headful bool, profileDir string, concurrency int) (*Browser, err
 	// create the session with "Failed to set preferences".  The webdriver flag
 	// is already masked at runtime by injectStealthJS (Object.defineProperty).
 
-	// geckodriver speaks W3C WebDriver directly on /  — NOT the old /wd/hub path
-	// used by Selenium standalone server.
-	b := &Browser{
-		service: svc,
-		baseURL: fmt.Sprintf("http://localhost:%d", port),
-		pool:    make(chan pooledSession, concurrency),
-	}
+	b := &Browser{pool: make(chan pooledSession, concurrency)}
 
-	// Pre-create sessions sequentially.  Each session gets its own Firefox
-	// profile directory (cloned from the base) so extensions and cookies are
-	// independent.  Staggering launches avoids a race where geckodriver tries
-	// to start multiple Firefox processes before the first one has initialised.
+	// Start one geckodriver per slot on consecutive ports.  Sessions are created
+	// sequentially with a short delay between launches so Firefox has time to
+	// initialise before the next process starts.
+	const basePort = 4444
 	for i := 0; i < concurrency; i++ {
 		if i > 0 {
 			time.Sleep(1500 * time.Millisecond)
 		}
+
+		port := basePort + i
+		svc, err := selenium.NewGeckoDriverService(geckodriverPath, port)
+		if err != nil {
+			b.closeAll()
+			return nil, fmt.Errorf("start geckodriver %d/%d on :%d: %w\n(is port %d already in use?)",
+				i+1, concurrency, port, err, port)
+		}
+		baseURL := fmt.Sprintf("http://localhost:%d", port)
 
 		// Resolve the profile directory for this slot.
 		slotProfile := profileDir
 		if profileDir != "" && concurrency > 1 {
 			slotProfile = fmt.Sprintf("%s-%d", profileDir, i)
 			if err := prepareProfileClone(profileDir, slotProfile); err != nil {
-				for len(b.pool) > 0 {
-					_ = (<-b.pool).wd.Quit()
-				}
 				_ = svc.Stop()
+				b.closeAll()
 				return nil, fmt.Errorf("prepare profile clone %d: %w", i, err)
 			}
 		} else if slotProfile != "" {
@@ -128,19 +117,17 @@ func NewBrowser(headful bool, profileDir string, concurrency int) (*Browser, err
 		}
 
 		caps := buildCaps(headful, slotProfile)
-		wd, err := selenium.NewRemote(caps, b.baseURL)
+		wd, err := selenium.NewRemote(caps, baseURL)
 		if err != nil {
-			for len(b.pool) > 0 {
-				_ = (<-b.pool).wd.Quit()
-			}
 			_ = svc.Stop()
+			b.closeAll()
 			return nil, fmt.Errorf("open Firefox session %d/%d: %w", i+1, concurrency, err)
 		}
 		_ = wd.SetPageLoadTimeout(30 * time.Second)
 		_ = wd.SetImplicitWaitTimeout(0)
 		_ = wd.Get("about:blank")
-		b.pool <- pooledSession{wd: wd, caps: caps}
-		log.Printf("[browser] session %d/%d ready", i+1, concurrency)
+		b.pool <- pooledSession{wd: wd, caps: caps, service: svc, baseURL: baseURL}
+		log.Printf("[browser] session %d/%d ready (port %d)", i+1, concurrency, port)
 	}
 
 	return b, nil
@@ -162,16 +149,20 @@ func buildCaps(headful bool, profileDir string) selenium.Capabilities {
 	return caps
 }
 
-// prepareProfileClone ensures dst is a ready-to-use copy of src.  If dst does
-// not exist it is created by recursively copying src.  If it already exists
-// (from a previous run) only stale lock files are removed — the existing clone
-// is reused so Simplify stays authenticated across runs.
+// prepareProfileClone always rebuilds dst as a fresh copy of src so that any
+// changes made to the base profile (re-login, extension updates, preference
+// changes) are reflected in every concurrent slot.  The old clone is removed
+// first to guarantee the copy is clean.
 func prepareProfileClone(src, dst string) error {
-	if _, err := os.Stat(dst); os.IsNotExist(err) {
-		log.Printf("[browser] cloning profile %s → %s", src, dst)
-		if err := copyDir(src, dst); err != nil {
-			return fmt.Errorf("copy profile: %w", err)
-		}
+	log.Printf("[browser] syncing profile clone → %s", dst)
+	if err := os.RemoveAll(dst); err != nil {
+		return fmt.Errorf("remove old clone: %w", err)
+	}
+	if err := copyDir(src, dst); err != nil {
+		return fmt.Errorf("copy profile: %w", err)
+	}
+	if freed, err := CompactProfile(dst); err == nil && freed > 0 {
+		log.Printf("[browser] compacted clone — freed %.1f MB", float64(freed)/1e6)
 	}
 	for _, f := range []string{"lock", ".parentlock"} {
 		_ = os.Remove(filepath.Join(dst, f))
@@ -195,6 +186,56 @@ func copyDir(src, dst string) error {
 		}
 		return copyFile(path, target, info.Mode())
 	})
+}
+
+// CompactProfile removes cached and ephemeral data from a Firefox profile
+// directory that is not needed for automation: HTTP cache, startup cache,
+// thumbnails, crash dumps, telemetry, session-restore data, and temporary
+// origin storage.  Extension data, cookies, preferences, and saved passwords
+// are left untouched so the Simplify extension stays authenticated.
+// Returns the total bytes freed.
+func CompactProfile(dir string) (int64, error) {
+	cacheDirs := []string{
+		"cache2",                               // HTTP response cache (largest)
+		"cache",                                // Legacy HTTP cache
+		"startupCache",                         // Startup cache
+		"thumbnails",                           // New-tab-page thumbnails
+		"crashes",                              // Crash reporter data
+		"datareporting",                        // Telemetry
+		"minidumps",                            // Crash minidumps
+		"saved-telemetry-pings",                // Telemetry pings
+		"sessionstore-backups",                 // Session-restore backups
+		filepath.Join("storage", "temporary"),  // Temporary origin storage (not extension data)
+	}
+	cacheFiles := []string{
+		"sessionstore.jsonlz4",
+		"sessionCheckpoints.json",
+	}
+
+	var freed int64
+	du := func(path string) int64 {
+		var n int64
+		_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() {
+				n += info.Size()
+			}
+			return nil
+		})
+		return n
+	}
+	for _, rel := range cacheDirs {
+		p := filepath.Join(dir, rel)
+		freed += du(p)
+		_ = os.RemoveAll(p)
+	}
+	for _, f := range cacheFiles {
+		p := filepath.Join(dir, f)
+		if info, err := os.Stat(p); err == nil {
+			freed += info.Size()
+			_ = os.Remove(p)
+		}
+	}
+	return freed, nil
 }
 
 // copyFile copies a single file preserving permissions.
@@ -265,43 +306,49 @@ func RunSetup(ctx context.Context, profileDir string) error {
 	return nil
 }
 
-// Close quits all pooled sessions and stops the geckodriver process.
-// Sessions that are currently in use by workers will be terminated when
-// geckodriver exits.
-func (b *Browser) Close() {
+// Close quits all pooled Firefox sessions and stops every geckodriver process.
+// Sessions currently in use by workers are terminated when their geckodriver
+// exits.
+func (b *Browser) Close() { b.closeAll() }
+
+// closeAll drains the pool, quitting each session and stopping its geckodriver.
+// Safe to call during error cleanup in NewBrowser before the Browser is returned.
+func (b *Browser) closeAll() {
 	for {
 		select {
 		case s := <-b.pool:
 			_ = s.wd.Quit()
+			_ = s.service.Stop()
 		default:
-			_ = b.service.Stop()
 			return
 		}
 	}
 }
 
 // returnSession navigates the session back to about:blank and returns it to
-// the pool.  If the session is dead (the Firefox window was closed or crashed),
-// it spawns a replacement in the background so the pool stays at its original
-// capacity.
+// the pool.  If the session is dead (Firefox window closed or crashed),
+// it reconnects to the same geckodriver process and spawns a replacement in
+// the background so the pool stays at its original capacity.
 func (b *Browser) returnSession(s pooledSession) {
 	if err := s.wd.Get("about:blank"); err == nil {
 		_ = s.wd.DeleteAllCookies()
 		b.pool <- s
 		return
 	}
-	// Session is dead — replace it asynchronously so the caller is not blocked.
+	// Firefox is gone — reconnect to the same geckodriver (still running) and
+	// create a fresh session on it.  Do this asynchronously so the worker
+	// is not blocked.
 	go func() {
-		fresh, err := selenium.NewRemote(s.caps, b.baseURL)
+		fresh, err := selenium.NewRemote(s.caps, s.baseURL)
 		if err != nil {
-			log.Printf("[browser] could not replace dead session: %v — pool capacity reduced by 1", err)
+			log.Printf("[browser] could not replace dead session on %s: %v — pool capacity reduced by 1", s.baseURL, err)
 			return
 		}
 		_ = fresh.SetPageLoadTimeout(30 * time.Second)
 		_ = fresh.SetImplicitWaitTimeout(0)
 		_ = fresh.Get("about:blank")
-		b.pool <- pooledSession{wd: fresh, caps: s.caps}
-		log.Printf("[browser] dead session replaced")
+		b.pool <- pooledSession{wd: fresh, caps: s.caps, service: s.service, baseURL: s.baseURL}
+		log.Printf("[browser] dead session replaced on %s", s.baseURL)
 	}()
 }
 
@@ -415,7 +462,7 @@ func (b *Browser) FillApplication(
 		return fmt.Errorf("navigate to %s: %w", job.URL, err)
 	}
 	// Give JavaScript-heavy ATS pages time to finish rendering.
-	time.Sleep(2 * time.Second)
+	time.Sleep(1200 * time.Millisecond)
 
 	// iCIMS: job-description URLs (ending in /job) need ?mode=apply to load
 	// the application form directly.  Navigate there now so the form is ready
@@ -426,7 +473,7 @@ func (b *Browser) FillApplication(
 			sep = "&"
 		}
 		if gerr := wd.Get(job.URL + sep + "mode=apply"); gerr == nil {
-			time.Sleep(2 * time.Second)
+			time.Sleep(1500 * time.Millisecond)
 		}
 	}
 
@@ -585,8 +632,9 @@ func (b *Browser) FillApplication(
 	// Runs after all platform-specific fills to catch any remaining empty
 	// required fields — custom employer questions, consent checkboxes, radio
 	// groups, etc. — before attempting submission.
+	_, mopupLocalPhone := splitPhone(info.Phone)
 	if n, err := wd.ExecuteScript(jsFillRequiredFields, []interface{}{
-		info.CoverLetter, info.ExpectedSalary, info.Phone, info.Website,
+		info.CoverLetter, info.ExpectedSalary, info.Phone, info.Website, mopupLocalPhone,
 	}); err == nil {
 		if cnt, ok := n.(float64); ok && cnt > 0 {
 			log.Printf("[apply] mop-up filled %d remaining required native field(s)", int(cnt))
@@ -767,9 +815,9 @@ const jsGetAllUnfilledRequiredComboboxIDs = `
 // (input, textarea, select, radio group, checkbox) and fills it with the best
 // synthetic value available.  React Select comboboxes are excluded — they need
 // WebDriver click+pick and are handled by the combobox mop-up.
-// args: coverLetter, salary, phone, website
+// args: coverLetter, salary, phone, website, localPhone
 const jsFillRequiredFields = `
-(function(coverLetter, salary, phone, website) {
+(function(coverLetter, salary, phone, website, localPhone) {
     var nSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
     var tSet = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
     var filled = 0;
@@ -797,11 +845,26 @@ const jsFillRequiredFields = `
         return (t+' '+(el.name||'')+' '+(el.id||'')+' '+(el.placeholder||'')).toLowerCase();
     }
 
+    var phoneCodeKw = ['country_code','phone_country','dial_code','calling_code',
+                       'phone_prefix','country-code','dialcode','countrycode',
+                       'phonecode','phone_code','prefix','phoneext','phone_ext',
+                       'countrycallingcode','callingcode'];
+    function phoneCountrySelectSet() {
+        var sels = document.querySelectorAll('select');
+        for (var s = 0; s < sels.length; s++) {
+            var nm = ((sels[s].name||'')+' '+(sels[s].id||'')).toLowerCase();
+            for (var k = 0; k < phoneCodeKw.length; k++) {
+                if (nm.indexOf(phoneCodeKw[k]) !== -1 && sels[s].value && sels[s].selectedIndex > 0) return true;
+            }
+        }
+        return false;
+    }
+
     function synthVal(el) {
         var c = labelCtx(el);
         // Skip fields we already fill specifically — returning '' skips the element
         if (/\b(name|email|linkedin)\b/.test(c)) return '';
-        if (/phone|mobile|tel/.test(c)) return phone;
+        if (/phone|mobile|tel/.test(c)) return (localPhone && phoneCountrySelectSet()) ? localPhone : phone;
         if (/salary|compensation|ctc|pay|wage|remunerat/.test(c)) return salary;
         if (/year|yrs\b|experience|how.?long|seniority/.test(c)) return '5';
         if (/notice|start.?date|availab|when.?can.?you|earliest/.test(c)) return '2 weeks';
@@ -1258,6 +1321,53 @@ const jsHandleWorkEligibility = `
 })(arguments[0],arguments[1]);
 `
 
+// jsHandleWorkRestrictions answers questions about NDAs, non-compete clauses,
+// cooling-off periods, and other post-employment work restrictions with "no"
+// (no such restrictions exist).  Handles radio buttons, native <select>
+// dropdowns, and Ashby-style Yes/No button pairs in a single round-trip.
+const jsHandleWorkRestrictions = `
+(function(){
+    var RE = /\b(non[\s-]?disclosure|nda\b|non[\s-]?compete|non[\s-]?competition|non[\s-]?solicitation|cool(?:ing)?[\s-]?(?:off)?[\s-]?period|restrictive\s+covenant|work\s+restriction|confidentiality\s+agreement|post[\s-]?employment\s+restrict|garden\s+leave|restraint\s+of\s+trade)\b/i;
+    var NO_RE = /^\s*no\s*$/i;
+
+    function pickNo(container) {
+        var radios = container.querySelectorAll('input[type="radio"],[role="radio"]');
+        for (var i = 0; i < radios.length; i++) {
+            var r = radios[i]; if (r.disabled) continue;
+            var lbl = document.querySelector('label[for="'+r.id+'"]') || r.closest('label');
+            var t = (lbl ? lbl.textContent : (r.getAttribute('aria-label') || r.value || '')).trim();
+            if (NO_RE.test(t)) {
+                r.scrollIntoView({block:'center'}); r.click();
+                r.dispatchEvent(new Event('change',{bubbles:true})); return true;
+            }
+        }
+        var sel = container.querySelector('select');
+        if (sel && !sel.disabled) {
+            for (var i = 0; i < sel.options.length; i++) {
+                if (sel.options[i].value && NO_RE.test(sel.options[i].text)) {
+                    sel.selectedIndex = i; sel.dispatchEvent(new Event('change',{bubbles:true})); return true;
+                }
+            }
+        }
+        var btns = container.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+            var t2 = (btns[i].innerText || btns[i].textContent || '').trim().toLowerCase();
+            if (t2 === 'no') { btns[i].scrollIntoView({block:'center'}); btns[i].click(); return true; }
+        }
+        return false;
+    }
+
+    document.querySelectorAll('fieldset').forEach(function(fs) {
+        var leg = fs.querySelector('legend'); if (!leg) return;
+        if (RE.test(leg.textContent)) pickNo(fs);
+    });
+    document.querySelectorAll('[class*="question"],[class*="field-group"],[class*="form-group"],[class*="form-field"],[class*="radio-group"],[data-qa]').forEach(function(d) {
+        if (RE.test(d.textContent)) pickNo(d);
+    });
+    return true;
+})()
+`
+
 // jsHandleEEORadios answers gender and ethnicity radio-button groups that
 // appear in voluntary self-identification (EEO) sections.  Used on Ashby and
 // any other ATS that renders EEO as radio inputs rather than <select> elements.
@@ -1625,7 +1735,7 @@ func fillComboboxByLabel(wd selenium.WebDriver, labelText, value string) bool {
 	if err != nil || res == nil {
 		return false
 	}
-	time.Sleep(1200 * time.Millisecond) // wait for listbox to render
+	time.Sleep(800 * time.Millisecond) // wait for listbox to render
 	for _, sel := range []string{
 		`[role="listbox"] [role="option"]`,
 		`[role="option"]`,
@@ -1639,14 +1749,14 @@ func fillComboboxByLabel(wd selenium.WebDriver, labelText, value string) bool {
 			text, _ := el.Text()
 			if strings.Contains(strings.ToLower(text), valLow) {
 				_ = el.Click()
-				time.Sleep(300 * time.Millisecond)
+				time.Sleep(200 * time.Millisecond)
 				return true
 			}
 		}
 		// No text match — click the first visible option rather than leaving
 		// the dropdown open with nothing selected.
 		if err := els[0].Click(); err == nil {
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			return true
 		}
 	}
@@ -1886,6 +1996,9 @@ func fillCommonExtras(ctx context.Context, wd selenium.WebDriver, info Applicant
 		sponsorAns = "no"
 	}
 	wd.ExecuteScript(jsHandleWorkEligibility, []interface{}{authAns, sponsorAns}) //nolint:errcheck
+
+	// ── NDA / non-compete / cooling-off / work restrictions — always "no" ────
+	wd.ExecuteScript(jsHandleWorkRestrictions, nil) //nolint:errcheck
 
 	// ── EEO radio buttons (gender + ethnicity — Ashby and others) ────────────
 	genderVal := info.Gender
@@ -2150,7 +2263,7 @@ func fillGreenhouseComboboxByID(wd selenium.WebDriver, id, value string, waitMs 
 	if err := inp.Click(); err != nil {
 		return false
 	}
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 	// Clear any previously typed text (e.g. from a prior failed fill attempt).
 	// inp.Clear() is safer than Ctrl+A+Delete, which React Select can intercept
 	// to close the dropdown — causing the first typed character to be swallowed
@@ -2177,7 +2290,7 @@ func fillGreenhouseComboboxByID(wd selenium.WebDriver, id, value string, waitMs 
 			if strings.Contains(strings.ToLower(text), valLow) {
 				if err := el.Click(); err == nil {
 					log.Printf("[greenhouse] combobox #%s: selected %q", id, strings.TrimSpace(text))
-					time.Sleep(300 * time.Millisecond)
+					time.Sleep(200 * time.Millisecond)
 					return true
 				}
 			}
@@ -2186,7 +2299,7 @@ func fillGreenhouseComboboxByID(wd selenium.WebDriver, id, value string, waitMs 
 		if err := els[0].Click(); err == nil {
 			text, _ := els[0].Text()
 			log.Printf("[greenhouse] combobox #%s: first-option fallback %q", id, strings.TrimSpace(text))
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			return true
 		}
 	}
@@ -2200,7 +2313,7 @@ func fillGreenhouseComboboxByID(wd selenium.WebDriver, id, value string, waitMs 
 // Recognises the separators "and", "&", "/", and "," (in that priority order).
 func splitDualMajor(field string) []string {
 	low := strings.ToLower(field)
-	for _, sep := range []string{" and ", " & ", " / ", ", "} {
+	for _, sep := range []string{" and ", " & ", " / ", "/", ", "} {
 		idx := strings.Index(low, sep)
 		if idx < 0 {
 			continue
@@ -2257,7 +2370,7 @@ func fillGreenhouseComboboxOrOther(wd selenium.WebDriver, id, value string, wait
 			if strings.Contains(strings.ToLower(text), valLow) {
 				if err := el.Click(); err == nil {
 					log.Printf("[greenhouse] combobox #%s: selected %q", id, strings.TrimSpace(text))
-					time.Sleep(300 * time.Millisecond)
+					time.Sleep(200 * time.Millisecond)
 					return true
 				}
 			}
@@ -2276,7 +2389,7 @@ func fillGreenhouseComboboxOrOther(wd selenium.WebDriver, id, value string, wait
 					if strings.Contains(strings.ToLower(text), partLow) {
 						if err := el.Click(); err == nil {
 							log.Printf("[greenhouse] combobox #%s: dual major — matched component %q (full: %q)", id, strings.TrimSpace(text), value)
-							time.Sleep(300 * time.Millisecond)
+							time.Sleep(200 * time.Millisecond)
 							return true
 						}
 					}
@@ -2286,14 +2399,14 @@ func fillGreenhouseComboboxOrOther(wd selenium.WebDriver, id, value string, wait
 	}
 
 	// Phase 2: value not found — search specifically for "Other".
-	if els := openAndType("other", 700); els != nil {
+	if els := openAndType("other", 500); els != nil {
 		for _, el := range els {
 			text, _ := el.Text()
 			low := strings.ToLower(strings.TrimSpace(text))
 			if low == "other" || strings.HasPrefix(low, "other ") || strings.HasSuffix(low, " other") {
 				if err := el.Click(); err == nil {
 					log.Printf("[greenhouse] combobox #%s: %q not in list — fell back to \"Other\"", id, value)
-					time.Sleep(300 * time.Millisecond)
+					time.Sleep(200 * time.Millisecond)
 					return true
 				}
 			}
@@ -2305,7 +2418,7 @@ func fillGreenhouseComboboxOrOther(wd selenium.WebDriver, id, value string, wait
 		if err := els[0].Click(); err == nil {
 			text, _ := els[0].Text()
 			log.Printf("[greenhouse] combobox #%s: first-option fallback %q", id, strings.TrimSpace(text))
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			return true
 		}
 	}
@@ -2363,9 +2476,12 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 	if name := countryDisplayName(info); name != "" {
 		fillGreenhouseComboboxByID(wd, "country", name, 800)
 	}
-	if !trySetInput(wd, "#phone", info.Phone) {
-		tryFillByLabel(wd, "phone", info.Phone)
-	}
+	// The country code is handled by the React Select combobox above, not a
+	// native <select>, so fillPhone's native-select detection does not fire.
+	// Strip the dial code via splitPhone and fill the phone input with the
+	// national number directly (e.g. "972556661778" → "0556661778").
+	_, ghLocalPhone := splitPhone(info.Phone)
+	fillPhoneInput(wd, ghLocalPhone)
 
 	// Location — Google Places-backed async combobox.  The old boards.greenhouse.io
 	// format uses id="candidate-location"; the new job-boards.greenhouse.io format
@@ -2376,8 +2492,8 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 		locVal = countryDisplayName(info)
 	}
 	if locVal != "" {
-		if !fillGreenhouseComboboxByID(wd, "candidate-location", locVal, 2000) {
-			if !fillGreenhouseComboboxByID(wd, "location", locVal, 2000) {
+		if !fillGreenhouseComboboxByID(wd, "candidate-location", locVal, 1500) {
+			if !fillGreenhouseComboboxByID(wd, "location", locVal, 1500) {
 				fillComboboxByLabel(wd, "location", locVal)
 			}
 		}
@@ -2447,6 +2563,15 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 	fillComboboxByLabel(wd, "previously worked for", "no")
 	fillComboboxByLabel(wd, "employment agreement", "no")
 	fillComboboxByLabel(wd, "post-employment restriction", "no")
+	fillComboboxByLabel(wd, "non-disclosure", "no")
+	fillComboboxByLabel(wd, "non-compete", "no")
+	fillComboboxByLabel(wd, "non-solicitation", "no")
+	fillComboboxByLabel(wd, "cooling-off period", "no")
+	fillComboboxByLabel(wd, "cool-off period", "no")
+	fillComboboxByLabel(wd, "restrictive covenant", "no")
+	fillComboboxByLabel(wd, "work restriction", "no")
+	fillComboboxByLabel(wd, "confidentiality agreement", "no")
+	fillComboboxByLabel(wd, "garden leave", "no")
 
 	// Location eligibility — two common phrasings with different expected answers.
 	// "based in the following [locations/countries]" → yes (user qualifies)
@@ -2489,7 +2614,7 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 	// and text inputs here so both formats are covered.
 	if info.School != "" {
 		// Combobox: try exact school name; fall back to "Other" if not in list.
-		fillGreenhouseComboboxOrOther(wd, "school_name_0", info.School, 1200)
+		fillGreenhouseComboboxOrOther(wd, "school_name_0", info.School, 900)
 		// Native <select> and text-input variants (older Greenhouse format).
 		if !trySetSelect(wd, `select[id*="school" i], select[name*="school" i]`, info.School) {
 			trySetSelectByLabel(wd, "school", info.School)
@@ -2505,7 +2630,7 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 			"associate": {"associate"},
 		}
 		for _, term := range degreeTerms[info.Degree] {
-			if fillGreenhouseComboboxOrOther(wd, "degree_0", term, 1000) {
+			if fillGreenhouseComboboxOrOther(wd, "degree_0", term, 800) {
 				break
 			}
 		}
@@ -2520,7 +2645,7 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 	}
 	if info.FieldOfStudy != "" {
 		// Combobox: try field name; fall back to "Other" if not in list.
-		fillGreenhouseComboboxOrOther(wd, "discipline_0", info.FieldOfStudy, 1000)
+		fillGreenhouseComboboxOrOther(wd, "discipline_0", info.FieldOfStudy, 800)
 		tryFillByLabel(wd, "field of study", info.FieldOfStudy)
 		tryFillByLabel(wd, "major", info.FieldOfStudy)
 		tryFillByLabel(wd, "discipline", info.FieldOfStudy)
@@ -2565,7 +2690,7 @@ func fillGreenhouseEEODecline(wd selenium.WebDriver, id string) {
 	}
 	// Clear + no typing = show all options
 	_ = inp.Clear()
-	time.Sleep(800 * time.Millisecond)
+	time.Sleep(600 * time.Millisecond)
 	for _, sel := range []string{`[role="listbox"] [role="option"]`, `[role="option"]`} {
 		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
 		if err != nil || len(els) == 0 {
@@ -2575,7 +2700,7 @@ func fillGreenhouseEEODecline(wd selenium.WebDriver, id string) {
 		if err := last.Click(); err == nil {
 			text, _ := last.Text()
 			log.Printf("[greenhouse] EEO combobox #%s: last-option decline %q", id, strings.TrimSpace(text))
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			return
 		}
 	}
@@ -2622,6 +2747,17 @@ func fillGreenhouseAllUnfilledDropdowns(wd selenium.WebDriver, sponsorAns, authA
 
 		var value string
 		switch {
+		case strings.Contains(lbl, "non-disclosure") ||
+			strings.Contains(lbl, "non-compete") ||
+			strings.Contains(lbl, "non-solicitation") ||
+			strings.Contains(lbl, "cooling-off") ||
+			strings.Contains(lbl, "cool-off") ||
+			strings.Contains(lbl, "restrictive covenant") ||
+			strings.Contains(lbl, "work restriction") ||
+			strings.Contains(lbl, "confidentiality agreement") ||
+			strings.Contains(lbl, "garden leave") ||
+			strings.Contains(lbl, "post-employment"):
+			value = "no"
 		case strings.Contains(lbl, "relocat") ||
 			strings.Contains(lbl, "reside") ||
 			strings.Contains(lbl, "located in") ||
@@ -2699,9 +2835,7 @@ func fillLever(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 	if !trySetInput(wd, `input[name="email"]`, info.Email) {
 		tryFillByLabel(wd, "email", info.Email)
 	}
-	if !trySetInput(wd, `input[name="phone"]`, info.Phone) {
-		tryFillByLabel(wd, "phone", info.Phone)
-	}
+	fillPhone(wd, info.Phone)
 	if !trySetInput(wd, `input[name="urls[LinkedIn]"]`, info.LinkedInURL) {
 		tryFillByLabel(wd, "linkedin", info.LinkedInURL)
 	}
@@ -2791,7 +2925,7 @@ func fillAshbyUnfilledComboboxes(wd selenium.WebDriver) {
 		if err := inp.Click(); err != nil {
 			continue
 		}
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 		for _, sel := range []string{`[role="listbox"] [role="option"]`, `[role="option"]`} {
 			opts, err := wd.FindElements(selenium.ByCSSSelector, sel)
 			if err != nil || len(opts) == 0 {
@@ -2800,7 +2934,7 @@ func fillAshbyUnfilledComboboxes(wd selenium.WebDriver) {
 			if err := opts[0].Click(); err == nil {
 				text, _ := opts[0].Text()
 				log.Printf("[ashby] mop-up: combobox #%s selected first option %q", id, strings.TrimSpace(text))
-				time.Sleep(300 * time.Millisecond)
+				time.Sleep(200 * time.Millisecond)
 			}
 			break
 		}
@@ -2831,24 +2965,7 @@ func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 	// Phone — Ashby uses UUID-named tel inputs that may ignore the native JS
 	// value setter (custom phone component).  Use WebDriver SendKeys first so
 	// real key events are dispatched; fall back to JS-setter approaches.
-	{
-		phoneFilled := false
-		if phoneEls, _ := wd.FindElements(selenium.ByCSSSelector, `input[type="tel"]`); len(phoneEls) > 0 {
-			if err := phoneEls[0].Click(); err == nil {
-				_ = phoneEls[0].Clear()
-				if err2 := phoneEls[0].SendKeys(info.Phone); err2 == nil {
-					phoneFilled = true
-				}
-			}
-		}
-		if !phoneFilled {
-			if !trySetInput(wd, `input[name="phone"]`, info.Phone) &&
-				!trySetInput(wd, `input[autocomplete="tel"]`, info.Phone) {
-				tryFillByLabel(wd, "phone number", info.Phone)
-				tryFillByLabel(wd, "phone", info.Phone)
-			}
-		}
-	}
+	fillPhoneSendKeys(wd, info.Phone)
 	// LinkedIn
 	if !trySetInput(wd, `input[placeholder*="LinkedIn" i]`, info.LinkedInURL) &&
 		!trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
@@ -2914,7 +3031,7 @@ func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 	fillComboboxByLabel(wd, "location are you applying for", "other")
 	// Some Ashby forms reveal a free-text input after "Other" is selected.
 	// Give React 800 ms to render the conditional field, then fill it.
-	time.Sleep(800 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	fillLoc := info.City
 	if fillLoc == "" {
 		fillLoc = info.Country
@@ -2953,6 +3070,21 @@ func fillAshby(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"legally authorized to work", authAns}) //nolint:errcheck
 	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"legally allowed to work", authAns})   //nolint:errcheck
 	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"require sponsorship", sponsorAns})    //nolint:errcheck
+
+	// NDA / non-compete / cooling-off / work restrictions — always "no"
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"non-disclosure", "no"})       //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"non-compete", "no"})          //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"non-solicitation", "no"})     //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"cooling-off", "no"})          //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"cool-off", "no"})             //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"work restriction", "no"})     //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"confidentiality agreement", "no"}) //nolint:errcheck
+	wd.ExecuteScript(jsHandleAshbyYesNo, []interface{}{"restrictive covenant", "no"}) //nolint:errcheck
+	fillComboboxByLabel(wd, "non-disclosure", "no")
+	fillComboboxByLabel(wd, "non-compete", "no")
+	fillComboboxByLabel(wd, "non-solicitation", "no")
+	fillComboboxByLabel(wd, "cooling-off", "no")
+	fillComboboxByLabel(wd, "work restriction", "no")
 
 	// "How did you hear about us?" — Ashby MultiValueSelect (checkbox list).
 	// Click the combobox open and pick the first available option.
@@ -3064,11 +3196,7 @@ func fillBambooHR(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo
 		!trySetInput(wd, `input[name*="email" i]`, info.Email) {
 		tryFillByLabel(wd, "email", info.Email)
 	}
-	if !trySetInput(wd, `input[id*="phone" i]`, info.Phone) &&
-		!trySetInput(wd, `input[type="tel"]`, info.Phone) &&
-		!trySetInput(wd, `input[name*="phone" i]`, info.Phone) {
-		tryFillByLabel(wd, "phone", info.Phone)
-	}
+	fillPhone(wd, info.Phone)
 	uploadResume(wd, resumePath)
 	fillCommonExtras(ctx, wd, info)
 }
@@ -3111,11 +3239,7 @@ func fillPersonio(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo
 		tryFillByLabel(wd, "email", info.Email)
 	}
 	// Phone
-	if !trySetInput(wd, `input[name="phone"]`, info.Phone) &&
-		!trySetInput(wd, `input[type="tel"]`, info.Phone) &&
-		!trySetInput(wd, `input[autocomplete="tel"]`, info.Phone) {
-		tryFillByLabel(wd, "phone", info.Phone)
-	}
+	fillPhone(wd, info.Phone)
 	// LinkedIn
 	if !trySetInput(wd, `input[name="linkedin_profile"]`, info.LinkedInURL) &&
 		!trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
@@ -3218,24 +3342,7 @@ func fillGeneric(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 		tryFillByLabel(wd, "email", info.Email)
 	}
 
-	filled = false
-	for _, sel := range []string{
-		`input[type="tel"]`, `input[name*="phone" i]`,
-		`input[placeholder*="phone" i]`, `input[id*="phone" i]`,
-	} {
-		if trySetInput(wd, sel, info.Phone) {
-			filled = true
-			break
-		}
-	}
-	if !filled {
-		if !tryFillByLabel(wd, "phone", info.Phone) &&
-			!tryFillByLabel(wd, "mobile", info.Phone) {
-			if !tryFillByLabel(wd, "telefon", info.Phone) {
-				tryFillByLabel(wd, "handynummer", info.Phone)
-			}
-		}
-	}
+	fillPhone(wd, info.Phone)
 
 	filled = false
 	for _, sel := range []string{
@@ -3277,7 +3384,7 @@ func fillWorkday(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo,
 		trySetInput(wd, `[data-automation-id="email"]`, info.Email)
 	}
 
-	trySetInput(wd, `[data-automation-id="phone-number"]`, info.Phone)
+	fillPhone(wd, info.Phone)
 	trySetInput(wd, `[data-automation-id="city"]`, info.City)
 	trySetInput(wd, `[data-automation-id="postalCode"]`, info.ZipCode)
 	trySetSelectByLabel(wd, "country", info.Country)
@@ -3315,10 +3422,7 @@ func fillICIMS(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, r
 		!trySetInput(wd, `input[type="email"]`, info.Email) {
 		tryFillByLabel(wd, "email", info.Email)
 	}
-	if !trySetInput(wd, `input[name="phone"]`, info.Phone) &&
-		!trySetInput(wd, `input[type="tel"]`, info.Phone) {
-		tryFillByLabel(wd, "phone", info.Phone)
-	}
+	fillPhone(wd, info.Phone)
 	trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL)
 
 	uploadResume(wd, resumePath)
@@ -3349,10 +3453,7 @@ func fillWorkable(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo
 		!trySetInput(wd, `input[name*="email" i]`, info.Email) {
 		tryFillByLabel(wd, "email", info.Email)
 	}
-	if !trySetInput(wd, `input[type="tel"]`, info.Phone) &&
-		!trySetInput(wd, `input[name*="phone" i]`, info.Phone) {
-		tryFillByLabel(wd, "phone", info.Phone)
-	}
+	fillPhone(wd, info.Phone)
 	if info.LinkedInURL != "" {
 		if !trySetInput(wd, `input[name*="linkedin" i]`, info.LinkedInURL) {
 			tryFillByLabel(wd, "linkedin", info.LinkedInURL)
@@ -3495,7 +3596,7 @@ func dismissCookieBanner(wd selenium.WebDriver) {
 		if err != nil || res != true {
 			return
 		}
-		time.Sleep(400 * time.Millisecond) // wait for the overlay animation
+		time.Sleep(250 * time.Millisecond) // wait for the overlay animation
 	}
 }
 
@@ -4278,7 +4379,7 @@ func submitWithAshbyRetry(ctx context.Context, wd selenium.WebDriver, info Appli
 		clickConfirmationModal(wd)
 
 		// Give React time to process the submit event and render any errors.
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(1000 * time.Millisecond)
 
 		// Read validation errors from the Ashby error summary banner.
 		raw, err := wd.ExecuteScript(jsReadAshbyValidationErrors, nil)
@@ -4369,15 +4470,16 @@ func submitWithAshbyRetry(ctx context.Context, wd selenium.WebDriver, info Appli
 			default:
 				// Unknown field — run the generic mop-up, then also try to fill
 				// any remaining Ashby comboboxes with their first available option.
+				_, ashbyLocalPhone := splitPhone(info.Phone)
 				wd.ExecuteScript(jsFillRequiredFields, []interface{}{ //nolint:errcheck
-					info.CoverLetter, info.ExpectedSalary, info.Phone, info.Website,
+					info.CoverLetter, info.ExpectedSalary, info.Phone, info.Website, ashbyLocalPhone,
 				})
 				fillAshbyUnfilledComboboxes(wd)
 			}
 		}
 
 		// Short pause for React to re-evaluate form validity after fixes.
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	return verifySubmission(ctx, wd, flags.Headful || flags.Hold)
@@ -4609,7 +4711,7 @@ func clickConfirmationModal(wd selenium.WebDriver) {
 					strings.Contains(tl, "yes") || strings.Contains(tl, "ok") || strings.Contains(tl, "apply") {
 					if el.Click() == nil {
 						log.Printf("[apply] confirmation dialog clicked (%q)", tl)
-						time.Sleep(2 * time.Second)
+						time.Sleep(1500 * time.Millisecond)
 						return
 					}
 				}
@@ -4648,7 +4750,7 @@ func clickSubmit(wd selenium.WebDriver) error {
 		if err == nil && len(els) > 0 {
 			_, _ = wd.ExecuteScript(`arguments[0].scrollIntoView({block:'center'})`, []interface{}{els[0]})
 			if cerr := els[0].Click(); cerr == nil {
-				time.Sleep(2 * time.Second)
+				time.Sleep(1500 * time.Millisecond)
 				return nil
 			}
 		}
@@ -4663,7 +4765,7 @@ func clickSubmit(wd selenium.WebDriver) error {
 		if err == nil && len(els) > 0 {
 			_, _ = wd.ExecuteScript(`arguments[0].scrollIntoView({block:'center'})`, []interface{}{els[0]})
 			if cerr := els[0].Click(); cerr == nil {
-				time.Sleep(2 * time.Second)
+				time.Sleep(1500 * time.Millisecond)
 				return nil
 			}
 		}
@@ -4672,7 +4774,7 @@ func clickSubmit(wd selenium.WebDriver) error {
 	// 3. JS heuristic — skips disabled buttons (prefers enabled ones).
 	res, err := wd.ExecuteScript(jsSubmit, nil)
 	if err == nil && res == true {
-		time.Sleep(2 * time.Second)
+		time.Sleep(1500 * time.Millisecond)
 		return nil
 	}
 
@@ -4682,7 +4784,7 @@ func clickSubmit(wd selenium.WebDriver) error {
 	log.Printf("[apply] normal click failed — dispatching synthetic click on submit button")
 	res2, err2 := wd.ExecuteScript(jsForceClickSubmit, nil)
 	if err2 == nil && res2 == true {
-		time.Sleep(2 * time.Second)
+		time.Sleep(1500 * time.Millisecond)
 		return nil
 	}
 

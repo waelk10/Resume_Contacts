@@ -23,6 +23,8 @@ type runFlags struct {
 	countries   []string // ISO 3166-1 alpha-2 codes or region aliases; nil = all seeds
 	hops        int      // BFS depth for discover (ignored by start/pages)
 	smtpVerify  bool     // probe mail server to confirm address exists (start only)
+	roles       []string // role-keyword filter (pages only); nil = caller picks default
+	rolesSet    bool     // true when --roles was explicitly passed on the command line
 }
 
 func Execute() {
@@ -48,6 +50,10 @@ func Execute() {
 		cleanContacts()
 	case "purge":
 		purgeAll()
+	case "compact-profiles":
+		compactProfiles()
+	case "compact-log":
+		compactLog()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %q\n\n", os.Args[1])
 		printHelp()
@@ -66,12 +72,18 @@ func parseFlags(cmd string) runFlags {
 	var c int
 	var s string
 	var countriesRaw string
+	var rolesRaw string
 	var hops int
 	fs.IntVar(&c, "concurrency", defaultConcurrency, "concurrent lookups per domain (1–8)")
 	fs.IntVar(&c, "c", defaultConcurrency, "concurrent lookups per domain (1–8) (shorthand)")
 	fs.StringVar(&s, "seeds", "", "path to a line-separated file of extra seed URLs")
 	fs.StringVar(&s, "s", "", "path to a line-separated file of extra seed URLs (shorthand)")
 	fs.StringVar(&countriesRaw, "countries", "", "comma-separated country/region codes to restrict seeds")
+	fs.StringVar(&rolesRaw, "roles", "",
+		"comma-separated role/title keywords for pages — only links whose anchor text\n"+
+			"\tmatches a keyword are followed (case-insensitive substring).\n"+
+			"\tDefault for pages: built-in tech list.  Pass \"\" to disable filtering.\n"+
+			"\tExample: --roles \"engineer,developer,data,security\"")
 	fs.IntVar(&hops, "hops", 2, "BFS depth for discover: how many meta-source hops beyond the initial list (discover only)")
 	var smtpVerify bool
 	fs.BoolVar(&smtpVerify, "smtp-verify", false, "probe the mail server to confirm each address exists before saving (start only; slower)")
@@ -92,7 +104,25 @@ func parseFlags(cmd string) runFlags {
 			countries = append(countries, tok)
 		}
 	}
-	return runFlags{concurrency: c, seedsFile: s, countries: countries, hops: hops, smtpVerify: smtpVerify}
+	// Detect whether --roles was explicitly provided so callers can distinguish
+	// "user didn't mention roles" (nil → use command default) from "user passed
+	// --roles """ (empty slice → disable filter).
+	var roles []string
+	rolesSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "roles" {
+			rolesSet = true
+		}
+	})
+	if rolesSet {
+		for _, tok := range strings.Split(rolesRaw, ",") {
+			tok = strings.TrimSpace(strings.ToLower(tok))
+			if tok != "" {
+				roles = append(roles, tok)
+			}
+		}
+	}
+	return runFlags{concurrency: c, seedsFile: s, countries: countries, hops: hops, smtpVerify: smtpVerify, roles: roles, rolesSet: rolesSet}
 }
 
 // loadSeedsFile reads a line-separated file of seed URLs.
@@ -134,8 +164,10 @@ Commands:
   pages      Scrape job boards and collect application-page URLs  →  application_pages.txt
   discover   Auto-discover new seed sources and write them to discovered_seeds.txt
   apply      Auto-apply to jobs from a URL list using a headless browser
-  clean      Clean contacts/*.vcf files in-place (filter by regex, deduplicate)
-  purge      Delete all persistent output (contacts, application pages, seeds)
+  clean              Clean contacts/*.vcf files in-place (filter by regex, deduplicate)
+  purge              Delete all persistent output (contacts, application pages, seeds)
+  compact-profiles   Strip Firefox profile caches to reclaim disk space
+  compact-log        Convert verbose apply.log → deduplicated JSONL; browse in TUI (log view)
   version    Print the version
   help       Show this help message
 
@@ -143,6 +175,10 @@ Flags (start, pages, discover):
   -c, --concurrency int   concurrent lookups per domain, 1–%d (default %d)
   -s, --seeds FILE        line-separated file of extra seed URLs to add to the built-in list
       --countries CODES   comma-separated country/region codes to restrict seeds
+      --roles KEYWORDS    comma-separated role/title keywords (pages only).
+                          A job link is followed only when its visible title contains a keyword.
+                          Default: built-in tech list (engineer, developer, data, security, …).
+                          Pass --roles "" to disable filtering and collect all job types.
       --hops int          BFS depth for discover: extra meta-source hops beyond the initial
                           list (default 2, 0 = single-pass; ignored by start/pages)
       --smtp-verify       probe each email's mail server to confirm the address exists before

@@ -38,6 +38,7 @@ func discoverSeeds(f runFlags) {
 	// to avoid re-appending them to the file).
 	existing, _ := readLines(discoveredSeedsFile) // ignore "file not found"
 	knownSeeds := append(scraper.BuiltInSeeds(), existing...)
+	knownSeeds = append(knownSeeds, mustLoadSeeds(f.seedsFile)...)
 
 	d := sources.New(cfg)
 	results, err := d.Run(ctx, knownSeeds)

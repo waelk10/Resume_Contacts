@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/rand"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,8 +22,8 @@ import (
 // submissions — a per-platform cooldown prevents the account from being flagged
 // and applications silently dropped.
 var platformCooldowns = map[string]time.Duration{
-	"ashby":      90 * time.Second,
-	"greenhouse": 30 * time.Second, // baseline; email-verify forces 65 min
+	"ashby":      60 * time.Second,
+	"greenhouse": 20 * time.Second, // baseline; email-verify forces 65 min
 }
 
 // ApplicantInfo holds the personal details typed into application forms.
@@ -271,11 +271,11 @@ func (a *Applicator) Run(ctx context.Context, urls []string) []Result {
 
 	// queue is open (never closed by Run).  Its capacity is len(urls)+conc so
 	// that in-flight re-queues from goroutines never block when workers are busy.
-	// Shuffling the order reduces the chance of hitting the same ATS platform
-	// back-to-back and triggering rate limits or spam filters.
+	// URLs are interleaved by platform/FQDN so that the first N items dequeued
+	// by N workers each come from a different platform, maximising effective
+	// concurrency and minimising immediate re-queues from the inFlight lock.
 	queue := make(chan int, len(urls)+conc)
-	indices := rand.Perm(len(urls))
-	for _, i := range indices {
+	for _, i := range interleavedByPlatform(urls) {
 		queue <- i
 	}
 
@@ -373,6 +373,51 @@ func (a *Applicator) Run(ctx context.Context, urls []string) []Result {
 	return results
 }
 
+// interleavedByPlatform returns indices into urls in a round-robin order over
+// detected platforms/FQDNs.  Generic (non-ATS) URLs are bucketed by hostname
+// so different company sites each get their own slot in the rotation.
+func interleavedByPlatform(urls []string) []int {
+	type entry struct {
+		key     string
+		indices []int
+	}
+	groupMap := make(map[string]*entry)
+	var order []string // preserves first-seen key order for determinism
+
+	for i, u := range urls {
+		p := detectPlatform(u)
+		key := p
+		if p == "generic" {
+			if parsed, err := url.Parse(u); err == nil {
+				key = "generic:" + parsed.Hostname()
+			}
+		}
+		if _, exists := groupMap[key]; !exists {
+			groupMap[key] = &entry{key: key}
+			order = append(order, key)
+		}
+		groupMap[key].indices = append(groupMap[key].indices, i)
+	}
+
+	out := make([]int, 0, len(urls))
+	offsets := make(map[string]int, len(order))
+	for {
+		added := 0
+		for _, k := range order {
+			off := offsets[k]
+			if off < len(groupMap[k].indices) {
+				out = append(out, groupMap[k].indices[off])
+				offsets[k]++
+				added++
+			}
+		}
+		if added == 0 {
+			break
+		}
+	}
+	return out
+}
+
 func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 	res := Result{URL: rawURL}
 
@@ -388,12 +433,31 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 
 	// Prevent two workers from filling forms on the same platform or company
 	// simultaneously — either can trigger rate-limiting / duplicate detection.
-	platformKey := job.ATSPlatform
+	//
+	// For "generic" one-off pages there is no shared platform state, so we
+	// skip the platform key and guard only on the FQDN instead (allowing
+	// parallel fills across different company sites).
+	var platformKey, hostKey string
+	if job.ATSPlatform == "generic" {
+		if u, err2 := url.Parse(rawURL); err2 == nil {
+			hostKey = "host:" + u.Hostname()
+		}
+	} else {
+		platformKey = job.ATSPlatform
+	}
 	companyKey := "co:" + strings.ToLower(strings.TrimSpace(job.Company))
 	acquired := false
 	a.inFlightMu.Lock()
-	if !a.inFlight[platformKey] && (job.Company == "" || !a.inFlight[companyKey]) {
-		a.inFlight[platformKey] = true
+	platformFree := platformKey == "" || !a.inFlight[platformKey]
+	hostFree := hostKey == "" || !a.inFlight[hostKey]
+	companyFree := job.Company == "" || !a.inFlight[companyKey]
+	if platformFree && hostFree && companyFree {
+		if platformKey != "" {
+			a.inFlight[platformKey] = true
+		}
+		if hostKey != "" {
+			a.inFlight[hostKey] = true
+		}
 		if job.Company != "" {
 			a.inFlight[companyKey] = true
 		}
@@ -406,7 +470,12 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 	}
 	defer func() {
 		a.inFlightMu.Lock()
-		delete(a.inFlight, platformKey)
+		if platformKey != "" {
+			delete(a.inFlight, platformKey)
+		}
+		if hostKey != "" {
+			delete(a.inFlight, hostKey)
+		}
 		if job.Company != "" {
 			delete(a.inFlight, companyKey)
 		}
@@ -439,15 +508,18 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 			return Result{URL: rawURL, Status: "pending"}
 		}
 		if errors.Is(err, ErrCaptcha) {
-			// CAPTCHA inside the form means the platform is rate-limiting us.
-			// Force a much longer cooldown so subsequent URLs on the same platform
-			// are not immediately blocked too.
-			const captchaCooldown = 10 * time.Minute
-			a.cooldownMu.Lock()
-			a.lastRun[job.ATSPlatform] = time.Now().Add(captchaCooldown - platformCooldowns[job.ATSPlatform])
-			a.cooldownMu.Unlock()
-			log.Printf("[apply] %s captcha — enforcing %v cooldown before next %s application",
-				job.ATSPlatform, captchaCooldown, job.ATSPlatform)
+			// Generic forms are one-off pages from unrelated companies, so a
+			// cooldown would only penalise unrelated URLs — skip it.
+			if job.ATSPlatform != "generic" {
+				const captchaCooldown = 10 * time.Minute
+				a.cooldownMu.Lock()
+				a.lastRun[job.ATSPlatform] = time.Now().Add(captchaCooldown - platformCooldowns[job.ATSPlatform])
+				a.cooldownMu.Unlock()
+				log.Printf("[apply] %s captcha — enforcing %v cooldown before next %s application",
+					job.ATSPlatform, captchaCooldown, job.ATSPlatform)
+			} else {
+				log.Printf("[apply] captcha on generic form — skipping URL, no cooldown")
+			}
 			res.Status = "error"
 			res.Error = err
 			return res

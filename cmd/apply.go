@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"Resume_Contacts_Scraper/internal/applylog"
 	"Resume_Contacts_Scraper/internal/applier"
 )
 
@@ -112,8 +113,8 @@ All flags:
 	fs.StringVar(&linkedin, "linkedin", "", "LinkedIn profile URL")
 	fs.BoolVar(&dryRun, "dry-run", false, "fill forms but do not click Submit")
 	fs.BoolVar(&hold, "hold", false, "keep each window open until you close it, then move to the next URL (implies --headful)")
-	fs.IntVar(&conc, "concurrency", 1, "parallel browser pages (keep low to avoid detection)")
-	fs.IntVar(&conc, "c", 1, "shorthand for --concurrency")
+	fs.IntVar(&conc, "concurrency", 2, "parallel browser pages (keep ≤ 2 to avoid detection)")
+	fs.IntVar(&conc, "c", 2, "shorthand for --concurrency")
 	fs.BoolVar(&headful, "headful", false, "show the browser window (useful for debugging)")
 	fs.BoolVar(&shots, "screenshots", false, "save a PNG screenshot after filling each form")
 	fs.BoolVar(&tailor, "tailor", false, "use the claude CLI to tailor the resume to each job before uploading")
@@ -195,6 +196,7 @@ All flags:
 	}
 
 	// Set up log file — tee all log output to both stderr and the file.
+	runID := time.Now().Format(time.RFC3339)
 	var logWriter io.Writer = os.Stderr
 	if logFile != "" {
 		lf, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -203,11 +205,20 @@ All flags:
 		} else {
 			defer lf.Close()
 			logWriter = io.MultiWriter(os.Stderr, lf)
-			fmt.Fprintf(lf, "\n=== apply run started %s ===\n", time.Now().Format(time.RFC3339))
+			fmt.Fprintf(lf, "\n=== apply run started %s ===\n", runID)
 		}
 	}
 	log.SetOutput(logWriter)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	// Set up compact structured log (JSONL) alongside the verbose log.
+	var compactWriter *applylog.Writer
+	if cw, err := applylog.NewWriter(defaultCompactLogFile); err != nil {
+		log.Printf("warning: could not open compact log %q: %v", defaultCompactLogFile, err)
+	} else {
+		compactWriter = cw
+		defer compactWriter.Close()
+	}
 
 	urls, err := readLines(urlsFile)
 	if err != nil {
@@ -347,6 +358,22 @@ All flags:
 			line := fmt.Sprintf("[!] %s: %v", r.URL, r.Error)
 			fmt.Println(line)
 			log.Print(line)
+		}
+		if r.Status != "pending" && compactWriter != nil {
+			errStr := ""
+			if r.Error != nil {
+				errStr = r.Error.Error()
+			}
+			_ = compactWriter.Write(applylog.Record{
+				RunID:    runID,
+				TS:       time.Now(),
+				Status:   r.Status,
+				Title:    r.Title,
+				Company:  r.Company,
+				URL:      r.URL,
+				Platform: platformFromURL(r.URL),
+				Error:    errStr,
+			})
 		}
 	}
 	summary := fmt.Sprintf("Done. Applied: %d  Dry-run: %d  Skipped: %d  Errors: %d  Pending: %d",

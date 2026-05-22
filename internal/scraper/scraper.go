@@ -23,7 +23,14 @@ import (
 	"Resume_Contacts_Scraper/internal/extractor"
 )
 
-const maxParallelism = 8
+const (
+	// maxParallelism caps the contact scraper, which crawls arbitrary company
+	// websites and must stay polite.
+	maxParallelism = 8
+	// maxAppScanParallelism caps the app-page scanner, which hits large ATS
+	// platforms that can sustain much higher concurrency.
+	maxAppScanParallelism = 512
+)
 
 // reseedDelay is how long runWeb waits between crawl cycles once the queue drains.
 const reseedDelay = 30 * time.Minute
@@ -40,6 +47,11 @@ type Config struct {
 	MaxBodyBytes   int           // maximum response body bytes read; excess is discarded
 	ExtraSeeds     []string      // additional seed URLs merged with the built-in list
 	Countries      []string      // ISO 3166-1 alpha-2 codes / region aliases to filter built-in seeds; nil = all
+	// Roles, when non-nil, restricts AppScanner to job-application links whose
+	// anchor text contains at least one of the listed keywords (case-insensitive
+	// substring).  Links with absent or generic anchor text are always followed.
+	// nil (default) disables role filtering.
+	Roles []string
 }
 
 // BuiltInSeeds returns the URLs of all built-in seeds regardless of country filter.
@@ -129,6 +141,47 @@ func (c Config) parallelism() int {
 		return maxParallelism
 	}
 	return c.Parallelism
+}
+
+func (c Config) appScanParallelism() int {
+	if c.Parallelism < 1 {
+		return 1
+	}
+	if c.Parallelism > maxAppScanParallelism {
+		return maxAppScanParallelism
+	}
+	return c.Parallelism
+}
+
+// newAppScanTransport returns an http.Transport tuned for high-concurrency
+// bulk ATS crawling: larger idle-connection pool, faster fail-fast timeouts
+// so slow/dead hosts don't hold goroutines for 15–30 s.
+func newAppScanTransport(parallelism int) *http.Transport {
+	perHost := 8
+	if parallelism > 64 {
+		perHost = 16
+	}
+	dialer := &net.Dialer{
+		Timeout:   8 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	return &http.Transport{
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   8 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:          parallelism * 4,
+		MaxIdleConnsPerHost:   perHost,
+		IdleConnTimeout:       90 * time.Second,
+		TLSClientConfig: &tls.Config{
+			CurvePreferences: []tls.CurveID{
+				tls.X25519,
+				tls.CurveP256,
+				tls.CurveP384,
+				tls.CurveP521,
+			},
+		},
+	}
 }
 
 // domainBlocker tracks consecutive per-FQDN failures and blocks a domain once

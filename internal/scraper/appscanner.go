@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,13 +18,20 @@ import (
 // the most widely used ATS platforms.
 var appPageRe = regexp.MustCompile(`(?i)` +
 	`boards\.greenhouse\.io/[^/?#]+/jobs/\d+` +
+	// New Greenhouse format (job-boards.greenhouse.io) and EU instance.
+	`|job-boards\.greenhouse\.io/[^/?#]+/jobs/\d+` +
+	`|boards\.eu\.greenhouse\.io/[^/?#]+/jobs/\d+` +
 	// Lever: job detail page is jobs.lever.co/co/uuid; the apply form is at .../uuid/apply.
+	// Also match apply.lever.co (alternative apply domain used by some companies).
 	`|jobs\.lever\.co/[^/?#]+/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/apply(?:[/?#]|$)` +
+	`|apply\.lever\.co/[^/?#]+/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?:[/?#]|$)` +
 	`|[^./\s]+\.myworkdayjobs\.com/.+/job/.+` +
 	`|[^./\s]+\.icims\.com/jobs/\d+/[^/?#]+/job\b` +
 	`|[^./\s]+\.bamboohr\.com/careers/\d+` +
 	`|[^./\s]+\.taleo\.net/careersection/.+/jobdetail` +
 	`|jobs\.ashbyhq\.com/[^/?#]+/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}` +
+	// Ashby direct application form URL (app.ashbyhq.com/company/posting/uuid).
+	`|app\.ashbyhq\.com/[^/?#]+/posting/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}` +
 	`|apply\.workable\.com/[^/?#]+/j/[A-Z0-9]+` +
 	`|[^./\s]+\.workable\.com/j/[A-Z0-9]+` +
 	`|careers\.smartrecruiters\.com/[^/?#]+/[^/?#]+/\d+` +
@@ -35,22 +41,43 @@ var appPageRe = regexp.MustCompile(`(?i)` +
 	`|[^./\s]+\.jazz\.co/apply/[^/?#]+/[^/?#]+` +
 	`|[^./\s]+\.jobvite\.com/[^/?#]+/job/[^/?#]+` +
 	`|[^./\s]+\.pinpointhq\.com/jobs/[^/?#]+` +
-	`|app\.dover\.com/apply/[^/?#]+/[^/?#]+`,
+	`|app\.dover\.com/apply/[^/?#]+/[^/?#]+` +
+	// Teamtailor: job URLs are company.teamtailor.com/jobs/NNN-slug.
+	`|[^./\s]+\.teamtailor\.com/jobs/\d+-[^/?#]+` +
+	// Comeet: www.comeet.com/jobs/company/hash.
+	`|www\.comeet\.com/jobs/[^/?#]+/[A-Za-z0-9.]+` +
+	// Freshteam (Zoho): company.freshteam.com/jobs/id/apply.
+	`|[^./\s]+\.freshteam\.com/jobs/[^/?#]+/apply` +
+	// Rippling embedded job pages.
+	`|app\.rippling\.com/job-listings/[^/?#]+`,
 )
 
 // atsListingRe matches ATS company-level job-list pages that are worth following
 // to discover individual application-page links underneath them.
 var atsListingRe = regexp.MustCompile(`(?i)` +
 	`boards\.greenhouse\.io/[^/?#]+(?:[/?#]|$)` +
+	`|job-boards\.greenhouse\.io/[^/?#]+(?:[/?#]|$)` +
+	`|boards\.eu\.greenhouse\.io/[^/?#]+(?:[/?#]|$)` +
 	`|jobs\.lever\.co/[^/?#]+(?:[/?#]|$)` +
+	// Lever job-detail page (not yet /apply) — follow to reach the apply form.
+	`|jobs\.lever\.co/[^/?#]+/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?:[/?#]|$)` +
 	`|jobs\.ashbyhq\.com/[^/?#]+(?:[/?#]|$)` +
 	`|[^./\s]+\.myworkdayjobs\.com/[^/?#]+(?:[/?#]|$)` +
 	`|[^./\s]+\.recruitee\.com/?(?:[/?#]|$)` +
 	`|careers\.smartrecruiters\.com/[^/?#]+(?:[/?#]|$)` +
 	`|apply\.workable\.com/[^/?#]+(?:[/?#]|$)` +
+	`|[^./\s]+\.workable\.com/?(?:[/?#]|$)` +
 	`|[^./\s]+\.bamboohr\.com/careers/?(?:[/?#]|$)` +
 	`|[^./\s]+\.breezy\.hr/?(?:[/?#]|$)` +
-	`|[^./\s]+\.pinpointhq\.com/jobs/?(?:[/?#]|$)`,
+	`|[^./\s]+\.pinpointhq\.com/jobs/?(?:[/?#]|$)` +
+	`|[^./\s]+\.teamtailor\.com/jobs/?(?:[/?#]|$)` +
+	`|www\.comeet\.com/jobs/[^/?#]+(?:[/?#]|$)` +
+	`|[^./\s]+\.freshteam\.com/jobs/?(?:[/?#]|$)` +
+	`|app\.rippling\.com/job-listings/?(?:[/?#]|$)` +
+	`|app\.dover\.com/jobs/[^/?#]+(?:[/?#]|$)` +
+	`|[^./\s]+\.jazz\.co/[^/?#]+(?:[/?#]|$)` +
+	`|[^./\s]+\.jobvite\.com/[^/?#]+/jobs(?:[/?#]|$)` +
+	`|[^./\s]+\.jobs\.personio\.(?:de|com)/?(?:[/?#]|$)`,
 )
 
 // applyTextRe matches the visible text of typical "Apply" call-to-action buttons
@@ -64,7 +91,7 @@ var applyTextRe = regexp.MustCompile(`(?i)^\s*(?:` +
 	`)\s*$`)
 
 // atsDomainRe matches hostnames of the ATS platforms we track.
-var atsDomainRe = regexp.MustCompile(`(?i)greenhouse\.io|lever\.co|myworkdayjobs\.com|icims\.com|bamboohr\.com|taleo\.net|ashbyhq\.com|workable\.com|smartrecruiters\.com|breezy\.hr|personio\.|recruitee\.com|jazz\.co|jobvite\.com|pinpointhq\.com|dover\.com`)
+var atsDomainRe = regexp.MustCompile(`(?i)greenhouse\.io|lever\.co|myworkdayjobs\.com|icims\.com|bamboohr\.com|taleo\.net|ashbyhq\.com|workable\.com|smartrecruiters\.com|breezy\.hr|personio\.|recruitee\.com|jazz\.co|jobvite\.com|pinpointhq\.com|dover\.com|teamtailor\.com|comeet\.com|freshteam\.com|rippling\.com`)
 
 func isATSDomain(host string) bool {
 	return atsDomainRe.MatchString(strings.ToLower(host))
@@ -109,28 +136,45 @@ type pendingItem struct {
 
 // domainRateLimit tracks per-domain 429 backoffs.  Each consecutive 429 on the
 // same domain doubles the cooldown (starting at 30 s, capped at 10 min).
+// After rlMaxStrikes rounds at max backoff the domain is considered exhausted
+// and should be permanently blocked by the caller.
 type domainRateLimit struct {
 	mu        sync.Mutex
 	releaseAt map[string]time.Time
 	backoff   map[string]time.Duration
+	strikes   map[string]int // consecutive rounds that hit rlMaxBackoff
 }
 
 func newDomainRateLimit() *domainRateLimit {
 	return &domainRateLimit{
 		releaseAt: make(map[string]time.Time),
 		backoff:   make(map[string]time.Duration),
+		strikes:   make(map[string]int),
 	}
 }
 
 const (
 	rlInitialBackoff = 30 * time.Second
 	rlMaxBackoff     = 10 * time.Minute
+	rlMaxStrikes     = 3 // block permanently after this many max-backoff rounds
 )
 
-// record marks domain as rate-limited and returns the earliest retry time.
-func (r *domainRateLimit) record(domain string) time.Time {
+// tryRecord marks domain as rate-limited and returns (retryAt, true) if the
+// domain was not already in a cooldown window.  When concurrent in-flight
+// requests all return a 429 at the same time, only the first call records and
+// doubles the backoff; subsequent calls return (zero, false) so callers skip
+// the log line and leave the already-set cooldown intact.  This prevents the
+// backoff from compounding (30s→60s→120s→240s) just because colly had several
+// parallel requests in-flight when the block was detected.
+// When the doubled backoff would exceed rlMaxBackoff the strike counter is
+// incremented; callers should call isExhausted() and permanently block the
+// domain once the counter reaches rlMaxStrikes.
+func (r *domainRateLimit) tryRecord(domain string) (time.Time, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if t, ok := r.releaseAt[domain]; ok && time.Now().Before(t) {
+		return time.Time{}, false
+	}
 	b := r.backoff[domain]
 	if b == 0 {
 		b = rlInitialBackoff
@@ -138,12 +182,21 @@ func (r *domainRateLimit) record(domain string) time.Time {
 		b *= 2
 		if b > rlMaxBackoff {
 			b = rlMaxBackoff
+			r.strikes[domain]++
 		}
 	}
 	r.backoff[domain] = b
 	t := time.Now().Add(b)
 	r.releaseAt[domain] = t
-	return t
+	return t, true
+}
+
+// isExhausted reports whether domain has hit the max backoff too many times
+// in a row and should be permanently blocked rather than retried.
+func (r *domainRateLimit) isExhausted(domain string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.strikes[domain] >= rlMaxStrikes
 }
 
 // isReady reports whether domain has no active rate-limit cooldown.
@@ -173,8 +226,9 @@ func NewAppScanner(cfg Config, onURL func(string)) *AppScanner {
 }
 
 // Run starts the crawl and blocks until all seeds — including any URLs that
-// were deferred due to per-domain rate-limit (429) cooldowns — are exhausted.
-func (s *AppScanner) Run() error {
+// were deferred due to per-domain rate-limit (429) cooldowns — are exhausted,
+// or until ctx is cancelled (e.g. Ctrl+C).
+func (s *AppScanner) Run(ctx context.Context) error {
 	blocker := newDomainBlocker(3)
 	rl := newDomainRateLimit()
 
@@ -189,23 +243,76 @@ func (s *AppScanner) Run() error {
 		deferMu.Unlock()
 	}
 
+	par := s.cfg.appScanParallelism()
+
+	// visitedURLs replaces colly's built-in visited-URL deduplication.
+	// We disable colly's tracking (AllowURLRevisit) so that a URL that was
+	// deferred due to a rate-limit can be re-queued in the retry round without
+	// colly rejecting it as already-visited.  Our OnRequest hook uses
+	// LoadOrStore to enforce the same once-only guarantee and deletes the entry
+	// whenever a URL is sent to deferred so the retry round can re-mark it.
+	var visitedURLs sync.Map
+
 	c := colly.NewCollector(
 		// +2 so the path board(0)→listing(1)→job-detail(2)→apply-form(3) fits within the limit,
 		// with one extra hop for boards that interpose an intermediate redirect page.
 		colly.MaxDepth(s.cfg.MaxDepth+2),
 		colly.Async(true),
 		colly.MaxBodySize(s.cfg.MaxBodyBytes),
+		colly.AllowURLRevisit(), // deduplication handled by visitedURLs
 	)
-	c.WithTransport(newTransport())
-	c.SetRequestTimeout(s.cfg.RequestTimeout)
+	c.WithTransport(&ctxTransport{base: newAppScanTransport(par), ctx: ctx})
+	// Shorter timeout: slow ATS hosts shouldn't park a goroutine for 30 s.
+	c.SetRequestTimeout(15 * time.Second)
 	extensions.RandomUserAgent(c)
+	// ATS platforms are large, well-resourced services; limit to 4 concurrent
+	// requests per ATS domain to avoid triggering their bot-detection while
+	// still being fast overall.
+	if err := c.Limit(&colly.LimitRule{
+		DomainRegexp: atsDomainRe.String(),
+		Parallelism:  4,
+		RandomDelay:  400 * time.Millisecond,
+	}); err != nil {
+		log.Printf("[app] ATS rate limit setup: %v", err)
+	}
+	// General job boards and everything else: use the full requested concurrency.
 	if err := c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
-		Parallelism: s.cfg.parallelism(),
-		RandomDelay: s.cfg.Delay,
+		Parallelism: par,
+		RandomDelay: 600 * time.Millisecond,
 	}); err != nil {
 		log.Printf("[app] rate limit setup: %v", err)
 	}
+
+	// OnRequest fires immediately before each HTTP dispatch — the last point at
+	// which we can cheaply abort a request without paying network RTT.  This is
+	// the primary synchronisation point: as soon as any worker records a
+	// rate-limit or block on a domain, every subsequent goroutine that would
+	// dispatch to that same FQDN is intercepted here and diverted to deferred.
+	c.OnRequest(func(r *colly.Request) {
+		host := r.URL.Hostname()
+		rawURL := r.URL.String()
+
+		// Permanently blocked domains: abort without any retry.
+		if blocker.isBlocked(host) {
+			r.Abort()
+			return
+		}
+
+		// Rate-limited domain: defer for retry and abort immediately.
+		// Delete from visitedURLs so the retry round can re-mark and re-dispatch.
+		if !rl.isReady(host) {
+			visitedURLs.Delete(rawURL)
+			addDeferred(rawURL, host)
+			r.Abort()
+			return
+		}
+
+		// Deduplication: abort if another goroutine already dispatched this URL.
+		if _, loaded := visitedURLs.LoadOrStore(rawURL, struct{}{}); loaded {
+			r.Abort()
+		}
+	})
 
 	// Emit application-page URLs only on a clean 2xx response.
 	// URLs that return 404 or any other error are silently discarded.
@@ -243,8 +350,17 @@ func (s *AppScanner) Run() error {
 			return
 		}
 
-		// Domain is currently rate-limited — defer instead of visiting now.
-		// The URL will be retried once the cooldown expires.
+		// Role filter: applied only to individual application-page links.
+		// Listing pages (isFollowable) are always crawled — they may contain
+		// tech roles we cannot see until we fetch them.  Apply-CTA buttons sit
+		// on pages we are already visiting, so filtering them would be too late.
+		if isApp && !s.passesRoleFilter(strings.TrimSpace(el.Text)) {
+			return
+		}
+
+		// Fast path: if the domain is already in cooldown, defer without even
+		// queuing the URL in colly.  OnRequest is the authoritative check for
+		// URLs that slip through here while the rate-limit is being recorded.
 		if !rl.isReady(host) {
 			addDeferred(abs, host)
 			return
@@ -254,23 +370,56 @@ func (s *AppScanner) Run() error {
 	})
 
 	c.OnError(func(r *colly.Response, err error) {
+		// Requests cancelled via ctxTransport (Ctrl+C or deadline) are not
+		// domain faults — skip all error handling to avoid penalising domains.
+		if ctx.Err() != nil {
+			return
+		}
 		host := r.Request.URL.Hostname()
+		rawURL := r.Request.URL.String()
 		switch r.StatusCode {
 		case http.StatusNotFound:
 			// A 404 means the listing was removed — don't penalise the domain.
 			log.Printf("[app] %s: 404 not found (skipped)", r.Request.URL)
-		case http.StatusTooManyRequests:
-			// Record the cooldown and defer the URL for retry; do NOT count
-			// this as a blocker failure — the domain is healthy, just busy.
-			retryAt := rl.record(host)
-			log.Printf("[app] %s: rate-limited (429) — retry after %s",
-				host, retryAt.Format("15:04:05"))
-			addDeferred(r.Request.URL.String(), host)
+		case http.StatusTooManyRequests,
+			http.StatusForbidden,
+			http.StatusUnauthorized,
+			http.StatusServiceUnavailable,
+			http.StatusBadGateway,
+			http.StatusGatewayTimeout:
+			// Any "go away" response: back off per-FQDN and defer for retry.
+			// Do NOT count against the permanent blocker — the domain is reachable.
+			// Use tryRecord so that concurrent in-flight requests returning the same
+			// status code don't each double the backoff (only the first wins).
+			if retryAt, fresh := rl.tryRecord(host); fresh {
+				log.Printf("[app] %s: blocked (%d) — retry after %s",
+					host, r.StatusCode, retryAt.Format("15:04:05"))
+				if rl.isExhausted(host) {
+					log.Printf("[app] %s: rate-limit exhausted after %d rounds — dropping domain",
+						host, rlMaxStrikes)
+					blocker.blockNow(host)
+					return
+				}
+			}
+			// Allow this URL to be re-dispatched in the retry round.
+			visitedURLs.Delete(rawURL)
+			addDeferred(rawURL, host)
 		default:
-			if err != nil && strings.Contains(err.Error(), "tls:") {
+			switch {
+			case err != nil && strings.Contains(err.Error(), "tls:"):
 				log.Printf("[app] %s: TLS error — skipping domain: %v", host, err)
 				blocker.blockNow(host)
-			} else {
+			case isNetworkTimeout(err):
+				// Timeout with no HTTP response (dial, response-header, or
+				// context deadline): the server is overloaded or throttling us.
+				// Treat identically to a 429 — back off and retry.
+				if retryAt, fresh := rl.tryRecord(host); fresh {
+					log.Printf("[app] %s: timeout — retry after %s",
+						host, retryAt.Format("15:04:05"))
+				}
+				visitedURLs.Delete(rawURL)
+				addDeferred(rawURL, host)
+			default:
 				log.Printf("[app] %s: %v", r.Request.URL, err)
 				blocker.recordFailure(host)
 			}
@@ -281,8 +430,8 @@ func (s *AppScanner) Run() error {
 	// threads before starting the main colly crawl so they are included in the
 	// same pass.  These calls are synchronous; any URLs they find are already in
 	// colly's queue when c.Wait() is called below.
-	s.seedFromReddit(c, blocker)
-	s.seedFromLobsters(c, blocker)
+	s.seedFromReddit(ctx, c, blocker)
+	s.seedFromLobsters(ctx, c, blocker)
 
 	allSeeds := s.cfg.buildSeeds()
 	// Append app-scanner-specific seeds (not used by the contact scraper).
@@ -301,17 +450,19 @@ func (s *AppScanner) Run() error {
 	}
 	c.Wait()
 
-	// Retry loop: drain deferred URLs in rounds.  Each round waits for each
-	// domain's cooldown to expire before re-submitting, mirroring the
-	// applicator's per-platform cooldown queue.  New 429s during a retry pass
-	// re-populate deferred, so we loop until it stabilises at empty.
+	// Retry loop: drain deferred URLs in rounds.  New 429s during a retry pass
+	// re-populate deferred, so we loop until it stabilises at empty or ctx is
+	// cancelled.  Each round spawns one goroutine per rate-limited domain;
+	// each goroutine sleeps (ctx-interruptible) until its own cooldown expires,
+	// then dispatches its URLs in bulk.  Total wait equals the longest single
+	// cooldown, not the sum of all cooldowns.
 	for {
 		deferMu.Lock()
 		batch := deferred
 		deferred = nil
 		deferMu.Unlock()
 
-		if len(batch) == 0 {
+		if len(batch) == 0 || ctx.Err() != nil {
 			break
 		}
 
@@ -326,27 +477,39 @@ func (s *AppScanner) Run() error {
 		}
 		batch = unique
 
-		log.Printf("[app] retrying %d rate-limited URL(s)", len(batch))
-
-		// Sort by cooldown expiry: shortest-wait domains first.  This lets
-		// colly start crawling whichever domain unblocks earliest while we
-		// wait for longer cooldowns — maximising throughput.
-		sort.Slice(batch, func(i, j int) bool {
-			return rl.readyAt(batch[i].domain).Before(rl.readyAt(batch[j].domain))
-		})
-
+		// Group non-blocked URLs by domain for parallel dispatch.
+		domainURLs := make(map[string][]string)
 		for _, item := range batch {
-			if blocker.isBlocked(item.domain) {
-				continue
+			if !blocker.isBlocked(item.domain) {
+				domainURLs[item.domain] = append(domainURLs[item.domain], item.rawURL)
 			}
-			if readyAt := rl.readyAt(item.domain); time.Now().Before(readyAt) {
-				wait := time.Until(readyAt)
-				log.Printf("[app] [%s] cooldown — waiting %.0fs before retry",
-					item.domain, wait.Seconds())
-				time.Sleep(wait)
-			}
-			_ = c.Visit(item.rawURL)
 		}
+		log.Printf("[app] retrying %d rate-limited URL(s) across %d domain(s)",
+			len(batch), len(domainURLs))
+
+		var dispatchWg sync.WaitGroup
+		for domain, urls := range domainURLs {
+			dispatchWg.Add(1)
+			go func(domain string, urls []string) {
+				defer dispatchWg.Done()
+				if readyAt := rl.readyAt(domain); time.Now().Before(readyAt) {
+					log.Printf("[app] [%s] cooldown %.0fs — dispatching %d URL(s) when ready",
+						domain, time.Until(readyAt).Seconds(), len(urls))
+					select {
+					case <-time.After(time.Until(readyAt)):
+					case <-ctx.Done():
+						return
+					}
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				for _, u := range urls {
+					_ = c.Visit(u)
+				}
+			}(domain, urls)
+		}
+		dispatchWg.Wait()
 		c.Wait()
 	}
 
@@ -375,9 +538,8 @@ func extractAppURLsFromText(text string) []string {
 // redditSubreddits, extracts ATS application-page URLs from their titles and
 // self-text, and queues them for visiting via c.  Called once at the start of
 // Run() so the URLs are included in the same colly crawl as the built-in seeds.
-func (s *AppScanner) seedFromReddit(c *colly.Collector, blocker *domainBlocker) {
+func (s *AppScanner) seedFromReddit(ctx context.Context, c *colly.Collector, blocker *domainBlocker) {
 	client := &http.Client{Timeout: s.cfg.RequestTimeout, Transport: newTransport()}
-	ctx := context.Background()
 
 	for _, sub := range redditSubreddits {
 		listing, err := redditFetchListing(ctx, client, sub)
@@ -408,9 +570,8 @@ func (s *AppScanner) seedFromReddit(c *colly.Collector, blocker *domainBlocker) 
 // seedFromLobsters fetches stories tagged "hiring" on lobste.rs, extracts ATS
 // application-page URLs from story descriptions and all comment bodies, and
 // queues them via c.  Mirrors the Lobste.rs integration in the contact scraper.
-func (s *AppScanner) seedFromLobsters(c *colly.Collector, blocker *domainBlocker) {
+func (s *AppScanner) seedFromLobsters(ctx context.Context, c *colly.Collector, blocker *domainBlocker) {
 	client := &http.Client{Timeout: s.cfg.RequestTimeout, Transport: newTransport()}
-	ctx := context.Background()
 
 	stubs, err := lobstersFetchTag(ctx, client, "hiring")
 	if err != nil {
@@ -432,6 +593,48 @@ func (s *AppScanner) seedFromLobsters(c *colly.Collector, blocker *domainBlocker
 	if total > 0 {
 		log.Printf("[app/lobsters] queued %d application-page URL(s)", total)
 	}
+}
+
+// passesRoleFilter returns true when the job link is allowed through the role
+// filter configured on the scanner.  It uses anchorText (the visible link label
+// on the listing page — typically the job title) as the primary signal.
+//
+// Filtering is skipped and the link is allowed through when:
+//   - no Roles are configured (nil / empty)
+//   - the text is blank or matches the generic Apply-CTA pattern
+//   - the text is longer than 120 characters (looks like a nav block, not a title)
+//
+// In those cases we have no reliable role signal, so we pass through rather
+// than risk silently dropping legitimate tech listings.
+func (s *AppScanner) passesRoleFilter(anchorText string) bool {
+	if len(s.cfg.Roles) == 0 {
+		return true
+	}
+	if anchorText == "" || len(anchorText) > 120 || applyTextRe.MatchString(anchorText) {
+		return true
+	}
+	low := strings.ToLower(anchorText)
+	for _, role := range s.cfg.Roles {
+		if strings.Contains(low, role) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNetworkTimeout reports whether err is a transient network timeout with no
+// HTTP status code: response-header timeout, dial timeout, or context deadline.
+// These share the same recovery path as a 429 — back off and retry.
+// TLS errors must be checked before this function is called; a TLS handshake
+// failure that also happens to time out will contain "tls:" and be caught first.
+func isNetworkTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "timeout") ||
+		strings.Contains(s, "deadline exceeded") ||
+		strings.Contains(s, "timed out")
 }
 
 func queueAppURLsFromText(c *colly.Collector, blocker *domainBlocker, text string) int {
@@ -461,10 +664,135 @@ func queueAppURLsFromComments(c *colly.Collector, blocker *domainBlocker, commen
 // appScanSeeds are built-in seeds specific to the application-page scanner.
 // They are not included in the general contact scraper's seed list.
 var appScanSeeds = []taggedSeed{
+	// ── Germany ──────────────────────────────────────────────────────────────
 	// German Federal Employment Agency — Nuremberg/Mittelfranken, 25 km radius,
 	// IT and industrial sectors (branche=3;11).
 	{
 		URL:       "https://www.arbeitsagentur.de/jobsuche/suche?angebotsart=1&wo=N%C3%BCrnberg,%20Mittelfranken&umkreis=25&branche=3;11",
 		Countries: []string{"de"},
 	},
+
+	// ── Global / Remote ───────────────────────────────────────────────────────
+	{URL: "https://www.ycombinator.com/jobs", Countries: []string{"global"}},
+	{URL: "https://arc.dev/remote-jobs", Countries: []string{"global"}},
+	{URL: "https://himalayas.app/jobs", Countries: []string{"global"}},
+	{URL: "https://4dayweek.io/jobs", Countries: []string{"global"}},
+	{URL: "https://remote.co/remote-jobs/developer/", Countries: []string{"global"}},
+	{URL: "https://wfh.io/jobs", Countries: []string{"global"}},
+	{URL: "https://justremote.co/remote-developer-jobs", Countries: []string{"global"}},
+	{URL: "https://authenticjobs.com/", Countries: []string{"global"}},
+	{URL: "https://remoteok.com/remote-dev-jobs", Countries: []string{"global"}},
+	{URL: "https://jobspresso.co/remote-work/", Countries: []string{"global"}},
+	{URL: "https://nodesk.co/remote-jobs/engineering/", Countries: []string{"global"}},
+	{URL: "https://remoteleaf.com/", Countries: []string{"global"}},
+	{URL: "https://europeremotely.com/", Countries: []string{"global"}},
+	{URL: "https://remotefrontendjobs.com/", Countries: []string{"global"}},
+	{URL: "https://whoishiring.io/", Countries: []string{"global"}},
+	{URL: "https://www.workatastartup.com/jobs", Countries: []string{"global"}},
+	{URL: "https://angel.co/jobs", Countries: []string{"global"}},
+	{URL: "https://wellfound.com/jobs", Countries: []string{"global"}},
+	{URL: "https://startup.jobs/", Countries: []string{"global"}},
+	{URL: "https://otta.com/jobs", Countries: []string{"global"}},
+
+	// ── United States ─────────────────────────────────────────────────────────
+	{URL: "https://builtin.com/jobs", Countries: []string{"us"}},
+	{URL: "https://builtinnyc.com/jobs", Countries: []string{"us"}},
+	{URL: "https://builtinsf.com/jobs", Countries: []string{"us"}},
+	{URL: "https://builtinboston.com/jobs", Countries: []string{"us"}},
+	{URL: "https://builtinchicago.com/jobs", Countries: []string{"us"}},
+	{URL: "https://builtinaustin.com/jobs", Countries: []string{"us"}},
+	{URL: "https://builtinseattle.com/jobs", Countries: []string{"us"}},
+	{URL: "https://builtinla.com/jobs", Countries: []string{"us"}},
+	{URL: "https://www.dice.com/jobs?q=software+engineer", Countries: []string{"us"}},
+	{URL: "https://levels.fyi/jobs/", Countries: []string{"us"}},
+	{URL: "https://devit.org/jobs", Countries: []string{"us"}},
+	{URL: "https://www.idealist.org/en/jobs?q=software", Countries: []string{"us"}},
+	{URL: "https://www.simplyhired.com/search?q=software+engineer", Countries: []string{"us"}},
+	{URL: "https://www.glassdoor.com/Job/software-engineer-jobs-SRCH_KO0,17.htm", Countries: []string{"us"}},
+	{URL: "https://www.indeed.com/jobs?q=software+engineer&sc.keyword=software+engineer", Countries: []string{"us"}},
+	{URL: "https://jobs.github.com/positions?description=software+engineer", Countries: []string{"us"}},
+	{URL: "https://stackoverflow.com/jobs?q=software+engineer", Countries: []string{"us"}},
+	{URL: "https://www.hired.com/jobs/software-engineer", Countries: []string{"us"}},
+	{URL: "https://triplebyte.com/jobs", Countries: []string{"us"}},
+
+	// ── United Kingdom ────────────────────────────────────────────────────────
+	{URL: "https://cord.co/jobs", Countries: []string{"gb"}},
+	{URL: "https://www.technojobs.co.uk/", Countries: []string{"gb"}},
+	{URL: "https://www.cwjobs.co.uk/jobs/software-developer", Countries: []string{"gb"}},
+	{URL: "https://www.jobserve.com/gb/en/IT-Jobs", Countries: []string{"gb"}},
+	{URL: "https://www.efinancialcareers.co.uk/jobs/information-technology", Countries: []string{"gb"}},
+
+	// ── European Union (pan-EU) ───────────────────────────────────────────────
+	{URL: "https://arbeitnow.com/", Countries: []string{"eu"}},
+	{URL: "https://euremotejobs.com/", Countries: []string{"eu"}},
+	{URL: "https://jobs.techeu.com/jobs", Countries: []string{"eu"}},
+	{URL: "https://techjobs.eu/", Countries: []string{"eu"}},
+	{URL: "https://remoteurope.eu/jobs/", Countries: []string{"eu"}},
+	{URL: "https://talent.io/p/en-gb/jobs", Countries: []string{"eu"}},
+	{URL: "https://join.com/jobs", Countries: []string{"eu"}},
+	{URL: "https://techloop.io/jobs", Countries: []string{"eu"}},
+	{URL: "https://sifted.eu/jobs", Countries: []string{"eu"}},
+	{URL: "https://www.jobgether.com/en/jobs", Countries: []string{"eu"}},
+	{URL: "https://www.jobteaser.com/en/job-offers?contract_type=permanent", Countries: []string{"eu"}},
+	{URL: "https://relocate.me/jobs", Countries: []string{"eu"}},
+	{URL: "https://otta.com/jobs", Countries: []string{"eu"}},
+
+	// ── Germany (EU) ─────────────────────────────────────────────────────────
+	{URL: "https://www.xing.com/jobs/search?keywords=software+developer", Countries: []string{"de"}},
+	{URL: "https://www.it-talents.de/stellenangebote", Countries: []string{"de"}},
+	{URL: "https://www.entwickler.de/jobs", Countries: []string{"de"}},
+	{URL: "https://www.stepstone.de/jobs/en", Countries: []string{"de"}},
+
+	// ── Poland (EU) ──────────────────────────────────────────────────────────
+	{URL: "https://bulldogjob.pl/companies/jobs", Countries: []string{"pl"}},
+	{URL: "https://solid.jobs/offers/it", Countries: []string{"pl"}},
+	{URL: "https://nofluffjobs.com/pl", Countries: []string{"pl"}},
+
+	// ── Romania (EU) ─────────────────────────────────────────────────────────
+	{URL: "https://www.hipo.ro/locuri-de-munca/it", Countries: []string{"ro"}},
+	{URL: "https://www.ejobs.ro/locuri-de-munca/it", Countries: []string{"ro"}},
+
+	// ── Czech Republic (EU) ──────────────────────────────────────────────────
+	{URL: "https://techloop.io/jobs?country=cz", Countries: []string{"cz"}},
+	{URL: "https://www.startupjobs.cz", Countries: []string{"cz"}},
+
+	// ── France (EU) ──────────────────────────────────────────────────────────
+	{URL: "https://www.welcometothejungle.com/en/jobs", Countries: []string{"fr"}},
+	{URL: "https://www.talent.io/p/fr-fr/jobs", Countries: []string{"fr"}},
+
+	// ── Netherlands (EU) ─────────────────────────────────────────────────────
+	{URL: "https://www.intermediair.nl/vacatures/ict", Countries: []string{"nl"}},
+	{URL: "https://amsterdamtechjobs.com", Countries: []string{"nl"}},
+
+	// ── Spain (EU) ───────────────────────────────────────────────────────────
+	{URL: "https://www.infojobs.net/ofertas-trabajo/informatica", Countries: []string{"es"}},
+	{URL: "https://www.tecnoempleo.com", Countries: []string{"es"}},
+
+	// ── Israel ────────────────────────────────────────────────────────────────
+	{URL: "https://www.alljobs.co.il/", Countries: []string{"il"}},
+	{URL: "https://www.drushim.co.il/", Countries: []string{"il"}},
+	{URL: "https://www.jobmaster.co.il/", Countries: []string{"il"}},
+	{URL: "https://www.gotfriends.co.il/jobs/", Countries: []string{"il"}},
+	{URL: "https://www.comeet.com/jobs/search?country=Israel", Countries: []string{"il"}},
+	{URL: "https://www.linkedin.com/jobs/search/?location=Israel&f_T=software-engineer", Countries: []string{"il"}},
+	{URL: "https://www.startupnation.com/jobs/", Countries: []string{"il"}},
+	{URL: "https://www.jobnet.co.il/", Countries: []string{"il"}},
+	{URL: "https://www.smartr.me/", Countries: []string{"il"}},
+
+	// ── Australia / New Zealand ───────────────────────────────────────────────
+	{URL: "https://www.seek.com.au/software-engineer-jobs", Countries: []string{"au"}},
+	{URL: "https://www.careerone.com.au/jobs?q=software+engineer", Countries: []string{"au"}},
+	{URL: "https://au.indeed.com/jobs?q=software+engineer", Countries: []string{"au"}},
+	{URL: "https://www.trademe.co.nz/a/jobs/computing", Countries: []string{"nz"}},
+
+	// ── Singapore / APAC ─────────────────────────────────────────────────────
+	{URL: "https://www.mycareersfuture.gov.sg/search?search=software+engineer", Countries: []string{"sg"}},
+	{URL: "https://sg.indeed.com/jobs?q=software+engineer", Countries: []string{"sg"}},
+	{URL: "https://www.techinasia.com/jobs", Countries: []string{"sg"}},
+	{URL: "https://glints.com/sg/opportunities/jobs/explore", Countries: []string{"sg"}},
+
+	// ── Canada ────────────────────────────────────────────────────────────────
+	{URL: "https://ca.indeed.com/jobs?q=software+engineer", Countries: []string{"ca"}},
+	{URL: "https://www.eluta.ca/jobs-for-software-engineer", Countries: []string{"ca"}},
+	{URL: "https://jobs.jobillico.com/en/search-jobs?q=software+engineer", Countries: []string{"ca"}},
 }

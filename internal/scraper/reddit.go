@@ -25,7 +25,14 @@ const (
 // redditSubreddits lists the subreddits scanned for job-posting emails.
 // All three are dedicated hiring boards where post bodies routinely carry
 // company contact addresses.
-var redditSubreddits = []string{"forhire", "remotework", "hiring"}
+var redditSubreddits = []string{
+	"forhire",
+	"remotework",
+	"hiring",
+	"devops_jobs",
+	"remotejs",
+	"cscareerquestionseu",
+}
 
 type redditListing struct {
 	Data struct {

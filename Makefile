@@ -23,6 +23,7 @@ build:
 linux:
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
 		$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN_LINUX) .
+	ln -sf $(BIN_LINUX) $(BINARY)
 
 .PHONY: windows
 windows:

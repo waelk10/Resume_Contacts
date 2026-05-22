@@ -1,12 +1,16 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"Resume_Contacts_Scraper/internal/applylog"
 )
 
 func runTUI() {
@@ -58,7 +62,7 @@ func runTUI() {
 	pgConc := st.Pages.Concurrency
 	pgSeeds := st.Pages.Seeds
 	pgCountries := st.Pages.Countries
-	pgSMTP := st.Pages.SMTPVerify
+	pgRoles := st.Pages.Roles
 
 	// discover
 	discConc := st.Discover.Concurrency
@@ -112,7 +116,7 @@ func runTUI() {
 	snapshot := func() tuiSavedState {
 		return tuiSavedState{
 			Start: tuiStartSaved{startConc, startSeeds, startCountries, startSMTP},
-			Pages: tuiPagesSaved{pgConc, pgSeeds, pgCountries, pgSMTP},
+			Pages: tuiPagesSaved{pgConc, pgSeeds, pgCountries, pgRoles},
 			Discover: tuiDiscoverSaved{discConc, discSeeds, discCountries, discHops},
 			Apply: tuiApplySaved{
 				Mode: applyMode, URLsFile: applyURLs, Resume: applyResume,
@@ -155,10 +159,28 @@ func runTUI() {
 			AddInputField("Concurrency", pgConc, 6, acceptInt, func(t string) { pgConc = t }).
 			AddInputField("Seeds file", pgSeeds, 40, nil, func(t string) { pgSeeds = t }).
 			AddInputField("Countries", pgCountries, 40, nil, func(t string) { pgCountries = t }).
-			AddCheckbox("SMTP-verify each address", pgSMTP, func(c bool) { pgSMTP = c }).
+			AddInputField("Role keywords (empty = tech default, * = all)", pgRoles, 60, nil, func(t string) { pgRoles = t }).
 			AddButton("Run", func() {
 				saveTUIState(snapshot())
-				pendingAction = func() { appscan(tuiBuildFlags(pgConc, pgSeeds, pgCountries, 0, pgSMTP)) }
+				pendingAction = func() {
+					flags := tuiBuildFlags(pgConc, pgSeeds, pgCountries, 0, false)
+					// Non-empty field overrides the built-in tech default.
+					// "*" or "all" disables the filter entirely.
+					if pgRoles != "" {
+						flags.rolesSet = true
+						raw := pgRoles
+						if raw != "*" && raw != "all" {
+							for _, tok := range strings.Split(raw, ",") {
+								tok = strings.TrimSpace(strings.ToLower(tok))
+								if tok != "" {
+									flags.roles = append(flags.roles, tok)
+								}
+							}
+						}
+						// else: flags.roles stays nil → no filter
+					}
+					appscan(flags)
+				}
 				app.Stop()
 			})
 		addCmd("pages", f)
@@ -367,11 +389,121 @@ func runTUI() {
 		addCmd("purge", f)
 	}
 
+	// ── log ────────────────────────────────────────────────────────────────
+	var logTable *tview.Table
+	var logStatus *tview.TextView
+	var logRecords []applylog.Record
+	var logFilterStatus string
+	var logFilterText string
+
+	logTable = tview.NewTable().SetFixed(1, 0).SetSelectable(true, false)
+	logStatus = tview.NewTextView().SetDynamicColors(true)
+
+	logRefresh := func() {
+		logTable.Clear()
+		cols := []string{"Date", "Status", "Company", "Title", "Platform"}
+		for i, h := range cols {
+			logTable.SetCell(0, i, tview.NewTableCell(h).
+				SetSelectable(false).
+				SetAttributes(tcell.AttrBold).
+				SetExpansion(1))
+		}
+		row := 1
+		for _, r := range logRecords {
+			if logFilterStatus != "" && r.Status != logFilterStatus {
+				continue
+			}
+			if logFilterText != "" {
+				needle := strings.ToLower(logFilterText)
+				if !strings.Contains(strings.ToLower(r.Company+" "+r.Title+" "+r.URL), needle) {
+					continue
+				}
+			}
+			color := tcell.ColorWhite
+			switch r.Status {
+			case "applied":
+				color = tcell.ColorGreen
+			case "dry-run":
+				color = tcell.ColorAqua
+			case "skipped":
+				color = tcell.ColorGray
+			case "error":
+				color = tcell.ColorRed
+			}
+			date := r.TS.Format("2006-01-02")
+			logTable.SetCell(row, 0, tview.NewTableCell(date).SetTextColor(color))
+			logTable.SetCell(row, 1, tview.NewTableCell(r.Status).SetTextColor(color))
+			logTable.SetCell(row, 2, tview.NewTableCell(r.Company).SetMaxWidth(28).SetTextColor(color))
+			logTable.SetCell(row, 3, tview.NewTableCell(r.Title).SetMaxWidth(35).SetTextColor(color))
+			logTable.SetCell(row, 4, tview.NewTableCell(r.Platform).SetTextColor(color))
+			row++
+		}
+		shown := row - 1
+		logStatus.SetText(fmt.Sprintf(" [yellow]%d[-] / %d records", shown, len(logRecords)))
+	}
+
+	logReload := func() {
+		recs, _ := applylog.ReadAll(defaultCompactLogFile)
+		// Newest first.
+		sort.Slice(recs, func(i, j int) bool {
+			return recs[i].TS.After(recs[j].TS)
+		})
+		logRecords = recs
+		logRefresh()
+	}
+
+	statusOpts := []string{"all", "applied", "dry-run", "skipped", "error"}
+	logFilterForm := tview.NewForm().
+		AddDropDown("Status", statusOpts, 0, func(s string, _ int) {
+			if s == "all" {
+				logFilterStatus = ""
+			} else {
+				logFilterStatus = s
+			}
+			logRefresh()
+		}).
+		AddInputField("Search (company/title/URL)", "", 35, nil, func(t string) {
+			logFilterText = t
+			logRefresh()
+		})
+	logFilterForm.SetBorder(false)
+	logFilterForm.SetCancelFunc(focusList)
+
+	logTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			focusList()
+			return nil
+		}
+		if event.Key() == tcell.KeyTab || event.Key() == tcell.KeyBacktab {
+			app.SetFocus(logFilterForm)
+			return nil
+		}
+		return event
+	})
+
+	logPanel := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(logFilterForm, 5, 0, true).
+		AddItem(logTable, 0, 1, false).
+		AddItem(logStatus, 1, 0, false)
+	logPanel.SetBorder(true).
+		SetTitle(" log ").
+		SetTitleAlign(tview.AlignLeft).
+		SetBorderColor(tcell.ColorDarkCyan)
+
+	cmdList.AddItem("log", "", 0, nil)
+	rightPages.AddPage("log", logPanel, true, false)
+
+	logReload() // initial load
+
 	// Show start by default.
 	rightPages.SwitchToPage("start")
 
 	cmdList.SetChangedFunc(func(_ int, main string, _ string, _ rune) {
 		rightPages.SwitchToPage(main)
+		if main == "log" {
+			logReload()
+			app.SetFocus(logFilterForm)
+		}
 	})
 	cmdList.SetSelectedFunc(func(_ int, main string, _ string, _ rune) {
 		rightPages.SwitchToPage(main)

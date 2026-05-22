@@ -26,7 +26,7 @@ type tuiPagesSaved struct {
 	Concurrency string `json:"concurrency"`
 	Seeds       string `json:"seeds"`
 	Countries   string `json:"countries"`
-	SMTPVerify  bool   `json:"smtp_verify"`
+	Roles       string `json:"roles"` // comma-separated keywords; empty = built-in tech list
 }
 
 type tuiDiscoverSaved struct {
@@ -104,7 +104,6 @@ func tuiDefaultState() tuiSavedState {
 		Pages: tuiPagesSaved{
 			Concurrency: "16",
 			Countries:   "de,il,us,ca,uk,pt,cz,at",
-			SMTPVerify:  true,
 		},
 		Discover: tuiDiscoverSaved{
 			Concurrency: "40",
