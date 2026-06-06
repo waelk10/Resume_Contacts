@@ -21,14 +21,24 @@ import (
 // All are plain text / HTML served without JavaScript, making them reliable
 // even without a headless browser.
 var DefaultMetaSources = []string{
+	// Curated awesome-lists (raw Markdown → absolute URLs, most reliable)
 	"https://raw.githubusercontent.com/tramcar/awesome-job-boards/master/README.md",
 	"https://raw.githubusercontent.com/lukasz-madon/awesome-remote-job/master/README.md",
 	"https://raw.githubusercontent.com/remoteintech/remote-jobs/main/README.md",
 	"https://raw.githubusercontent.com/nickytonline/remote-jobs-boards/main/README.md",
 	"https://raw.githubusercontent.com/engineerapart/theremotepath/master/README.md",
-	"https://raw.githubusercontent.com/reHackable/awesome-reMarkable/master/README.md",
+	"https://raw.githubusercontent.com/abdelhai/awesome-jobs/master/README.md",
+	"https://raw.githubusercontent.com/vladhardy/awesome-tech-job-boards/main/README.md",
+	"https://raw.githubusercontent.com/j-delaney/easy-application/master/README.md",
+	"https://raw.githubusercontent.com/poteto/hiring-without-whiteboards/master/README.md",
+	// GitHub topic pages (href-resolved via hrefRe → repo links → raw README hop)
 	"https://github.com/topics/job-board",
 	"https://github.com/topics/remote-jobs",
+	"https://github.com/topics/job-boards",
+	"https://github.com/topics/jobs",
+	"https://github.com/topics/hiring",
+	"https://github.com/topics/remote-work",
+	"https://github.com/topics/awesome-jobs",
 }
 
 // Config controls a discovery run.
@@ -36,8 +46,9 @@ type Config struct {
 	Concurrency    int
 	RequestTimeout time.Duration
 	MetaSources    []string
-	Countries      []string // ISO 3166-1 alpha-2 codes / region aliases; nil = all
-	MaxHops        int      // extra BFS hops beyond the initial meta-source fetch (0 = single-pass)
+	Countries       []string // ISO 3166-1 alpha-2 codes / region aliases; nil = all
+	IgnoreCountries []string // codes / region aliases to exclude from results; nil = nothing excluded
+	MaxHops         int      // extra BFS hops beyond the initial meta-source fetch (0 = single-pass)
 	// Jitter is the upper bound of a random pre-request delay added to each
 	// liveness probe. Zero disables jitter.
 	Jitter time.Duration
@@ -171,6 +182,31 @@ func urlMatchesCountryFilter(rawURL string, filter map[string]bool) bool {
 			}
 		}
 		return true
+	}
+	return false
+}
+
+// urlMatchesIgnoreFilter reports whether rawURL should be excluded given an ignore
+// filter produced by expandFilterCodes.  A URL is excluded when its ccTLD belongs
+// to any ignored country code.
+func urlMatchesIgnoreFilter(rawURL string, ignoreFilter map[string]bool) bool {
+	if len(ignoreFilter) == 0 {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	for country, tlds := range countryTLDs {
+		if !ignoreFilter[country] {
+			continue
+		}
+		for _, tld := range tlds {
+			if strings.HasSuffix(host, tld) {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -509,6 +545,7 @@ func (d *Discoverer) Run(ctx context.Context, existing []string) ([]Result, erro
 	rand.Shuffle(len(unique), func(i, j int) { unique[i], unique[j] = unique[j], unique[i] })
 
 	filter := expandFilterCodes(d.cfg.Countries)
+	ignoreFilter := expandFilterCodes(d.cfg.IgnoreCountries)
 
 	// partialResults returns the deduplicated (but unvalidated) unique set with
 	// the country filter applied. Called on cancellation so the caller always
@@ -516,7 +553,8 @@ func (d *Discoverer) Run(ctx context.Context, existing []string) ([]Result, erro
 	partialResults := func() []Result {
 		var out []Result
 		for _, u := range unique {
-			if len(filter) == 0 || urlMatchesCountryFilter(u.rawURL, filter) {
+			if (len(filter) == 0 || urlMatchesCountryFilter(u.rawURL, filter)) &&
+				!urlMatchesIgnoreFilter(u.rawURL, ignoreFilter) {
 				out = append(out, Result{URL: u.rawURL, Source: u.source})
 			}
 		}
@@ -566,7 +604,8 @@ validLoop:
 
 	var results []Result
 	for r := range resultCh {
-		if len(filter) == 0 || urlMatchesCountryFilter(r.URL, filter) {
+		if (len(filter) == 0 || urlMatchesCountryFilter(r.URL, filter)) &&
+			!urlMatchesIgnoreFilter(r.URL, ignoreFilter) {
 			results = append(results, r)
 		}
 	}
@@ -714,6 +753,10 @@ func (d *Discoverer) fetchSocialCandidates(ctx context.Context) []candidate {
 // urlRe matches http(s) URLs in plain text and Markdown link syntax.
 var urlRe = regexp.MustCompile(`https?://[^\s\)\]>"'<]+`)
 
+// hrefRe extracts href attribute values from HTML, capturing both relative and
+// absolute URLs that urlRe would miss (e.g. all links on GitHub topic pages).
+var hrefRe = regexp.MustCompile(`\bhref=["']([^"'<>\s]+)["']`)
+
 // infraHosts are domains that host meta-source content rather than job boards.
 var infraHosts = []string{
 	"github.com", "raw.githubusercontent.com", "gist.githubusercontent.com",
@@ -729,7 +772,10 @@ var infraHosts = []string{
 var jobBoardKeywords = []string{
 	"job", "career", "hire", "hiring", "recruit", "talent", "work",
 	"employ", "vacancy", "position", "opening", "remote", "startup",
-	"tech", "dev", "engineer", "freelance", "gig", "talent",
+	"tech", "dev", "engineer", "freelance", "gig",
+	// Additional terms that appear in job-board domains/paths but not in the original list.
+	"board", "apply", "hunt", "placement", "listing", "intern", "grad",
+	"opportunity", "staff", "join", "offer", "search", "find", "people",
 }
 
 // extractURLs fetches src and returns:
@@ -772,30 +818,59 @@ func (d *Discoverer) extractURLs(ctx context.Context, src string) (boards, metas
 		return nil, nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
+	// URLs from curated-list pages (e.g. raw GitHub READMEs) often link to job
+	// boards whose domains contain no job-related keyword (indeed.com, monster.com,
+	// glassdoor.com, …). Accept any non-infra URL from those sources.
+	relaxed := host == "raw.githubusercontent.com" || host == "gist.githubusercontent.com"
+
 	lr := io.LimitReader(resp.Body, 4*1024*1024)
 	scanner := bufio.NewScanner(lr)
 	seenBoards := make(map[string]bool)
 	seenMetas := make(map[string]bool)
-	for scanner.Scan() {
-		for _, raw := range urlRe.FindAllString(scanner.Text(), -1) {
-			raw = strings.TrimRight(raw, ".,;:!?)\"'#")
-			p, err := url.Parse(raw)
-			if err != nil || p.Host == "" {
-				continue
-			}
-			// Strip query/fragment to normalise and avoid session noise.
-			p.RawQuery = ""
-			p.Fragment = ""
-			normalised := p.String()
 
-			if looksLikeJobBoard(p) && !seenBoards[p.Host] {
-				seenBoards[p.Host] = true
-				boards = append(boards, normalised)
+	addCandidate := func(raw string) {
+		raw = strings.TrimRight(raw, `.,;:!?)"'#`)
+		p, err := url.Parse(raw)
+		if err != nil {
+			return
+		}
+		// Resolve relative URLs (e.g. href="/user/repo" on GitHub topic pages).
+		if p.Host == "" {
+			p = parsed.ResolveReference(p)
+		}
+		if p.Host == "" || p.Scheme == "" {
+			return
+		}
+		p.RawQuery = ""
+		p.Fragment = ""
+		normalised := p.String()
+
+		isBoard := looksLikeJobBoard(p) || (relaxed && !isInfraHost(p.Host))
+		if isBoard && !seenBoards[p.Host] {
+			seenBoards[p.Host] = true
+			boards = append(boards, normalised)
+		}
+		if looksLikeCuratedList(p) && !seenMetas[normalised] {
+			seenMetas[normalised] = true
+			metas = append(metas, normalised)
+			// For github.com/user/repo meta-sources also queue the raw README so
+			// the next hop reads Markdown directly instead of rendered HTML.
+			if p.Host == "github.com" {
+				if raw := githubRawReadme(p); raw != "" && !seenMetas[raw] {
+					seenMetas[raw] = true
+					metas = append(metas, raw)
+				}
 			}
-			if looksLikeCuratedList(p) && !seenMetas[normalised] {
-				seenMetas[normalised] = true
-				metas = append(metas, normalised)
-			}
+		}
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		for _, raw := range urlRe.FindAllString(line, -1) {
+			addCandidate(raw)
+		}
+		for _, m := range hrefRe.FindAllStringSubmatch(line, -1) {
+			addCandidate(m[1])
 		}
 	}
 	return boards, metas, scanner.Err()
@@ -868,16 +943,35 @@ func looksLikeCuratedList(u *url.URL) bool {
 	return false
 }
 
-// looksLikeJobBoard returns true when the URL host or path suggests a job-related site.
-func looksLikeJobBoard(u *url.URL) bool {
-	host := strings.ToLower(u.Host)
-	path := strings.ToLower(u.Path)
+// isInfraHost reports whether host is a known infrastructure domain (version
+// control, social, CDN, badge, …) rather than a job board.
+func isInfraHost(host string) bool {
+	host = strings.ToLower(host)
 	for _, infra := range infraHosts {
-		if strings.HasSuffix(host, infra) {
-			return false
+		if host == infra || strings.HasSuffix(host, "."+infra) {
+			return true
 		}
 	}
-	combined := host + path
+	return false
+}
+
+// githubRawReadme converts a github.com/user/repo URL to the raw README URL so
+// the BFS can read the Markdown content directly instead of rendered HTML.
+// Returns "" for anything that isn't a two-segment repo path.
+func githubRawReadme(u *url.URL) string {
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return "https://raw.githubusercontent.com/" + parts[0] + "/" + parts[1] + "/HEAD/README.md"
+}
+
+// looksLikeJobBoard returns true when the URL host or path suggests a job-related site.
+func looksLikeJobBoard(u *url.URL) bool {
+	if isInfraHost(u.Host) {
+		return false
+	}
+	combined := strings.ToLower(u.Host) + strings.ToLower(u.Path)
 	for _, kw := range jobBoardKeywords {
 		if strings.Contains(combined, kw) {
 			return true
@@ -1007,13 +1101,12 @@ func (d *Discoverer) isLive(ctx context.Context, rawURL string) bool {
 	resp.Body.Close()
 
 	switch resp.StatusCode {
-	case http.StatusForbidden:
-		d.blocker.block(host, time.Now().Add(block403Duration))
-		return false
 	case http.StatusTooManyRequests:
 		d.blocker.block(host, time.Now().Add(retryAfterDuration(resp, block429Duration)))
 		return false
-	case http.StatusMethodNotAllowed:
+	case http.StatusForbidden, http.StatusMethodNotAllowed:
+		// 403 from HEAD is common bot-blocking, not a dead site — fall back to GET.
+		// 405 means HEAD is unsupported — same GET fallback.
 		if d.blocker.isBlocked(host) {
 			return false
 		}

@@ -71,6 +71,18 @@ func (w *URLWriter) resetIfDeleted() error {
 	return nil
 }
 
+// MarkSeen pre-seeds the seen set with additional URLs so they are treated as
+// duplicates and never written to the output file.  Safe to call concurrently.
+func (w *URLWriter) MarkSeen(urls ...string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, u := range urls {
+		if u != "" {
+			w.seen[strings.ToLower(u)] = struct{}{}
+		}
+	}
+}
+
 func (w *URLWriter) Count() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()

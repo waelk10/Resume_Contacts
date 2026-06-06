@@ -21,6 +21,7 @@ import (
 
 	"Resume_Contacts_Scraper/internal/contact"
 	"Resume_Contacts_Scraper/internal/extractor"
+	"Resume_Contacts_Scraper/internal/memguard"
 )
 
 const (
@@ -33,7 +34,7 @@ const (
 )
 
 // reseedDelay is how long runWeb waits between crawl cycles once the queue drains.
-const reseedDelay = 30 * time.Minute
+const reseedDelay = 5 * time.Minute
 
 // hnRecheckInterval is how long runHN waits between polls for new HN threads.
 const hnRecheckInterval = 1 * time.Hour
@@ -47,11 +48,16 @@ type Config struct {
 	MaxBodyBytes   int           // maximum response body bytes read; excess is discarded
 	ExtraSeeds     []string      // additional seed URLs merged with the built-in list
 	Countries      []string      // ISO 3166-1 alpha-2 codes / region aliases to filter built-in seeds; nil = all
+	IgnoreCountries []string     // codes / region aliases whose seeds are always excluded; nil = nothing excluded
 	// Roles, when non-nil, restricts AppScanner to job-application links whose
 	// anchor text contains at least one of the listed keywords (case-insensitive
 	// substring).  Links with absent or generic anchor text are always followed.
 	// nil (default) disables role filtering.
 	Roles []string
+	// BlockedDomains is a list of domains (e.g. "example.com") whose URLs —
+	// and any subdomain thereof — are never emitted by AppScanner.
+	// Entries are matched case-insensitively against the URL host.
+	BlockedDomains []string
 }
 
 // BuiltInSeeds returns the URLs of all built-in seeds regardless of country filter.
@@ -68,10 +74,13 @@ func BuiltInSeeds() []string {
 // with cfg.ExtraSeeds, shuffled so every run hits targets in a different sequence.
 func (cfg Config) buildSeeds() []string {
 	filter := expandCountries(cfg.Countries)
+	ignoreFilter := expandCountries(cfg.IgnoreCountries)
 	var all []string
 	for _, s := range webSeeds {
 		if filter == nil || seedMatchesFilter(s.Countries, filter) {
-			all = append(all, s.URL)
+			if ignoreFilter == nil || !seedMatchesFilter(s.Countries, ignoreFilter) {
+				all = append(all, s.URL)
+			}
 		}
 	}
 	all = append(all, cfg.ExtraSeeds...)
@@ -184,53 +193,109 @@ func newAppScanTransport(parallelism int) *http.Transport {
 	}
 }
 
-// domainBlocker tracks consecutive per-FQDN failures and blocks a domain once
-// it reaches the failure threshold, skipping all future visits to that FQDN.
+const (
+	// softBlockWindow is the sliding time window used to count failures for
+	// the soft-block mechanism.
+	softBlockWindow = 2 * time.Minute
+	// softBlockDuration is how long a domain is soft-blocked after hitting the
+	// threshold within the window.
+	softBlockDuration = 10 * time.Minute
+	// softBlockThreshold is the number of failures within softBlockWindow that
+	// triggers a soft-block.
+	softBlockThreshold = 3
+)
+
+// domainBlocker tracks per-FQDN failures and enforces two tiers of blocking:
+//   - Soft-block: ≥softBlockThreshold failures within softBlockWindow → blocked
+//     for softBlockDuration, then automatically eligible for retry.
+//   - Permanent block: ≥threshold consecutive failures, or an explicitly
+//     unrecoverable error (e.g. TLS) → domain skipped for the rest of the run.
 type domainBlocker struct {
-	mu        sync.Mutex
-	failures  map[string]int
-	blocked   map[string]bool
-	threshold int
+	mu          sync.Mutex
+	failures    map[string]int       // consecutive-failure counter (for permanent block)
+	blocked     map[string]bool      // permanently blocked domains
+	threshold   int                  // consecutive failures before permanent block
+	prefix      string               // log prefix, e.g. "[web]" or "[app]"
+	failTimes   map[string][]time.Time // recent failure timestamps (for soft-block)
+	softBlocked map[string]time.Time   // domain → soft-block expiry
 }
 
-func newDomainBlocker(threshold int) *domainBlocker {
+func newDomainBlocker(threshold int, prefix string) *domainBlocker {
 	return &domainBlocker{
-		failures:  make(map[string]int),
-		blocked:   make(map[string]bool),
-		threshold: threshold,
+		failures:    make(map[string]int),
+		blocked:     make(map[string]bool),
+		threshold:   threshold,
+		prefix:      prefix,
+		failTimes:   make(map[string][]time.Time),
+		softBlocked: make(map[string]time.Time),
 	}
 }
 
 func (db *domainBlocker) isBlocked(host string) bool {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.blocked[host]
+	if db.blocked[host] {
+		return true
+	}
+	if exp, ok := db.softBlocked[host]; ok {
+		if time.Now().Before(exp) {
+			return true
+		}
+		delete(db.softBlocked, host) // expired — evict to prevent unbounded map growth
+	}
+	return false
 }
 
-// recordFailure increments the consecutive-failure counter and blocks the host
-// if the threshold is reached. Returns true when the host becomes blocked.
+// recordFailure records a failure for host, applying both the soft-block
+// (time-windowed) and the permanent-block (consecutive-count) logic.
+// Returns true when host becomes permanently blocked.
 func (db *domainBlocker) recordFailure(host string) bool {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+
+	now := time.Now()
+
+	// Soft-block: maintain a sliding window of failure timestamps.
+	cutoff := now.Add(-softBlockWindow)
+	times := db.failTimes[host]
+	// Drop timestamps outside the window.
+	i := 0
+	for i < len(times) && times[i].Before(cutoff) {
+		i++
+	}
+	times = append(times[i:], now)
+	db.failTimes[host] = times
+	if len(times) >= softBlockThreshold {
+		if exp, ok := db.softBlocked[host]; !ok || now.After(exp) {
+			db.softBlocked[host] = now.Add(softBlockDuration)
+			log.Printf("%s soft-blocking %s for %v (%d failures in %v)",
+				db.prefix, host, softBlockDuration, softBlockThreshold, softBlockWindow)
+		}
+	}
+
+	// Permanent block: N consecutive failures.
 	db.failures[host]++
 	if !db.blocked[host] && db.failures[host] >= db.threshold {
 		db.blocked[host] = true
-		log.Printf("[web] blocking %s after %d consecutive failures", host, db.threshold)
+		log.Printf("%s permanently blocking %s after %d consecutive failures",
+			db.prefix, host, db.threshold)
 		return true
 	}
 	return db.blocked[host]
 }
 
-// recordSuccess resets the consecutive-failure counter for a host (does not
-// un-block a host that has already been blocked).
+// recordSuccess resets the consecutive-failure counter and the soft-block
+// failure window for host. An active soft-block is left to expire on its own
+// so flaky domains cannot escape the cooldown on a single lucky response.
 func (db *domainBlocker) recordSuccess(host string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	delete(db.failures, host)
+	delete(db.failTimes, host)
 }
 
-// blockNow immediately blocks a host, bypassing the failure threshold.
-// Use for errors that are guaranteed to be permanent for the whole domain
+// blockNow immediately permanently-blocks a host, bypassing the failure
+// threshold. Use for errors that are guaranteed to be domain-wide and permanent
 // (e.g. TLS handshake failures), so we avoid repeated log spam.
 func (db *domainBlocker) blockNow(host string) {
 	db.mu.Lock()
@@ -240,12 +305,34 @@ func (db *domainBlocker) blockNow(host string) {
 
 // Engine orchestrates all scraping sources.
 type Engine struct {
-	cfg Config
-	on  func(contact.Contact)
+	cfg       Config
+	on        func(contact.Contact)
+	guard     *memguard.Guard
+	metaSeeds *metaSeedStore
 }
 
 func New(cfg Config, onContact func(contact.Contact)) *Engine {
-	return &Engine{cfg: cfg, on: onContact}
+	return &Engine{cfg: cfg, on: onContact, guard: memguard.New(), metaSeeds: newMetaSeedStore()}
+}
+
+// searchQueryParams are query-string parameter names that identify a search
+// or filter interface on a job board (as opposed to a static listing page).
+var searchQueryParams = []string{"q", "query", "keywords", "keyword", "k", "search", "s", "term"}
+
+// isSearchURL reports whether u looks like a job-board search-results URL:
+// it must pass isRelevantURLParsed (job context) AND carry a non-empty search
+// query parameter.
+func isSearchURL(u *url.URL) bool {
+	if !isRelevantURLParsed(u) {
+		return false
+	}
+	q := u.Query()
+	for _, p := range searchQueryParams {
+		if q.Get(p) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // Run launches all scraping sources concurrently and blocks until ctx is
@@ -256,8 +343,6 @@ func (e *Engine) Run(ctx context.Context) error {
 	for _, fn := range []func(context.Context){
 		e.runWeb,
 		e.runHN,
-		e.runReddit,
-		e.runLobsters,
 	} {
 		fn := fn
 		wg.Add(1)
@@ -315,6 +400,10 @@ func (e *Engine) processHNThread(ctx context.Context, client *http.Client, threa
 	sem := make(chan struct{}, e.cfg.parallelism())
 	var wg sync.WaitGroup
 	for _, kid := range thread.Kids {
+		if err := e.guard.Throttle(ctx); err != nil {
+			wg.Wait()
+			return err
+		}
 		select {
 		case <-ctx.Done():
 			wg.Wait()
@@ -356,8 +445,6 @@ func (e *Engine) processHNThread(ctx context.Context, client *http.Client, threa
 // (resetting its visited-URL cache) and re-seeds from the full seed list.
 // When the queue drains, it sleeps reseedDelay before the next cycle.
 func (e *Engine) runWeb(ctx context.Context) {
-	blocker := newDomainBlocker(3)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -365,10 +452,26 @@ func (e *Engine) runWeb(ctx context.Context) {
 		default:
 		}
 
+		e.metaSeeds.load()
+
+		blocker := newDomainBlocker(3, "[web]")
 		queue := newURLQueue()
 		c := e.newCollector(ctx, blocker, queue)
 
-		for _, seed := range e.cfg.buildSeeds() {
+		// Merge static seeds with discovered meta-seeds, deduplicating so a URL
+		// that appears in both lists is only queued once.
+		staticSeeds := e.cfg.buildSeeds()
+		inStatic := make(map[string]bool, len(staticSeeds))
+		for _, s := range staticSeeds {
+			inStatic[s] = true
+		}
+		allSeeds := staticSeeds
+		for _, s := range e.metaSeeds.all() {
+			if !inStatic[s] {
+				allSeeds = append(allSeeds, s)
+			}
+		}
+		for _, seed := range allSeeds {
 			u, err := url.Parse(seed)
 			if err != nil || blocker.isBlocked(u.Hostname()) {
 				continue
@@ -383,6 +486,10 @@ func (e *Engine) runWeb(ctx context.Context) {
 				return
 			default:
 			}
+			if err := e.guard.Throttle(ctx); err != nil {
+				c.Wait()
+				return
+			}
 			batch := queue.drain(nil)
 			for _, u := range batch {
 				_ = c.Visit(u)
@@ -390,6 +497,7 @@ func (e *Engine) runWeb(ctx context.Context) {
 			c.Wait()
 		}
 
+		e.metaSeeds.flush()
 		log.Printf("[web] queue exhausted — re-seeding in %s", reseedDelay)
 		select {
 		case <-ctx.Done():
@@ -476,6 +584,8 @@ func (e *Engine) newCollector(ctx context.Context, blocker *domainBlocker, queue
 	})
 
 	// Enqueue links that look like contact/team/careers pages.
+	// Search URLs (those with a job-context path and a search query param) are
+	// also saved to the meta-seed store so they seed future crawl cycles.
 	c.OnHTML("a[href]", func(el *colly.HTMLElement) {
 		abs := el.Request.AbsoluteURL(el.Attr("href"))
 		if !isRelevantURL(abs) {
@@ -486,6 +596,9 @@ func (e *Engine) newCollector(ctx context.Context, blocker *domainBlocker, queue
 			return
 		}
 		queue.Push(abs)
+		if isSearchURL(u) {
+			e.metaSeeds.add(abs)
+		}
 	})
 
 	c.OnError(func(r *colly.Response, err error) {

@@ -3,6 +3,7 @@ package scraper
 import (
 	"context"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/gocolly/colly/v2"
 	"github.com/gocolly/colly/v2/extensions"
+
+	"Resume_Contacts_Scraper/internal/memguard"
 )
 
 // appPageRe matches the host+path of confirmed single-job application pages on
@@ -34,7 +37,11 @@ var appPageRe = regexp.MustCompile(`(?i)` +
 	`|app\.ashbyhq\.com/[^/?#]+/posting/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}` +
 	`|apply\.workable\.com/[^/?#]+/j/[A-Z0-9]+` +
 	`|[^./\s]+\.workable\.com/j/[A-Z0-9]+` +
-	`|careers\.smartrecruiters\.com/[^/?#]+/[^/?#]+/\d+` +
+	// SmartRecruiters: individual job pages have exactly 2 path segments
+	// (company/job-slug).  The previous pattern required a numeric third segment
+	// which never matches real SmartRecruiters URLs.
+	`|careers\.smartrecruiters\.com/[^/?#]+/[^/?#]+` +
+	`|jobs\.smartrecruiters\.com/[^/?#]+/[^/?#]+` +
 	`|[^./\s]+\.breezy\.hr/p/[0-9a-f-]{30,}` +
 	`|[^./\s]+\.jobs\.personio\.(?:de|com)/job/\d+` +
 	`|[^./\s]+\.recruitee\.com/o/[^/?#]+` +
@@ -49,7 +56,13 @@ var appPageRe = regexp.MustCompile(`(?i)` +
 	// Freshteam (Zoho): company.freshteam.com/jobs/id/apply.
 	`|[^./\s]+\.freshteam\.com/jobs/[^/?#]+/apply` +
 	// Rippling embedded job pages.
-	`|app\.rippling\.com/job-listings/[^/?#]+`,
+	`|app\.rippling\.com/job-listings/[^/?#]+` +
+	// Softgarden (common in DACH region): company.softgarden.io/job/id or /jobs/id.
+	`|[^./\s]+\.softgarden\.io/(?:[a-z]{2}/)?jobs?/\d+` +
+	// Zoho Recruit: recruit.zoho.{com,eu}/jobs/locale/id/title.
+	`|recruit\.zoho\.(?:com|eu)/jobs/[^/?#]+/\d+` +
+	// Nortech (Northern Israel tech hub): individual job listing pages.
+	`|nortech-platform\.com/listing/[^/?#]+`,
 )
 
 // atsListingRe matches ATS company-level job-list pages that are worth following
@@ -65,6 +78,7 @@ var atsListingRe = regexp.MustCompile(`(?i)` +
 	`|[^./\s]+\.myworkdayjobs\.com/[^/?#]+(?:[/?#]|$)` +
 	`|[^./\s]+\.recruitee\.com/?(?:[/?#]|$)` +
 	`|careers\.smartrecruiters\.com/[^/?#]+(?:[/?#]|$)` +
+	`|jobs\.smartrecruiters\.com/[^/?#]+(?:[/?#]|$)` +
 	`|apply\.workable\.com/[^/?#]+(?:[/?#]|$)` +
 	`|[^./\s]+\.workable\.com/?(?:[/?#]|$)` +
 	`|[^./\s]+\.bamboohr\.com/careers/?(?:[/?#]|$)` +
@@ -77,7 +91,8 @@ var atsListingRe = regexp.MustCompile(`(?i)` +
 	`|app\.dover\.com/jobs/[^/?#]+(?:[/?#]|$)` +
 	`|[^./\s]+\.jazz\.co/[^/?#]+(?:[/?#]|$)` +
 	`|[^./\s]+\.jobvite\.com/[^/?#]+/jobs(?:[/?#]|$)` +
-	`|[^./\s]+\.jobs\.personio\.(?:de|com)/?(?:[/?#]|$)`,
+	`|[^./\s]+\.jobs\.personio\.(?:de|com)/?(?:[/?#]|$)` +
+	`|[^./\s]+\.softgarden\.io/(?:[a-z]{2}/)?(?:vacancies?|jobs?)(?:[/?#]|$)`,
 )
 
 // applyTextRe matches the visible text of typical "Apply" call-to-action buttons
@@ -91,7 +106,7 @@ var applyTextRe = regexp.MustCompile(`(?i)^\s*(?:` +
 	`)\s*$`)
 
 // atsDomainRe matches hostnames of the ATS platforms we track.
-var atsDomainRe = regexp.MustCompile(`(?i)greenhouse\.io|lever\.co|myworkdayjobs\.com|icims\.com|bamboohr\.com|taleo\.net|ashbyhq\.com|workable\.com|smartrecruiters\.com|breezy\.hr|personio\.|recruitee\.com|jazz\.co|jobvite\.com|pinpointhq\.com|dover\.com|teamtailor\.com|comeet\.com|freshteam\.com|rippling\.com`)
+var atsDomainRe = regexp.MustCompile(`(?i)greenhouse\.io|lever\.co|myworkdayjobs\.com|icims\.com|bamboohr\.com|taleo\.net|ashbyhq\.com|workable\.com|smartrecruiters\.com|breezy\.hr|personio\.|recruitee\.com|jazz\.co|jobvite\.com|pinpointhq\.com|dover\.com|teamtailor\.com|comeet\.com|freshteam\.com|rippling\.com|softgarden\.io|zoho\.com|zoho\.eu`)
 
 func isATSDomain(host string) bool {
 	return atsDomainRe.MatchString(strings.ToLower(host))
@@ -183,8 +198,40 @@ const maxDeferredURLs = 50_000
 
 // retryMaxRounds caps how many retry rounds the scanner will attempt before
 // giving up on remaining rate-limited URLs.  Each round can wait up to
-// rlMaxBackoff (10 min), so 5 rounds ≈ up to ~24 min of waiting total.
-const retryMaxRounds = 5
+// rlMaxBackoff (2 h), so 12 rounds gives the exponential backoff enough room
+// to climb from the 30 s initial value all the way to the 2 h ceiling.
+const retryMaxRounds = 12
+
+// app404Threshold is the number of app-page 404 responses from a single domain
+// before the scanner stops queuing further app-page URLs from that domain for
+// the rest of the run.  Followable listing pages are unaffected — only
+// isAppPageURL links are suppressed once the threshold is crossed.
+const app404Threshold = 10
+
+// domain404Counter tracks per-domain 404 hit counts for application-page URLs.
+type domain404Counter struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func newDomain404Counter() *domain404Counter {
+	return &domain404Counter{counts: make(map[string]int)}
+}
+
+func (c *domain404Counter) record(host string) int {
+	c.mu.Lock()
+	c.counts[host]++
+	n := c.counts[host]
+	c.mu.Unlock()
+	return n
+}
+
+func (c *domain404Counter) get(host string) int {
+	c.mu.Lock()
+	n := c.counts[host]
+	c.mu.Unlock()
+	return n
+}
 
 // deferredSet accumulates pending URLs with deduplication on insert.
 // It replaces the previous []pendingItem + sync.Mutex design which required an
@@ -250,7 +297,7 @@ func newDomainRateLimit() *domainRateLimit {
 
 const (
 	rlInitialBackoff = 30 * time.Second
-	rlMaxBackoff     = 10 * time.Minute
+	rlMaxBackoff     = 2 * time.Hour
 	rlMaxStrikes     = 3 // block permanently after this many max-backoff rounds
 )
 
@@ -259,8 +306,9 @@ const (
 // requests all return a 429 at the same time, only the first call records and
 // doubles the backoff; subsequent calls return (zero, false) so callers skip
 // the log line and leave the already-set cooldown intact.  This prevents the
-// backoff from compounding (30s→60s→120s→240s) just because colly had several
+// backoff from compounding (30s→60s→120s→…) just because colly had several
 // parallel requests in-flight when the block was detected.
+// Backoff doubles on each hit: 30s→1m→2m→4m→8m→16m→32m→64m→2h (capped).
 // When the doubled backoff would exceed rlMaxBackoff the strike counter is
 // incremented; callers should call isExhausted() and permanently block the
 // domain once the counter reaches rlMaxStrikes.
@@ -312,22 +360,38 @@ func (r *domainRateLimit) readyAt(domain string) time.Time {
 
 // AppScanner crawls job boards and ATS platforms to collect application-page URLs.
 type AppScanner struct {
-	cfg Config
-	on  func(string)
+	cfg   Config
+	on    func(string)
+	guard *memguard.Guard
 }
 
 func NewAppScanner(cfg Config, onURL func(string)) *AppScanner {
-	return &AppScanner{cfg: cfg, on: onURL}
+	return &AppScanner{cfg: cfg, on: onURL, guard: memguard.New()}
 }
 
 // Run starts the crawl and blocks until all seeds — including any URLs that
 // were deferred due to per-domain rate-limit (429) cooldowns — are exhausted,
 // or until ctx is cancelled (e.g. Ctrl+C).
 func (s *AppScanner) Run(ctx context.Context) error {
-	blocker := newDomainBlocker(3)
+	blocker := newDomainBlocker(3, "[app]")
 	rl := newDomainRateLimit()
 	deferred := newDeferredSet()
 	visited := newVisitedSet()
+	app404s := newDomain404Counter()
+
+	// Shared HTTP client for direct ATS API calls (Greenhouse, Lever, etc.).
+	// Uses a modest concurrency transport — the API calls are lightweight JSON
+	// fetches, not the high-volume HTML crawl.
+	apiClient := &http.Client{Timeout: 15 * time.Second, Transport: newAppScanTransport(8)}
+
+	// Concurrent set tracking which Greenhouse/Lever identifiers have already
+	// had an API fetch triggered, so we don't repeat the same company twice.
+	seenGHTokens := newVisitedSet()
+	seenLeverCos := newVisitedSet()
+
+	// WaitGroup covering all goroutines spawned for direct API fetches so Run()
+	// does not return until every in-flight API call has finished.
+	var apiWg sync.WaitGroup
 
 	par := s.cfg.appScanParallelism()
 
@@ -346,18 +410,19 @@ func (s *AppScanner) Run(ctx context.Context) error {
 	// ATS platforms are large, well-resourced services; limit to 4 concurrent
 	// requests per ATS domain to avoid triggering their bot-detection while
 	// still being fast overall.
+	// RandomDelay is intentionally omitted from both LimitRules: colly's
+	// time.Sleep-based delay does not respect context, causing c.Wait() to
+	// hang for (queued/parallelism)×delay seconds after Ctrl+C.  A ctx-aware
+	// jitter is applied in OnRequest instead.
 	if err := c.Limit(&colly.LimitRule{
 		DomainRegexp: atsDomainRe.String(),
 		Parallelism:  4,
-		RandomDelay:  400 * time.Millisecond,
 	}); err != nil {
 		log.Printf("[app] ATS rate limit setup: %v", err)
 	}
-	// General job boards and everything else: use the full requested concurrency.
 	if err := c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: par,
-		RandomDelay: 600 * time.Millisecond,
 	}); err != nil {
 		log.Printf("[app] rate limit setup: %v", err)
 	}
@@ -365,10 +430,15 @@ func (s *AppScanner) Run(ctx context.Context) error {
 	// OnRequest fires immediately before each HTTP dispatch — the last point at
 	// which we can cheaply abort a request without paying network RTT.
 	c.OnRequest(func(r *colly.Request) {
+		// Fast exit on cancel: drains colly's internal queue without blocking.
+		if ctx.Err() != nil {
+			r.Abort()
+			return
+		}
 		host := r.URL.Hostname()
 		rawURL := r.URL.String()
 
-		if blocker.isBlocked(host) {
+		if blocker.isBlocked(host) || s.isBlockedDomain(host) {
 			r.Abort()
 			return
 		}
@@ -380,6 +450,17 @@ func (s *AppScanner) Run(ctx context.Context) error {
 		}
 		if visited.loadOrStore(rawURL) {
 			r.Abort()
+			return
+		}
+		// ctx-aware polite jitter: replaces colly's non-ctx-aware RandomDelay so
+		// Ctrl+C drains the queue in nanoseconds instead of (queue/par)×600ms.
+		if !isATSDomain(host) {
+			jitter := time.Duration(rand.Int63n(int64(100 * time.Millisecond)))
+			select {
+			case <-time.After(jitter):
+			case <-ctx.Done():
+				r.Abort()
+			}
 		}
 	})
 
@@ -388,7 +469,7 @@ func (s *AppScanner) Run(ctx context.Context) error {
 	c.OnResponse(func(r *colly.Response) {
 		if r.StatusCode >= 200 && r.StatusCode < 300 {
 			blocker.recordSuccess(r.Request.URL.Hostname())
-			if isAppPageURL(r.Request.URL.String()) {
+			if isAppPageURL(r.Request.URL.String()) && !s.isBlockedDomain(r.Request.URL.Hostname()) {
 				s.on(r.Request.URL.String())
 			}
 		}
@@ -405,7 +486,7 @@ func (s *AppScanner) Run(ctx context.Context) error {
 			return
 		}
 		host := u.Hostname()
-		if blocker.isBlocked(host) {
+		if blocker.isBlocked(host) || s.isBlockedDomain(host) {
 			return
 		}
 
@@ -421,11 +502,61 @@ func (s *AppScanner) Run(ctx context.Context) error {
 		if isApp && !s.passesRoleFilter(strings.TrimSpace(el.Text)) {
 			return
 		}
+		if isApp && app404s.get(host) >= app404Threshold {
+			return // domain has too many dead app-page URLs this run — skip
+		}
+		// Emit app-page URLs immediately on discovery so Ctrl+C never loses them.
+		// OnResponse will call s.on again after the fetch, but Write deduplicates.
+		if isApp {
+			s.on(abs)
+		}
 		if !rl.isReady(host) {
 			deferred.add(abs, host)
 			return
 		}
-		_ = c.Visit(abs)
+		// Use native colly link-following: depth increments from the parent
+		// request so the crawl stays pipelined — links are dispatched the
+		// moment their parent page lands instead of waiting for an entire BFS
+		// level to drain first.
+		_ = el.Request.Visit(abs)
+
+		// ── Direct ATS API discovery ─────────────────────────────────────────
+		// When a Greenhouse or Lever listing URL is encountered in any page's
+		// HTML, immediately query their public JSON APIs to harvest all current
+		// job URLs for that company.  This bypasses the HTML-crawl entirely for
+		// platforms that use JavaScript-heavy listing pages where colly gets an
+		// empty shell, and delivers all job URLs in a single API round-trip
+		// instead of one HTTP request per job link.
+		//
+		// Deduplication via seenGHTokens / seenLeverCos ensures each company's
+		// API is queried at most once per Run(), even when the same listing URL
+		// appears as a link on many different pages.
+		if ghToken := extractGreenhouseToken(u); ghToken != "" && !seenGHTokens.loadOrStore(ghToken) {
+			apiWg.Add(1)
+			go func(tok string) {
+				defer apiWg.Done()
+				urls := fetchGreenhouseJobs(ctx, apiClient, tok)
+				for _, jobURL := range urls {
+					s.on(jobURL)
+				}
+				if len(urls) > 0 {
+					log.Printf("[app/gh-api] %s: emitted %d job(s)", tok, len(urls))
+				}
+			}(ghToken)
+		}
+		if leverCo := extractLeverCompany(u); leverCo != "" && !seenLeverCos.loadOrStore(leverCo) {
+			apiWg.Add(1)
+			go func(co string) {
+				defer apiWg.Done()
+				urls := fetchLeverJobs(ctx, apiClient, co)
+				for _, jobURL := range urls {
+					s.on(jobURL)
+				}
+				if len(urls) > 0 {
+					log.Printf("[app/lever-api] %s: emitted %d job(s)", co, len(urls))
+				}
+			}(leverCo)
+		}
 	})
 
 	c.OnError(func(r *colly.Response, err error) {
@@ -438,7 +569,14 @@ func (s *AppScanner) Run(ctx context.Context) error {
 		rawURL := r.Request.URL.String()
 		switch r.StatusCode {
 		case http.StatusNotFound:
-			log.Printf("[app] %s: 404 not found (skipped)", r.Request.URL)
+			// Only track 404s on app-page URLs (individual job postings).
+			// Non-app-page 404s are expired listing links — silently discard them.
+			if isAppPageURL(rawURL) {
+				if n := app404s.record(host); n == app404Threshold {
+					log.Printf("[app] %s: %d app-page 404s this run — suppressing further app-page URLs from this domain",
+						host, app404Threshold)
+				}
+			}
 		case http.StatusTooManyRequests,
 			http.StatusForbidden,
 			http.StatusUnauthorized,
@@ -476,12 +614,18 @@ func (s *AppScanner) Run(ctx context.Context) error {
 		}
 	})
 
-	// Pull application-page URLs from Reddit hiring posts and Lobste.rs "hiring"
-	// threads before starting the main colly crawl so they are included in the
-	// same pass.  These calls are synchronous; any URLs they find are already in
-	// colly's queue when c.Wait() is called below.
-	s.seedFromReddit(ctx, c, blocker)
-	s.seedFromLobsters(ctx, c, blocker)
+	// Kick off public job-feed API seeders concurrently with the BFS crawl.
+	// These query JSON endpoints that return ATS apply URLs directly, bypassing
+	// the HTML crawl for platforms whose listing pages are JS-rendered SPAs.
+	apiWg.Add(2)
+	go func() {
+		defer apiWg.Done()
+		s.seedFromRemotiveAPI(ctx, s.on)
+	}()
+	go func() {
+		defer apiWg.Done()
+		s.seedFromRemoteOKAPI(ctx, s.on)
+	}()
 
 	allSeeds := s.cfg.buildSeeds()
 	// Append app-scanner-specific seeds (not used by the contact scraper).
@@ -491,7 +635,17 @@ func (s *AppScanner) Run(ctx context.Context) error {
 			allSeeds = append(allSeeds, as.URL)
 		}
 	}
+
+	// Dispatch all seeds; colly follows discovered links natively via
+	// el.Request.Visit() in OnHTML, keeping the crawl fully pipelined.
+	// colly.MaxDepth(s.cfg.MaxDepth+2) enforces the depth limit per chain.
 	for _, seed := range allSeeds {
+		if ctx.Err() != nil {
+			break
+		}
+		if s.guard.Throttle(ctx) != nil {
+			break
+		}
 		u, err := url.Parse(seed)
 		if err != nil || blocker.isBlocked(u.Hostname()) {
 			continue
@@ -499,12 +653,14 @@ func (s *AppScanner) Run(ctx context.Context) error {
 		_ = c.Visit(seed)
 	}
 	c.Wait()
+	visited = newVisitedSet() // free visited URL strings accumulated during the initial crawl
 
-	// Retry loop: drain deferred URLs in rounds.  Deduplication happens on
-	// insert (deferredSet), so no O(n) dedup pass is needed here.  At most
-	// retryMaxRounds are attempted; beyond that, remaining URLs are dropped
-	// with a log warning to prevent indefinite running when rate-limited
-	// domains keep generating new deferred URLs each round.
+	// Retry loop: drain deferred (rate-limited) URLs in rounds.  Deduplication
+	// happens on insert (deferredSet), so no O(n) dedup pass is needed here.
+	// At most retryMaxRounds are attempted to prevent indefinite running when
+	// rate-limited domains keep generating new deferred URLs each round.
+	// After each retry c.Wait(), links discovered by OnHTML are followed to
+	// one more BFS level so we don't miss app-page links from retried listings.
 	for round := 1; ; round++ {
 		batch := deferred.drain()
 		if len(batch) == 0 || ctx.Err() != nil {
@@ -531,19 +687,28 @@ func (s *AppScanner) Run(ctx context.Context) error {
 
 		var dispatchWg sync.WaitGroup
 		for domain, urls := range domainURLs {
+			if s.guard.Throttle(ctx) != nil {
+				break
+			}
 			dispatchWg.Add(1)
 			go func(domain string, urls []string) {
 				defer dispatchWg.Done()
 				if readyAt := rl.readyAt(domain); time.Now().Before(readyAt) {
 					log.Printf("[app] [%s] cooldown %.0fs — dispatching %d URL(s) when ready",
 						domain, time.Until(readyAt).Seconds(), len(urls))
+					cooldown := time.NewTimer(time.Until(readyAt))
 					select {
-					case <-time.After(time.Until(readyAt)):
+					case <-cooldown.C:
 					case <-ctx.Done():
+						cooldown.Stop()
 						return
 					}
 				}
 				if ctx.Err() != nil {
+					return
+				}
+				// A blockNow may have fired while we were sleeping the cooldown.
+				if blocker.isBlocked(domain) {
 					return
 				}
 				for _, u := range urls {
@@ -553,7 +718,15 @@ func (s *AppScanner) Run(ctx context.Context) error {
 		}
 		dispatchWg.Wait()
 		c.Wait()
+		visited = newVisitedSet() // free visited URL strings accumulated during this retry round
+		// Links discovered from retried pages are followed natively by colly
+		// via el.Request.Visit() in OnHTML; no secondary BFS loop needed.
 	}
+
+	// Wait for all in-flight API goroutines (Greenhouse/Lever per-company fetches,
+	// Remotive, RemoteOK) to finish before returning, so callers see a complete
+	// result set.  Each goroutine respects ctx, so this completes promptly on cancel.
+	apiWg.Wait()
 
 	return nil
 }
@@ -658,6 +831,19 @@ func (s *AppScanner) passesRoleFilter(anchorText string) bool {
 	low := strings.ToLower(anchorText)
 	for _, role := range s.cfg.Roles {
 		if strings.Contains(low, role) {
+			return true
+		}
+	}
+	return false
+}
+
+// isBlockedDomain reports whether host matches any entry in cfg.BlockedDomains
+// exactly or as a subdomain (e.g. "example.com" blocks "jobs.example.com").
+func (s *AppScanner) isBlockedDomain(host string) bool {
+	host = strings.ToLower(host)
+	for _, blocked := range s.cfg.BlockedDomains {
+		blocked = strings.ToLower(blocked)
+		if host == blocked || strings.HasSuffix(host, "."+blocked) {
 			return true
 		}
 	}
@@ -811,6 +997,7 @@ var appScanSeeds = []taggedSeed{
 	{URL: "https://www.tecnoempleo.com", Countries: []string{"es"}},
 
 	// ── Israel ────────────────────────────────────────────────────────────────
+	{URL: "https://nortech-platform.com/explore/?type=job&sort=latest", Countries: []string{"il"}},
 	{URL: "https://www.alljobs.co.il/", Countries: []string{"il"}},
 	{URL: "https://www.drushim.co.il/", Countries: []string{"il"}},
 	{URL: "https://www.jobmaster.co.il/", Countries: []string{"il"}},
