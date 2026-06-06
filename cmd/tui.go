@@ -56,18 +56,22 @@ func runTUI() {
 	startConc := st.Start.Concurrency
 	startSeeds := st.Start.Seeds
 	startCountries := st.Start.Countries
+	startIgnoreCountries := st.Start.IgnoreCountries
 	startSMTP := st.Start.SMTPVerify
 
 	// pages
 	pgConc := st.Pages.Concurrency
 	pgSeeds := st.Pages.Seeds
 	pgCountries := st.Pages.Countries
+	pgIgnoreCountries := st.Pages.IgnoreCountries
 	pgRoles := st.Pages.Roles
+	pgBlocked := st.Pages.BlockedDomains
 
 	// discover
 	discConc := st.Discover.Concurrency
 	discSeeds := st.Discover.Seeds
 	discCountries := st.Discover.Countries
+	discIgnoreCountries := st.Discover.IgnoreCountries
 	discHops := st.Discover.Hops
 
 	// apply
@@ -115,9 +119,9 @@ func runTUI() {
 	// snapshot captures the current value of every form variable.
 	snapshot := func() tuiSavedState {
 		return tuiSavedState{
-			Start: tuiStartSaved{startConc, startSeeds, startCountries, startSMTP},
-			Pages: tuiPagesSaved{pgConc, pgSeeds, pgCountries, pgRoles},
-			Discover: tuiDiscoverSaved{discConc, discSeeds, discCountries, discHops},
+			Start:    tuiStartSaved{startConc, startSeeds, startCountries, startIgnoreCountries, startSMTP},
+			Pages:    tuiPagesSaved{pgConc, pgSeeds, pgCountries, pgIgnoreCountries, pgRoles, pgBlocked},
+			Discover: tuiDiscoverSaved{discConc, discSeeds, discCountries, discIgnoreCountries, discHops},
 			Apply: tuiApplySaved{
 				Mode: applyMode, URLsFile: applyURLs, Resume: applyResume,
 				CoverLetter: applyCoverLetter, Name: applyName, Email: applyEmail,
@@ -144,10 +148,13 @@ func runTUI() {
 			AddInputField("Concurrency", startConc, 6, acceptInt, func(t string) { startConc = t }).
 			AddInputField("Seeds file", startSeeds, 40, nil, func(t string) { startSeeds = t }).
 			AddInputField("Countries", startCountries, 40, nil, func(t string) { startCountries = t }).
+			AddInputField("Ignore countries", startIgnoreCountries, 40, nil, func(t string) { startIgnoreCountries = t }).
 			AddCheckbox("SMTP-verify each address", startSMTP, func(c bool) { startSMTP = c }).
 			AddButton("Run", func() {
 				saveTUIState(snapshot())
-				pendingAction = func() { startup(tuiBuildFlags(startConc, startSeeds, startCountries, 0, startSMTP)) }
+				pendingAction = func() {
+					startup(tuiBuildFlags(startConc, startSeeds, startCountries, startIgnoreCountries, 0, startSMTP))
+				}
 				app.Stop()
 			})
 		addCmd("start", f)
@@ -159,25 +166,33 @@ func runTUI() {
 			AddInputField("Concurrency", pgConc, 6, acceptInt, func(t string) { pgConc = t }).
 			AddInputField("Seeds file", pgSeeds, 40, nil, func(t string) { pgSeeds = t }).
 			AddInputField("Countries", pgCountries, 40, nil, func(t string) { pgCountries = t }).
-			AddInputField("Role keywords (empty = tech default, * = all)", pgRoles, 60, nil, func(t string) { pgRoles = t }).
+			AddInputField("Ignore countries", pgIgnoreCountries, 40, nil, func(t string) { pgIgnoreCountries = t }).
+			AddInputField("Role keywords, space or comma-separated (empty = tech default, * = all)", pgRoles, 60, nil, func(t string) { pgRoles = t }).
+			AddInputField("Blocked domains, space or comma-separated (e.g. amazon.com google.com)", pgBlocked, 60, nil, func(t string) { pgBlocked = t }).
 			AddButton("Run", func() {
 				saveTUIState(snapshot())
 				pendingAction = func() {
-					flags := tuiBuildFlags(pgConc, pgSeeds, pgCountries, 0, false)
+					flags := tuiBuildFlags(pgConc, pgSeeds, pgCountries, pgIgnoreCountries, 0, false)
 					// Non-empty field overrides the built-in tech default.
 					// "*" or "all" disables the filter entirely.
 					if pgRoles != "" {
 						flags.rolesSet = true
 						raw := pgRoles
 						if raw != "*" && raw != "all" {
-							for _, tok := range strings.Split(raw, ",") {
-								tok = strings.TrimSpace(strings.ToLower(tok))
+							for _, tok := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+								tok = strings.ToLower(tok)
 								if tok != "" {
 									flags.roles = append(flags.roles, tok)
 								}
 							}
 						}
 						// else: flags.roles stays nil → no filter
+					}
+					for _, tok := range strings.FieldsFunc(pgBlocked, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+						tok = strings.ToLower(tok)
+						if tok != "" {
+							flags.blockedDomains = append(flags.blockedDomains, tok)
+						}
 					}
 					appscan(flags)
 				}
@@ -192,6 +207,7 @@ func runTUI() {
 			AddInputField("Concurrency", discConc, 6, acceptInt, func(t string) { discConc = t }).
 			AddInputField("Seeds file", discSeeds, 40, nil, func(t string) { discSeeds = t }).
 			AddInputField("Countries", discCountries, 40, nil, func(t string) { discCountries = t }).
+			AddInputField("Ignore countries", discIgnoreCountries, 40, nil, func(t string) { discIgnoreCountries = t }).
 			AddInputField("Hops", discHops, 6, acceptInt, func(t string) { discHops = t }).
 			AddButton("Run", func() {
 				hops, _ := strconv.Atoi(discHops)
@@ -199,7 +215,7 @@ func runTUI() {
 					hops = 0
 				}
 				saveTUIState(snapshot())
-				flags := tuiBuildFlags(discConc, discSeeds, discCountries, hops, false)
+				flags := tuiBuildFlags(discConc, discSeeds, discCountries, discIgnoreCountries, hops, false)
 				pendingAction = func() { discoverSeeds(flags) }
 				app.Stop()
 			})
@@ -569,7 +585,7 @@ func acceptInt(text string, _ rune) bool {
 	return err == nil
 }
 
-func tuiBuildFlags(concStr, seeds, countries string, hops int, smtpVerify bool) runFlags {
+func tuiBuildFlags(concStr, seeds, countries, ignoreCountries string, hops int, smtpVerify bool) runFlags {
 	c, _ := strconv.Atoi(concStr)
 	if c < 1 {
 		c = 1
@@ -584,7 +600,14 @@ func tuiBuildFlags(concStr, seeds, countries string, hops int, smtpVerify bool) 
 			cs = append(cs, tok)
 		}
 	}
-	return runFlags{concurrency: c, seedsFile: seeds, countries: cs, hops: hops, smtpVerify: smtpVerify}
+	var ics []string
+	for _, tok := range strings.Split(ignoreCountries, ",") {
+		tok = strings.TrimSpace(strings.ToLower(tok))
+		if tok != "" {
+			ics = append(ics, tok)
+		}
+	}
+	return runFlags{concurrency: c, seedsFile: seeds, countries: cs, ignoreCountries: ics, hops: hops, smtpVerify: smtpVerify}
 }
 
 func tuiSeedsDefault() string {

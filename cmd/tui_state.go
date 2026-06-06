@@ -16,24 +16,28 @@ type tuiSavedState struct {
 }
 
 type tuiStartSaved struct {
-	Concurrency string `json:"concurrency"`
-	Seeds       string `json:"seeds"`
-	Countries   string `json:"countries"`
-	SMTPVerify  bool   `json:"smtp_verify"`
+	Concurrency     string `json:"concurrency"`
+	Seeds           string `json:"seeds"`
+	Countries       string `json:"countries"`
+	IgnoreCountries string `json:"ignore_countries"`
+	SMTPVerify      bool   `json:"smtp_verify"`
 }
 
 type tuiPagesSaved struct {
-	Concurrency string `json:"concurrency"`
-	Seeds       string `json:"seeds"`
-	Countries   string `json:"countries"`
-	Roles       string `json:"roles"` // comma-separated keywords; empty = built-in tech list
+	Concurrency     string `json:"concurrency"`
+	Seeds           string `json:"seeds"`
+	Countries       string `json:"countries"`
+	IgnoreCountries string `json:"ignore_countries"`
+	Roles           string `json:"roles"`           // space/comma-separated keywords; empty = built-in tech list
+	BlockedDomains  string `json:"blocked_domains"` // space/comma-separated domains to exclude
 }
 
 type tuiDiscoverSaved struct {
-	Concurrency string `json:"concurrency"`
-	Seeds       string `json:"seeds"`
-	Countries   string `json:"countries"`
-	Hops        string `json:"hops"`
+	Concurrency     string `json:"concurrency"`
+	Seeds           string `json:"seeds"`
+	Countries       string `json:"countries"`
+	IgnoreCountries string `json:"ignore_countries"`
+	Hops            string `json:"hops"`
 }
 
 type tuiApplySaved struct {

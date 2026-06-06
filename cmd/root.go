@@ -13,18 +13,20 @@ const version = "0.1.0"
 
 const (
 	defaultConcurrency = 4
-	maxConcurrency     = 128
+	maxConcurrency     = 256
 )
 
 // runFlags holds the parsed flags common to the start, pages, and discover commands.
 type runFlags struct {
-	concurrency int
-	seedsFile   string
-	countries   []string // ISO 3166-1 alpha-2 codes or region aliases; nil = all seeds
-	hops        int      // BFS depth for discover (ignored by start/pages)
-	smtpVerify  bool     // probe mail server to confirm address exists (start only)
-	roles       []string // role-keyword filter (pages only); nil = caller picks default
-	rolesSet    bool     // true when --roles was explicitly passed on the command line
+	concurrency     int
+	seedsFile       string
+	countries       []string // ISO 3166-1 alpha-2 codes or region aliases; nil = all seeds
+	ignoreCountries []string // codes / aliases to exclude from seeds; nil = nothing excluded
+	hops            int      // BFS depth for discover (ignored by start/pages)
+	smtpVerify      bool     // probe mail server to confirm address exists (start only)
+	roles           []string // role-keyword filter (pages only); nil = caller picks default
+	rolesSet        bool     // true when --roles was explicitly passed on the command line
+	blockedDomains  []string // domains (and subdomains) whose URLs are never emitted (pages only)
 }
 
 func Execute() {
@@ -72,18 +74,25 @@ func parseFlags(cmd string) runFlags {
 	var c int
 	var s string
 	var countriesRaw string
+	var ignoreCountriesRaw string
 	var rolesRaw string
+	var blockedDomainsRaw string
 	var hops int
 	fs.IntVar(&c, "concurrency", defaultConcurrency, "concurrent lookups per domain (1–8)")
 	fs.IntVar(&c, "c", defaultConcurrency, "concurrent lookups per domain (1–8) (shorthand)")
 	fs.StringVar(&s, "seeds", "", "path to a line-separated file of extra seed URLs")
 	fs.StringVar(&s, "s", "", "path to a line-separated file of extra seed URLs (shorthand)")
 	fs.StringVar(&countriesRaw, "countries", "", "comma-separated country/region codes to restrict seeds")
+	fs.StringVar(&ignoreCountriesRaw, "ignore-countries", "", "comma-separated country/region codes to exclude from seeds")
 	fs.StringVar(&rolesRaw, "roles", "",
 		"comma-separated role/title keywords for pages — only links whose anchor text\n"+
 			"\tmatches a keyword are followed (case-insensitive substring).\n"+
 			"\tDefault for pages: built-in tech list.  Pass \"\" to disable filtering.\n"+
 			"\tExample: --roles \"engineer,developer,data,security\"")
+	fs.StringVar(&blockedDomainsRaw, "blocked-domains", "",
+		"space or comma-separated domains to exclude from pages output — subdomains are\n"+
+			"\talso blocked (e.g. \"example.com\" blocks \"jobs.example.com\").\n"+
+			"\tExample: --blocked-domains \"amazon.com google.com\"")
 	fs.IntVar(&hops, "hops", 2, "BFS depth for discover: how many meta-source hops beyond the initial list (discover only)")
 	var smtpVerify bool
 	fs.BoolVar(&smtpVerify, "smtp-verify", false, "probe the mail server to confirm each address exists before saving (start only; slower)")
@@ -104,6 +113,13 @@ func parseFlags(cmd string) runFlags {
 			countries = append(countries, tok)
 		}
 	}
+	var ignoreCountries []string
+	for _, tok := range strings.Split(ignoreCountriesRaw, ",") {
+		tok = strings.TrimSpace(strings.ToLower(tok))
+		if tok != "" {
+			ignoreCountries = append(ignoreCountries, tok)
+		}
+	}
 	// Detect whether --roles was explicitly provided so callers can distinguish
 	// "user didn't mention roles" (nil → use command default) from "user passed
 	// --roles """ (empty slice → disable filter).
@@ -115,14 +131,21 @@ func parseFlags(cmd string) runFlags {
 		}
 	})
 	if rolesSet {
-		for _, tok := range strings.Split(rolesRaw, ",") {
-			tok = strings.TrimSpace(strings.ToLower(tok))
+		for _, tok := range strings.FieldsFunc(rolesRaw, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+			tok = strings.ToLower(tok)
 			if tok != "" {
 				roles = append(roles, tok)
 			}
 		}
 	}
-	return runFlags{concurrency: c, seedsFile: s, countries: countries, hops: hops, smtpVerify: smtpVerify, roles: roles, rolesSet: rolesSet}
+	var blockedDomains []string
+	for _, tok := range strings.FieldsFunc(blockedDomainsRaw, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+		tok = strings.ToLower(tok)
+		if tok != "" {
+			blockedDomains = append(blockedDomains, tok)
+		}
+	}
+	return runFlags{concurrency: c, seedsFile: s, countries: countries, ignoreCountries: ignoreCountries, hops: hops, smtpVerify: smtpVerify, roles: roles, rolesSet: rolesSet, blockedDomains: blockedDomains}
 }
 
 // loadSeedsFile reads a line-separated file of seed URLs.
@@ -172,9 +195,10 @@ Commands:
   help       Show this help message
 
 Flags (start, pages, discover):
-  -c, --concurrency int   concurrent lookups per domain, 1–%d (default %d)
-  -s, --seeds FILE        line-separated file of extra seed URLs to add to the built-in list
-      --countries CODES   comma-separated country/region codes to restrict seeds
+  -c, --concurrency int        concurrent lookups per domain, 1–%d (default %d)
+  -s, --seeds FILE             line-separated file of extra seed URLs to add to the built-in list
+      --countries CODES        comma-separated country/region codes to restrict seeds
+      --ignore-countries CODES comma-separated country/region codes to exclude from seeds
       --roles KEYWORDS    comma-separated role/title keywords (pages only).
                           A job link is followed only when its visible title contains a keyword.
                           Default: built-in tech list (engineer, developer, data, security, …).
