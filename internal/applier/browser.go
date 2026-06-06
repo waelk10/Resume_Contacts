@@ -2,6 +2,7 @@ package applier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -60,6 +61,13 @@ func NewBrowser(headful bool, profileDir string, concurrency int) (*Browser, err
 				"profile directory %q has not been initialized — run with --setup first",
 				profileDir,
 			)
+		}
+		// Compact the source profile once before any use or cloning.
+		// Cache accumulates between runs; removing it here means every
+		// Firefox session (or clone) starts lean without each slot having
+		// to do its own compaction walk on an ever-larger directory.
+		if freed, err := CompactProfile(profileDir); err == nil && freed > 0 {
+			log.Printf("[browser] compacted profile — freed %.1f MB", float64(freed)/1e6)
 		}
 	}
 
@@ -161,9 +169,8 @@ func prepareProfileClone(src, dst string) error {
 	if err := copyDir(src, dst); err != nil {
 		return fmt.Errorf("copy profile: %w", err)
 	}
-	if freed, err := CompactProfile(dst); err == nil && freed > 0 {
-		log.Printf("[browser] compacted clone — freed %.1f MB", float64(freed)/1e6)
-	}
+	// No CompactProfile here — source was already compacted in NewBrowser
+	// before any cloning began, so the copy is already lean.
 	for _, f := range []string{"lock", ".parentlock"} {
 		_ = os.Remove(filepath.Join(dst, f))
 	}
@@ -364,6 +371,9 @@ func isInstantSkipError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrNoApplicationForm) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	for _, phrase := range []string{
 		"no application form found",
@@ -438,12 +448,15 @@ func (b *Browser) FillApplication(
 				log.Printf("[hold] error — close the Firefox window to continue: %v", retErr)
 				waitForWindowClose(ctx, wd)
 				retErr = nil
-			} else if flags.Headful && !isInstantSkipError(retErr) {
+			} else if flags.Headful && !isInstantSkipError(retErr) && ctx.Err() == nil {
 				// Skip the pause for errors the user cannot act on (dead pages,
-				// auth walls, HTTP errors) — only pause when the filled form is
-				// worth inspecting.
+				// auth walls, HTTP errors, or context cancellation) — only pause
+				// when the filled form is worth inspecting.
 				log.Printf("[apply] headful error — keeping browser open 10 s: %v", retErr)
-				time.Sleep(10 * time.Second)
+				select {
+				case <-time.After(10 * time.Second):
+				case <-ctx.Done():
+				}
 			} else if flags.Headful {
 				log.Printf("[apply] headful skip (auto): %v", retErr)
 			}
@@ -463,6 +476,21 @@ func (b *Browser) FillApplication(
 	}
 	// Give JavaScript-heavy ATS pages time to finish rendering.
 	time.Sleep(1200 * time.Millisecond)
+
+	// Ashby: job listing pages (jobs.ashbyhq.com/company/uuid) require clicking
+	// an "Apply" button to navigate to the actual form (…/application).  Ashby's
+	// React SPA can take several seconds to render the Apply button, causing
+	// clickPreApplyIfNeeded to miss it.  Navigate directly to the /application
+	// URL so the form is ready without relying on the pre-apply click.
+	if job.ATSPlatform == "ashby" {
+		u := strings.ToLower(strings.TrimRight(job.URL, "/"))
+		if !strings.HasSuffix(u, "/application") {
+			appURL := strings.TrimRight(job.URL, "/") + "/application"
+			if gerr := wd.Get(appURL); gerr == nil {
+				time.Sleep(1500 * time.Millisecond)
+			}
+		}
+	}
 
 	// iCIMS: job-description URLs (ending in /job) need ?mode=apply to load
 	// the application form directly.  Navigate there now so the form is ready
@@ -543,7 +571,7 @@ func (b *Browser) FillApplication(
 		if err := detectDeadPage(wd); err != nil {
 			return err
 		}
-		return fmt.Errorf("no application form found on page (job may be closed or removed)")
+		return ErrNoApplicationForm
 	}
 
 	// Trigger the Simplify extension: poll for its injected autofill button,
@@ -588,6 +616,8 @@ func (b *Browser) FillApplication(
 		fillICIMS(ctx, wd, info, resumePath)
 	case "jobvite":
 		fillGeneric(ctx, wd, info, resumePath)
+	case "xing":
+		fillXing(ctx, wd, info, resumePath)
 	default:
 		fillGeneric(ctx, wd, info, resumePath)
 	}
@@ -646,9 +676,82 @@ func (b *Browser) FillApplication(
 		if ids, ok := res.([]interface{}); ok && len(ids) > 0 {
 			for _, idv := range ids {
 				if id, ok := idv.(string); ok && id != "" {
+					// Geographic comboboxes must never receive a blind first-option fill —
+					// the dropdown reflects geolocation bias and will select the wrong
+					// country or city (e.g. Lebanon instead of Israel).
+					switch id {
+					case "candidate-location", "location", "country":
+						log.Printf("[apply] mop-up: skipping geographic combobox #%s", id)
+						continue
+					}
 					log.Printf("[apply] mop-up: filling required combobox #%s with first option", id)
 					fillGreenhouseComboboxByID(wd, id, "", 800)
 				}
+			}
+		}
+	}
+
+	// ── Multi-step form navigation ───────────────────────────────────────────
+	// Some ATS platforms (Xing, onlyfy, SmartRecruiters, Jobvite, and others)
+	// split the application into 2-6 pages separated by "Next / Weiter /
+	// Continue" buttons.  After the platform-specific filler fills step 1 and
+	// the mop-up above catches remaining required fields, we advance through
+	// every subsequent step, re-running the mop-up and common-extras filler on
+	// each new page so every step's fields are populated before we reach the
+	// final Submit button.
+	//
+	// Ashby uses a different submit-retry loop; skip multi-step navigation for it.
+	if job.ATSPlatform != "ashby" {
+		const maxSteps = 8
+		for step := 0; step < maxSteps; step++ {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !clickNextStepButton(ctx, wd) {
+				break // no Next/Continue button → we are on the final step
+			}
+			log.Printf("[apply] multi-step: advanced to step %d", step+2)
+			// Wait for the new step's fields to render.
+			waitForElement(ctx, wd, formReadySelector, 6*time.Second)
+			time.Sleep(500 * time.Millisecond)
+
+			// Re-run the full mop-up on the new step's fields.
+			if n, err := wd.ExecuteScript(jsFillRequiredFields, []interface{}{
+				info.CoverLetter, info.ExpectedSalary, info.Phone, info.Website, mopupLocalPhone,
+			}); err == nil {
+				if cnt, ok := n.(float64); ok && cnt > 0 {
+					log.Printf("[apply] multi-step mop-up: filled %d field(s) on step %d", int(cnt), step+2)
+					time.Sleep(400 * time.Millisecond)
+				}
+			}
+			if res, err := wd.ExecuteScript(jsGetAllUnfilledRequiredComboboxIDs, nil); err == nil {
+				if ids, ok := res.([]interface{}); ok {
+					for _, idv := range ids {
+						if id, ok := idv.(string); ok && id != "" {
+							switch id {
+							case "candidate-location", "location", "country":
+								continue
+							}
+							fillGreenhouseComboboxByID(wd, id, "", 600)
+						}
+					}
+				}
+			}
+			// Re-run common extras in case this step has city/country/LinkedIn fields.
+			fillCommonExtras(ctx, wd, info)
+			// Re-attempt resume upload — some forms put the file input on step 2+.
+			uploadResume(wd, resumePath)
+			// Re-try work eligibility questions that may appear on later steps.
+			if info.WorkAuthorized != "" || info.RequireSponsorship != "" {
+				authAns := info.WorkAuthorized
+				if authAns == "" {
+					authAns = "yes"
+				}
+				sponsorAns := info.RequireSponsorship
+				if sponsorAns == "" {
+					sponsorAns = "no"
+				}
+				_, _ = wd.ExecuteScript(jsHandleWorkEligibility, []interface{}{authAns, sponsorAns})
 			}
 		}
 	}
@@ -659,6 +762,11 @@ func (b *Browser) FillApplication(
 	if job.ATSPlatform == "ashby" {
 		return submitWithAshbyRetry(ctx, wd, info, flags)
 	}
+
+	// Scroll to the bottom so any below-fold submit button is in the viewport
+	// and React has had time to enable it after the mop-up pass.
+	_, _ = wd.ExecuteScript(`window.scrollTo(0, document.body.scrollHeight)`, nil)
+	time.Sleep(600 * time.Millisecond)
 
 	if err := clickSubmit(wd); err != nil {
 		return err
@@ -850,11 +958,56 @@ const jsFillRequiredFields = `
                        'phonecode','phone_code','prefix','phoneext','phone_ext',
                        'countrycallingcode','callingcode'];
     function phoneCountrySelectSet() {
+        // 1. Native <select> with phone-code keywords in name/id
         var sels = document.querySelectorAll('select');
         for (var s = 0; s < sels.length; s++) {
             var nm = ((sels[s].name||'')+' '+(sels[s].id||'')).toLowerCase();
             for (var k = 0; k < phoneCodeKw.length; k++) {
                 if (nm.indexOf(phoneCodeKw[k]) !== -1 && sels[s].value && sels[s].selectedIndex > 0) return true;
+            }
+        }
+        // 2. intl-tel-input: a country is active when getSelectedCountryData returns a dialCode
+        if (window.intlTelInputGlobals) {
+            var telEls = document.querySelectorAll('input[type="tel"]');
+            for (var ti = 0; ti < telEls.length; ti++) {
+                var iti = window.intlTelInputGlobals.getInstance(telEls[ti]);
+                if (iti) { var cd = iti.getSelectedCountryData(); if (cd && cd.dialCode) return true; }
+            }
+        }
+        // 3. React Select combobox that looks like a phone-country selector and has a value chosen.
+        //    Matches Greenhouse id="country" and similar patterns on other ATS platforms.
+        var combos = document.querySelectorAll('input[role="combobox"]');
+        for (var ci = 0; ci < combos.length; ci++) {
+            var cb = combos[ci];
+            var cbNm = ((cb.name||'')+' '+(cb.id||'')).toLowerCase();
+            var isCtrySel = cbNm.indexOf('country') !== -1;
+            if (!isCtrySel) {
+                for (var ki = 0; ki < phoneCodeKw.length; ki++) {
+                    if (cbNm.indexOf(phoneCodeKw[ki]) !== -1) { isCtrySel = true; break; }
+                }
+            }
+            if (!isCtrySel) {
+                // Walk up to find a label whose text mentions country/code/prefix
+                var pp = cb.parentElement;
+                for (var di = 0; di < 8 && pp && !isCtrySel; di++) {
+                    var ll = pp.querySelector('label');
+                    if (ll) {
+                        var lt = ll.textContent.toLowerCase();
+                        if (lt.indexOf('country') !== -1 || lt.indexOf('code') !== -1 || lt.indexOf('prefix') !== -1) isCtrySel = true;
+                    }
+                    pp = pp.parentElement;
+                }
+            }
+            if (!isCtrySel) continue;
+            // Confirm a value is selected: a visible single-value element, no placeholder
+            var pp2 = cb.parentElement;
+            for (var di2 = 0; di2 < 8 && pp2; di2++) {
+                var sv = pp2.querySelector('[class*="single-value"],[class*="singleValue"]');
+                if (sv) {
+                    var svSt = window.getComputedStyle(sv);
+                    if (svSt.display !== 'none' && svSt.visibility !== 'hidden') return true;
+                }
+                pp2 = pp2.parentElement;
             }
         }
         return false;
@@ -947,7 +1100,7 @@ const jsFillRequiredFields = `
     });
 
     return filled;
-})(arguments[0], arguments[1], arguments[2], arguments[3])
+})(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4])
 `
 
 // jsReadAshbyValidationErrors collects the field-level error messages that
@@ -1156,7 +1309,7 @@ const jsSelectRadioContaining = `
 // still missing).  Used as a last-resort after clickSubmit fails.
 const jsForceClickSubmit = `
 (function(){
-    var WORDS = /\b(submit|apply|send|complete|finish|confirm)\b/i;
+    var WORDS = /\b(submit|apply|send|complete|finish|confirm|absenden|abschicken|einreichen|bewerben)\b/i;
     var candidates = Array.from(document.querySelectorAll(
         'button[type="submit"], input[type="submit"], button, [role="button"]'
     ));
@@ -1461,13 +1614,119 @@ const jsHandleEEORadios = `
 })(arguments[0], arguments[1]);
 `
 
+// jsHandleDisabilityForm selects "I don't wish to answer" / "decline" on any
+// disability self-identification question found on the page, covering:
+//   - Radio buttons with name="disability_status" (Greenhouse OFCCP Section 503)
+//   - Any radio group whose fieldset/container mentions "disability"
+//   - <select> elements whose context mentions "disability"
+//
+// Scoring priority: "decline/prefer not/don't wish" → highest.
+// Never selects a "yes" (has disability) option.
+const jsHandleDisabilityForm = `
+(function(){
+    var DISAB_CTX = /\b(disability|disabilit(?:y|ies)|behinderung|handicap)\b/i;
+    var NO_T      = /\b(no[,\s]|don'?t\s+have|do\s+not\s+have|does\s+not\s+have|i\s+don'?t|i\s+do\s+not|nein|kein(?:e)?)\b/i;
+    var YES_T     = /\b(yes[,\s]|i\s+have\s+a|have\s+a\s+disab|ich\s+habe)\b/i;
+    var DECL_T    = /\b(prefer\s+not|decline|do\s+not\s+wish|don'?t\s+wish|choose\s+not|not\s+to\s+disclose|nicht\s+angeben|keine\s+angabe|lieber\s+nicht)\b/i;
+
+    function scoreOption(txt) {
+        if (YES_T.test(txt))  return -20;  // never pick "yes, I have a disability"
+        if (DECL_T.test(txt)) return 10;   // "I don't wish to answer" — preferred
+        if (NO_T.test(txt))   return 3;    // "No, I don't have a disability" — fallback
+        return 0;
+    }
+
+    function pickBestRadio(container) {
+        var radios = Array.from(container.querySelectorAll('input[type="radio"],[role="radio"]'));
+        if (!radios.length) return false;
+        var best = null, bestScore = -Infinity;
+        radios.forEach(function(r) {
+            if (r.disabled) return;
+            var lbl = document.querySelector('label[for="'+r.id+'"]') || r.closest('label');
+            var txt = (lbl ? lbl.textContent : (r.getAttribute('aria-label') || r.value || '')).trim();
+            var s = scoreOption(txt);
+            if (s > bestScore) { bestScore = s; best = r; }
+        });
+        if (!best || bestScore < 1) return false;
+        best.scrollIntoView({block:'center'});
+        best.click();
+        best.dispatchEvent(new Event('change',{bubbles:true}));
+        return true;
+    }
+
+    function pickBestSelect(sel) {
+        var best = -1, bestScore = -Infinity;
+        for (var i = 0; i < sel.options.length; i++) {
+            var opt = sel.options[i];
+            if (!opt.value || opt.disabled) continue;
+            var s = scoreOption(opt.text);
+            if (s > bestScore) { bestScore = s; best = i; }
+        }
+        if (best < 0 || bestScore < 1) return false;
+        sel.selectedIndex = best;
+        sel.dispatchEvent(new Event('change',{bubbles:true}));
+        return true;
+    }
+
+    var done = false;
+
+    // 1. Greenhouse OFCCP: input[name="disability_status"]
+    var byName = document.querySelectorAll('input[name="disability_status"]');
+    if (byName.length) {
+        done = pickBestRadio(document.body);
+    }
+
+    // 2. Fieldsets whose legend mentions disability
+    if (!done) {
+        document.querySelectorAll('fieldset').forEach(function(fs) {
+            if (done) return;
+            var leg = fs.querySelector('legend');
+            if (leg && DISAB_CTX.test(leg.textContent)) {
+                done = pickBestRadio(fs);
+            }
+        });
+    }
+
+    // 3. Generic containers whose text mentions disability
+    if (!done) {
+        var CONTAINERS = [
+            '[class*="disability"],[id*="disability"]',
+            '[class*="question"],[class*="field-group"],[class*="form-group"]',
+        ].join(',');
+        document.querySelectorAll(CONTAINERS).forEach(function(c) {
+            if (done) return;
+            if (DISAB_CTX.test(c.textContent)) {
+                done = pickBestRadio(c);
+            }
+        });
+    }
+
+    // 4. <select> elements whose context mentions disability
+    document.querySelectorAll('select').forEach(function(sel) {
+        if (sel.disabled || sel.offsetParent === null) return;
+        var ctx = '';
+        var lbl = document.querySelector('label[for="'+sel.id+'"]');
+        if (lbl) ctx += lbl.textContent;
+        var p = sel.parentElement;
+        for (var i = 0; i < 3 && p; i++) { ctx += p.textContent; p = p.parentElement; }
+        ctx = (ctx + ' ' + (sel.name||'') + ' ' + (sel.id||'')).toLowerCase();
+        if (DISAB_CTX.test(ctx)) pickBestSelect(sel);
+    });
+
+    return done;
+})();
+`
+
 // jsHandleOptionalSelects fills EEO dropdowns with "prefer not to answer" /
 // "decline" and answers "how did you hear about us" with "Indeed" or "Other".
 // All in one round-trip since these fields are typically non-required but
 // leaving them blank occasionally blocks submission.
+// NOTE: disability <select> elements are intentionally excluded here —
+// jsHandleDisabilityForm handles those with the correct "no disability" answer.
 const jsHandleOptionalSelects = `
 (function(){
-    var EEO=/\b(gender|sex(?:ual)?|race|ethnicity|ethnic\s+(?:origin|group)|national\s+origin|veteran|disability|disabilities|eeoc?|protected\s+class|geschlecht|ethnizit[äa]t|nationalit[äa]t|behinderung)\b/i;
+    var EEO=/\b(gender|sex(?:ual)?|race|ethnicity|ethnic\s+(?:origin|group)|national\s+origin|veteran|eeoc?|protected\s+class|geschlecht|ethnizit[äa]t|nationalit[äa]t)\b/i;
+    // disability is intentionally excluded — jsHandleDisabilityForm owns it
     var HEARD=/\b(how\s+(?:did\s+you|have\s+you)\s+(?:hear|find|learn|discover)|referral\s+source|where\s+did\s+you\s+(?:hear|find)|how\s+did\s+you\s+come\s+across|wie\s+(?:haben\s+sie|sind\s+sie)\s+(?:auf\s+uns|auf\s+diese)|wie\s+sind\s+sie\s+auf\s+die\s+stelle|wo\s+haben\s+sie\s+die\s+stelle|woher\s+(?:kennen|haben)\s+sie)\b/i;
     var DECLINE=['prefer not','decline','not to disclose','do not wish','choose not','not specified','not provided','keine angabe','nicht angeben','lieber nicht'];
     var HEARD_PREF=['indeed','linkedin','job board','job site','online job','internet','other','stellenbörse','jobbörse'];
@@ -1753,12 +2012,9 @@ func fillComboboxByLabel(wd selenium.WebDriver, labelText, value string) bool {
 				return true
 			}
 		}
-		// No text match — click the first visible option rather than leaving
-		// the dropdown open with nothing selected.
-		if err := els[0].Click(); err == nil {
-			time.Sleep(200 * time.Millisecond)
-			return true
-		}
+		// No text match and value is non-empty: do not fall back to the first
+		// option — picking the wrong geographic or categorical answer is worse
+		// than leaving the field blank and letting submit validation catch it.
 	}
 	// No listbox appeared at all — close any open dropdown so it does not
 	// intercept clicks meant for the next field.
@@ -2010,6 +2266,7 @@ func fillCommonExtras(ctx context.Context, wd selenium.WebDriver, info Applicant
 		ethnicityVal = "decline"
 	}
 	wd.ExecuteScript(jsHandleEEORadios, []interface{}{genderVal, ethnicityVal}) //nolint:errcheck
+	wd.ExecuteScript(jsHandleDisabilityForm, nil) //nolint:errcheck
 
 	// ── EEO <select> dropdowns + "how did you hear" ───────────────────────────
 	wd.ExecuteScript(jsHandleOptionalSelects, nil) //nolint:errcheck
@@ -2295,12 +2552,19 @@ func fillGreenhouseComboboxByID(wd selenium.WebDriver, id, value string, waitMs 
 				}
 			}
 		}
-		// No text match — click first option as fallback.
-		if err := els[0].Click(); err == nil {
-			text, _ := els[0].Text()
-			log.Printf("[greenhouse] combobox #%s: first-option fallback %q", id, strings.TrimSpace(text))
-			time.Sleep(200 * time.Millisecond)
-			return true
+		// First-option fallback only in mop-up mode (value == ""), where the
+		// caller explicitly wants "pick anything".  When a specific value was
+		// typed, silently selecting the wrong option is worse than leaving the
+		// field blank — especially for geographic fields (country, location).
+		if value == "" {
+			if safe := firstSafeOption(els); safe != nil {
+				if err := safe.Click(); err == nil {
+					text, _ := safe.Text()
+					log.Printf("[greenhouse] combobox #%s: first-option fallback %q", id, strings.TrimSpace(text))
+					time.Sleep(200 * time.Millisecond)
+					return true
+				}
+			}
 		}
 	}
 	inp.SendKeys(selenium.EscapeKey) //nolint:errcheck
@@ -2362,36 +2626,42 @@ func fillGreenhouseComboboxOrOther(wd selenium.WebDriver, id, value string, wait
 		return nil
 	}
 
-	// Phase 1: search for the actual value.
-	if els := openAndType(value, waitMs); els != nil {
-		valLow := strings.ToLower(value)
-		for _, el := range els {
-			text, _ := el.Text()
-			if strings.Contains(strings.ToLower(text), valLow) {
-				if err := el.Click(); err == nil {
-					log.Printf("[greenhouse] combobox #%s: selected %q", id, strings.TrimSpace(text))
-					time.Sleep(200 * time.Millisecond)
-					return true
+	// For dual majors (e.g. "Computer Science/Entrepreneurship"), skip Phase 1
+	// entirely: typing the combined string including "/" confuses the React Select
+	// filter and returns no options, leaving the input in a broken state for all
+	// subsequent openAndType calls on the same element.
+	parts := splitDualMajor(value)
+
+	// Phase 1: single-value search — only when not a dual major.
+	if len(parts) == 0 {
+		if els := openAndType(value, waitMs); els != nil {
+			valLow := strings.ToLower(value)
+			for _, el := range els {
+				text, _ := el.Text()
+				if strings.Contains(strings.ToLower(text), valLow) {
+					if err := el.Click(); err == nil {
+						log.Printf("[greenhouse] combobox #%s: selected %q", id, strings.TrimSpace(text))
+						time.Sleep(200 * time.Millisecond)
+						return true
+					}
 				}
 			}
 		}
 	}
 
-	// Phase 1b: dual major — try each component individually so "Computer Science
-	// and Mathematics" can still match "Computer Science" when the ATS only lists
-	// individual disciplines.
-	if parts := splitDualMajor(value); len(parts) > 0 {
-		for _, part := range parts {
-			if els := openAndType(part, waitMs); els != nil {
-				partLow := strings.ToLower(part)
-				for _, el := range els {
-					text, _ := el.Text()
-					if strings.Contains(strings.ToLower(text), partLow) {
-						if err := el.Click(); err == nil {
-							log.Printf("[greenhouse] combobox #%s: dual major — matched component %q (full: %q)", id, strings.TrimSpace(text), value)
-							time.Sleep(200 * time.Millisecond)
-							return true
-						}
+	// Phase 1b: dual major — try each component individually.  For a dual major
+	// we come here first (Phase 1 was skipped); for a single value this is a
+	// no-op since splitDualMajor already returned nil above.
+	for _, part := range parts {
+		if els := openAndType(part, waitMs); els != nil {
+			partLow := strings.ToLower(part)
+			for _, el := range els {
+				text, _ := el.Text()
+				if strings.Contains(strings.ToLower(text), partLow) {
+					if err := el.Click(); err == nil {
+						log.Printf("[greenhouse] combobox #%s: dual major — matched component %q (full: %q)", id, strings.TrimSpace(text), value)
+						time.Sleep(200 * time.Millisecond)
+						return true
 					}
 				}
 			}
@@ -2415,11 +2685,13 @@ func fillGreenhouseComboboxOrOther(wd selenium.WebDriver, id, value string, wait
 
 	// Phase 3: no "Other" option either — first-option fallback.
 	if els := openAndType(value, waitMs/2); els != nil {
-		if err := els[0].Click(); err == nil {
-			text, _ := els[0].Text()
-			log.Printf("[greenhouse] combobox #%s: first-option fallback %q", id, strings.TrimSpace(text))
-			time.Sleep(200 * time.Millisecond)
-			return true
+		if safe := firstSafeOption(els); safe != nil {
+			if err := safe.Click(); err == nil {
+				text, _ := safe.Text()
+				log.Printf("[greenhouse] combobox #%s: first-option fallback %q", id, strings.TrimSpace(text))
+				time.Sleep(200 * time.Millisecond)
+				return true
+			}
 		}
 	}
 
@@ -2580,10 +2852,10 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 	// Both React combobox and native <select> variants are covered.
 	fillComboboxByLabel(wd, "based in the following", "yes")
 	fillComboboxByLabel(wd, "united states or canada", "no")
-	fillComboboxByLabel(wd, "willing to relocate to the united states", "no")
-	fillComboboxByLabel(wd, "located in or willing to relocate", "no")
-	trySetSelectByLabel(wd, "willing to relocate to the united states", "no")
-	trySetSelectByLabel(wd, "located in or willing to relocate", "no")
+	fillComboboxByLabel(wd, "willing to relocate to the united states", "yes")
+	fillComboboxByLabel(wd, "located in or willing to relocate", "yes")
+	trySetSelectByLabel(wd, "willing to relocate to the united states", "yes")
+	trySetSelectByLabel(wd, "located in or willing to relocate", "yes")
 	trySetSelectByLabel(wd, "reside in the united states", "no")
 
 	// EEO/demographics — "wish to answer" matches the standard Greenhouse decline
@@ -2645,12 +2917,25 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 	}
 	if info.FieldOfStudy != "" {
 		// Combobox: try field name; fall back to "Other" if not in list.
+		// fillGreenhouseComboboxOrOther selects the first component of a dual major
+		// in discipline_0 (via Phase 1b).  The second component must be filed into
+		// discipline_1 explicitly — the function only fills the combobox it is given.
 		fillGreenhouseComboboxOrOther(wd, "discipline_0", info.FieldOfStudy, 800)
-		tryFillByLabel(wd, "field of study", info.FieldOfStudy)
-		tryFillByLabel(wd, "major", info.FieldOfStudy)
-		tryFillByLabel(wd, "discipline", info.FieldOfStudy)
-		trySetSelectByLabel(wd, "field of study", info.FieldOfStudy)
-		trySetSelectByLabel(wd, "major", info.FieldOfStudy)
+		if dualParts := splitDualMajor(info.FieldOfStudy); len(dualParts) > 1 {
+			fillGreenhouseComboboxOrOther(wd, "discipline_1", dualParts[1], 800)
+		}
+		// For text inputs and selects use only the first major component — the
+		// combined "A/B" string can't be matched against a single option or typed
+		// cleanly into a text field.
+		primaryMajor := info.FieldOfStudy
+		if parts := splitDualMajor(info.FieldOfStudy); len(parts) > 0 {
+			primaryMajor = parts[0]
+		}
+		tryFillByLabel(wd, "field of study", primaryMajor)
+		tryFillByLabel(wd, "major", primaryMajor)
+		tryFillByLabel(wd, "discipline", primaryMajor)
+		trySetSelectByLabel(wd, "field of study", primaryMajor)
+		trySetSelectByLabel(wd, "major", primaryMajor)
 	}
 
 	// Mop-up pass: find every remaining unfilled React Select combobox using
@@ -2660,27 +2945,61 @@ func fillGreenhouse(ctx context.Context, wd selenium.WebDriver, info ApplicantIn
 	fillGreenhouseAllUnfilledDropdowns(wd, sponsorAns, authAns, info)
 }
 
-// fillGreenhouseEEODecline selects the "decline to answer" option from an EEO
-// React Select combobox.  Different ATS instances phrase the decline option
-// differently ("I don't wish to answer", "Prefer not to say", "Decline to
-// self-identify", etc.), so we try several needles.  If none match, we open
-// the dropdown with all options visible and click the last one — Greenhouse EEO
-// forms always place the decline option last.
-func fillGreenhouseEEODecline(wd selenium.WebDriver, id string) {
-	for _, needle := range []string{
-		"decline",       // "Decline To Self Identify" (most common Greenhouse phrasing)
-		"wish to answer", // "I don't wish to answer"
-		"prefer not",   // "I prefer not to answer"
-		"no response",
-		"not to disclose",
-		"choose not",
-	} {
-		if fillGreenhouseComboboxByID(wd, id, needle, 800) {
-			return
+// isBotTrapOption returns true when the option text looks like a bot-detection
+// trap that must never be selected (e.g. "I am an AI or automated program").
+func isBotTrapOption(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(t, "i am an ai") ||
+		strings.Contains(t, "automated program") ||
+		strings.Contains(t, "i am a bot") ||
+		strings.Contains(t, "i am a robot") ||
+		strings.Contains(t, "not a human") ||
+		(strings.Contains(t, "automated") && strings.Contains(t, "program"))
+}
+
+// firstSafeOption returns the first element from els whose text is not a
+// bot-trap option, or nil when every option is a trap (should never happen).
+func firstSafeOption(els []selenium.WebElement) selenium.WebElement {
+	for _, el := range els {
+		text, _ := el.Text()
+		if !isBotTrapOption(text) {
+			return el
 		}
 	}
-	// All typed needles failed — open the dropdown with no filter text and
-	// click the last visible option (always the decline entry in GH EEO forms).
+	return nil
+}
+
+// eeoDeclineScore returns a priority score for an EEO dropdown option text.
+// Higher score = better "decline to answer" match.  Positive scores are
+// eligible; the highest scorer is clicked.  Returns 0 when the text looks
+// like a real demographic answer (should never be selected).
+func eeoDeclineScore(text string) int {
+	t := strings.ToLower(text)
+	switch {
+	case strings.Contains(t, "decline"):
+		return 10
+	case strings.Contains(t, "prefer not"):
+		return 9
+	case strings.Contains(t, "wish to answer") || strings.Contains(t, "not to answer"):
+		return 8
+	case strings.Contains(t, "choose not"):
+		return 7
+	case strings.Contains(t, "not to disclose") || strings.Contains(t, "not disclose"):
+		return 6
+	case strings.Contains(t, "no response") || strings.Contains(t, "not specified") || strings.Contains(t, "not provided"):
+		return 5
+	case strings.Contains(t, "i don") || strings.Contains(t, "rather not"):
+		return 4
+	}
+	return 0
+}
+
+// fillGreenhouseEEODecline selects the "decline to answer" option from an EEO
+// React Select combobox by opening the full unfiltered option list and scoring
+// each entry.  Many Greenhouse EEO comboboxes are non-searchable (typing does
+// not filter options), so the previous typed-needle approach wasted ~45 s per
+// field exhausting 6 search attempts before falling back to this exact logic.
+func fillGreenhouseEEODecline(wd selenium.WebDriver, id string) {
 	inp, err := wd.FindElement(selenium.ByCSSSelector, "#"+id)
 	if err != nil {
 		return
@@ -2688,18 +3007,29 @@ func fillGreenhouseEEODecline(wd selenium.WebDriver, id string) {
 	if err := inp.Click(); err != nil {
 		return
 	}
-	// Clear + no typing = show all options
-	_ = inp.Clear()
+	_ = inp.Clear() // clear without typing → show all options unfiltered
 	time.Sleep(600 * time.Millisecond)
+
 	for _, sel := range []string{`[role="listbox"] [role="option"]`, `[role="option"]`} {
 		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
 		if err != nil || len(els) == 0 {
 			continue
 		}
-		last := els[len(els)-1]
-		if err := last.Click(); err == nil {
-			text, _ := last.Text()
-			log.Printf("[greenhouse] EEO combobox #%s: last-option decline %q", id, strings.TrimSpace(text))
+		// Score all options; pick the highest-scoring decline match.
+		bestIdx, bestScore := -1, -1
+		for i, el := range els {
+			text, _ := el.Text()
+			if s := eeoDeclineScore(text); s > bestScore {
+				bestScore = s
+				bestIdx = i
+			}
+		}
+		if bestIdx < 0 {
+			bestIdx = len(els) - 1 // last option is always decline on GH EEO forms
+		}
+		if err := els[bestIdx].Click(); err == nil {
+			text, _ := els[bestIdx].Text()
+			log.Printf("[greenhouse] EEO combobox #%s: decline %q", id, strings.TrimSpace(text))
 			time.Sleep(200 * time.Millisecond)
 			return
 		}
@@ -2721,6 +3051,12 @@ func fillGreenhouseAllUnfilledDropdowns(wd selenium.WebDriver, sponsorAns, authA
 	pairs, ok := res.([]interface{})
 	if !ok || len(pairs) == 0 {
 		return
+	}
+
+	// Compute the location value once for use in geographic combobox cases.
+	locVal := info.City
+	if locVal == "" {
+		locVal = countryDisplayName(info)
 	}
 
 	const eeoDecline = "wish to answer"
@@ -2758,8 +3094,9 @@ func fillGreenhouseAllUnfilledDropdowns(wd selenium.WebDriver, sponsorAns, authA
 			strings.Contains(lbl, "garden leave") ||
 			strings.Contains(lbl, "post-employment"):
 			value = "no"
-		case strings.Contains(lbl, "relocat") ||
-			strings.Contains(lbl, "reside") ||
+		case strings.Contains(lbl, "relocat"):
+			value = "yes"
+		case strings.Contains(lbl, "reside") ||
 			strings.Contains(lbl, "located in") ||
 			strings.Contains(lbl, "united states or canada") ||
 			strings.Contains(lbl, "north america"):
@@ -2773,14 +3110,18 @@ func fillGreenhouseAllUnfilledDropdowns(wd selenium.WebDriver, sponsorAns, authA
 			strings.Contains(lbl, "right to work") ||
 			strings.Contains(lbl, "eligible to work"):
 			value = authAns
+		case strings.Contains(lbl, "disability"):
+			log.Printf("[greenhouse] mop-up: disability combobox #%s label=%q → decline", id, lbl)
+			fillGreenhouseEEODecline(wd, id)
+			continue
+
 		case strings.Contains(lbl, "gender") ||
 			strings.Contains(lbl, "sex ") ||
 			strings.Contains(lbl, "hispanic") ||
 			strings.Contains(lbl, "ethnicity") ||
 			strings.Contains(lbl, "race ") ||
 			strings.Contains(lbl, "racial") ||
-			strings.Contains(lbl, "veteran") ||
-			strings.Contains(lbl, "disability"):
+			strings.Contains(lbl, "veteran"):
 			log.Printf("[greenhouse] mop-up: EEO combobox #%s label=%q → decline", id, lbl)
 			fillGreenhouseEEODecline(wd, id)
 			continue
@@ -2809,6 +3150,18 @@ func fillGreenhouseAllUnfilledDropdowns(wd selenium.WebDriver, sponsorAns, authA
 			v := info.FieldOfStudy
 			log.Printf("[greenhouse] mop-up: field combobox #%s label=%q → %q (other fallback enabled)", id, lbl, v)
 			fillGreenhouseComboboxOrOther(wd, id, v, 1000)
+			continue
+
+		case strings.Contains(lbl, "location") ||
+			strings.Contains(lbl, "where are you located") ||
+			strings.Contains(lbl, "city") ||
+			strings.Contains(lbl, "current location"):
+			if locVal == "" {
+				log.Printf("[greenhouse] mop-up: skipping geographic combobox #%s label=%q (no location in profile)", id, lbl)
+				continue
+			}
+			log.Printf("[greenhouse] mop-up: location combobox #%s label=%q → %q", id, lbl, locVal)
+			fillGreenhouseComboboxByID(wd, id, locVal, 1500)
 			continue
 
 		default:
@@ -3266,6 +3619,172 @@ func fillPersonio(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo
 	uploadResume(wd, resumePath)
 	// fillCommonExtras handles city/country, cover letter, work auth, EEO,
 	// privacy consent checkbox, salary (JS fallback), and availability (JS fallback).
+	fillCommonExtras(ctx, wd, info)
+}
+
+// fillXing fills application forms on Xing and onlyfy (Xing's B2B recruiting
+// platform, onlyfy.com).  Both services share the same React-based application
+// flow and use German field labels by default.
+//
+// Form structure:
+//   Step 1 — personal details (Anrede · Vorname · Nachname · E-Mail · Telefon)
+//   Step 2 — documents (Lebenslauf file-upload zone)
+//   Step 3 — motivation text (Anschreiben / Motivationsschreiben) + salary + start date
+//   Step 4 — privacy/GDPR consent checkbox + submit
+//
+// The generic multi-step navigation loop advances through these steps
+// automatically; this filler fills whatever fields are visible on step 1 and
+// leaves the rest to the per-step mop-up passes.
+func fillXing(ctx context.Context, wd selenium.WebDriver, info ApplicantInfo, resumePath string) {
+	// Xing/onlyfy are React SPAs that take time to hydrate; wait for any name
+	// or email input before attempting to fill.
+	waitForElement(ctx, wd,
+		`input[name="firstName"], input[name="first_name"], `+
+			`input[autocomplete="given-name"], input[type="email"]`,
+		15*time.Second)
+
+	first, last := splitName(info.Name)
+
+	// ── Salutation (Anrede) ───────────────────────────────────────────────────
+	// Xing renders salutation as a native <select> or a custom React combobox
+	// with German options (Herr / Frau / Divers).  fillSalutation handles both;
+	// we call it explicitly here so it runs before the name fields are touched
+	// (the form visually validates top-to-bottom).
+	fillSalutation(wd)
+	// onlyfy sometimes uses a React Select combobox instead of a native select.
+	for _, lbl := range []string{"anrede", "salutation", "gender", "geschlecht"} {
+		if fillComboboxByLabel(wd, lbl, "herr") {
+			break
+		}
+	}
+
+	// ── First name (Vorname) ──────────────────────────────────────────────────
+	if !trySetInput(wd, `input[name="firstName"]`, first) &&
+		!trySetInput(wd, `input[name="first_name"]`, first) &&
+		!trySetInput(wd, `input[name="givenName"]`, first) &&
+		!trySetInput(wd, `input[autocomplete="given-name"]`, first) &&
+		!trySetInput(wd, `input[data-testid*="first" i]`, first) &&
+		!trySetInput(wd, `input[placeholder*="Vorname" i]`, first) &&
+		!trySetInput(wd, `input[placeholder*="First name" i]`, first) {
+		if !tryFillByLabel(wd, "vorname", first) {
+			tryFillByLabel(wd, "first name", first)
+		}
+	}
+
+	// ── Last name (Nachname) ──────────────────────────────────────────────────
+	if !trySetInput(wd, `input[name="lastName"]`, last) &&
+		!trySetInput(wd, `input[name="last_name"]`, last) &&
+		!trySetInput(wd, `input[name="familyName"]`, last) &&
+		!trySetInput(wd, `input[autocomplete="family-name"]`, last) &&
+		!trySetInput(wd, `input[data-testid*="last" i]`, last) &&
+		!trySetInput(wd, `input[placeholder*="Nachname" i]`, last) &&
+		!trySetInput(wd, `input[placeholder*="Last name" i]`, last) {
+		if !tryFillByLabel(wd, "nachname", last) &&
+			!tryFillByLabel(wd, "familienname", last) {
+			tryFillByLabel(wd, "last name", last)
+		}
+	}
+
+	// ── E-Mail ────────────────────────────────────────────────────────────────
+	if !trySetInput(wd, `input[name="email"]`, info.Email) &&
+		!trySetInput(wd, `input[type="email"]`, info.Email) &&
+		!trySetInput(wd, `input[autocomplete="email"]`, info.Email) &&
+		!trySetInput(wd, `input[data-testid*="email" i]`, info.Email) {
+		if !tryFillByLabel(wd, "e-mail", info.Email) {
+			tryFillByLabel(wd, "email", info.Email)
+		}
+	}
+
+	// ── Telefon ───────────────────────────────────────────────────────────────
+	fillPhone(wd, info.Phone)
+
+	// ── Anschreiben / Motivationsschreiben (cover letter text) ────────────────
+	// Xing/onlyfy may show a textarea for a free-text cover letter.  We fill it
+	// here so it is ready if visible on step 1; the mop-up picks it up on later
+	// steps if it appears there instead.
+	if info.CoverLetter != "" {
+		for _, sel := range []string{
+			`textarea[name*="cover" i]`,
+			`textarea[name*="letter" i]`,
+			`textarea[name*="motivat" i]`,
+			`textarea[name*="anschreiben" i]`,
+			`textarea[name*="message" i]`,
+			`textarea[name*="nachricht" i]`,
+			`textarea[name*="text" i]`,
+		} {
+			if trySetInput(wd, sel, info.CoverLetter) {
+				break
+			}
+		}
+		// Label-based fallback for React forms with no name attribute.
+		for _, lbl := range []string{
+			"anschreiben", "motivationsschreiben", "motivationstext",
+			"cover letter", "motivation letter", "message", "nachricht",
+		} {
+			if tryFillByLabel(wd, lbl, info.CoverLetter) {
+				break
+			}
+		}
+	}
+
+	// ── Gehaltsvorstellung (salary expectation) ───────────────────────────────
+	if info.ExpectedSalary != "" {
+		if !trySetInput(wd, `input[name*="salary" i]`, info.ExpectedSalary) &&
+			!trySetInput(wd, `input[name*="gehalt" i]`, info.ExpectedSalary) &&
+			!trySetInput(wd, `input[name*="compensation" i]`, info.ExpectedSalary) {
+			if !tryFillByLabel(wd, "gehaltsvorstellung", info.ExpectedSalary) &&
+				!tryFillByLabel(wd, "gehalt", info.ExpectedSalary) {
+				tryFillByLabel(wd, "salary", info.ExpectedSalary)
+			}
+		}
+	}
+
+	// ── Frühestmöglicher Eintrittstermin (earliest start date) ───────────────
+	if info.EarliestStartDate != "" {
+		if !trySetInput(wd, `input[name*="startDate" i]`, info.EarliestStartDate) &&
+			!trySetInput(wd, `input[name*="start_date" i]`, info.EarliestStartDate) &&
+			!trySetInput(wd, `input[name*="eintrittstermin" i]`, info.EarliestStartDate) &&
+			!trySetInput(wd, `input[name*="availab" i]`, info.EarliestStartDate) &&
+			!trySetInput(wd, `input[type="date"]`, info.EarliestStartDate) {
+			if !tryFillByLabel(wd, "frühestmöglicher eintrittstermin", info.EarliestStartDate) &&
+				!tryFillByLabel(wd, "eintrittstermin", info.EarliestStartDate) &&
+				!tryFillByLabel(wd, "earliest start date", info.EarliestStartDate) {
+				tryFillByLabel(wd, "start date", info.EarliestStartDate)
+			}
+		}
+	}
+
+	// ── Lebenslauf (CV / resume upload) ──────────────────────────────────────
+	// Xing renders a styled drop-zone labelled "Lebenslauf hochladen" that hides
+	// the real file input until the zone is clicked.  We click the zone first so
+	// the file input exists when jsRevealFileInputs runs inside uploadResume.
+	for _, sel := range []string{
+		`[data-testid*="resume-upload" i]`,
+		`[data-testid*="cv-upload" i]`,
+		`[data-testid*="lebenslauf" i]`,
+		`[class*="ResumeUpload" i]`,
+		`[class*="resume-upload" i]`,
+		`[class*="cv-upload" i]`,
+		`button[aria-label*="lebenslauf" i]`,
+		`button[aria-label*="lebenslauf hochladen" i]`,
+		`[class*="upload-area" i]`,
+		`[class*="uploadArea" i]`,
+		`[class*="dropzone" i]:not(input)`,
+		`[class*="drop-zone" i]:not(input)`,
+		`[class*="file-upload" i]:not(input)`,
+	} {
+		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+		if err == nil && len(els) > 0 {
+			_ = els[0].Click()
+			time.Sleep(500 * time.Millisecond)
+			break
+		}
+	}
+	uploadResume(wd, resumePath)
+
+	// fillCommonExtras handles: LinkedIn, city/country, work eligibility, EEO,
+	// GDPR/privacy consent checkbox, and the JS-based mop-up for any fields the
+	// targeted fills above missed.
 	fillCommonExtras(ctx, wd, info)
 }
 
@@ -3768,6 +4287,25 @@ var deadPagePhrases = []string{
 	"page does not exist",
 	"this page no longer exists",
 	"we couldn't find that page",
+	// Recruitee
+	"this offer is no longer active",
+	"this offer has been closed",
+	"this offer is closed",
+	"offer is no longer active",
+	// Jobvite
+	"this job is no longer available",
+	"this requisition is closed",
+	"position is no longer available",
+	// Personio
+	"this job posting is no longer active",
+	"this job is no longer active",
+	"job is no longer active",
+	"stelle ist nicht mehr aktiv",
+	"stelle ist leider nicht mehr verfügbar",
+	"diese stelle ist leider nicht mehr verfügbar",
+	// SmartRecruiters
+	"this job has been closed",
+	"job ad has been deactivated",
 	// German closed / expired
 	"diese stelle ist nicht mehr verfügbar",
 	"diese position ist nicht mehr verfügbar",
@@ -3934,6 +4472,14 @@ return false;`, []interface{}{appFormSelector})
 
 	clicked := false
 
+	// scrollAndClick scrolls an element into view via JS before clicking so
+	// off-screen buttons (sticky headers, below-the-fold CTAs) don't return
+	// "element not interactable" from WebDriver.
+	scrollAndClick := func(el selenium.WebElement) bool {
+		_, _ = wd.ExecuteScript("arguments[0].scrollIntoView({block:'center'})", []interface{}{el})
+		return el.Click() == nil
+	}
+
 	// 1. Attribute-based CSS — highest precision, platform-specific IDs/classes.
 	// Ordered: ATS-specific first, then generic data attributes.
 	for _, sel := range []string{
@@ -3955,7 +4501,7 @@ return false;`, []interface{}{appFormSelector})
 		}
 		// Try every match — the first one in DOM order may be off-screen.
 		for _, el := range els {
-			if el.Click() == nil {
+			if scrollAndClick(el) {
 				clicked = true
 				break
 			}
@@ -3970,16 +4516,22 @@ return false;`, []interface{}{appFormSelector})
 	if !clicked {
 		const lc = `translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')`
 		for _, phrase := range []string{
-			// English
+			// English — longest/most-specific first
 			"apply to this job",
 			"apply for this position",
 			"apply for this role",
 			"apply for this job",
+			"continue to application",
+			"proceed to application",
+			"submit your application",
+			"submit application",
 			"start your application",
 			"start application",
 			"begin application",
 			"apply with linkedin",
 			"apply with resume",
+			"apply online",
+			"apply here",
 			"quick apply",
 			"1-click apply",
 			"apply now",
@@ -3998,7 +4550,7 @@ return false;`, []interface{}{appFormSelector})
 				continue
 			}
 			for _, el := range els {
-				if el.Click() == nil {
+				if scrollAndClick(el) {
 					clicked = true
 					break
 				}
@@ -4015,7 +4567,7 @@ return false;`, []interface{}{appFormSelector})
 				els, err := wd.FindElements(selenium.ByXPATH, xpath)
 				if err == nil {
 					for _, el := range els {
-						if el.Click() == nil {
+						if scrollAndClick(el) {
 							clicked = true
 							break
 						}
@@ -4032,14 +4584,19 @@ return false;`, []interface{}{appFormSelector})
 	// off-screen buttons (sticky headers, bottom CTAs) are reachable.
 	// Excludes nav/footer/[role="navigation"] but NOT <header> — legitimate
 	// ATS apply buttons are frequently placed inside sticky page headers.
+	// offsetParent === null is true for BOTH display:none ancestors (hidden,
+	// skip) and position:fixed elements (visible sticky CTAs, keep).
 	if !clicked {
 		const jsApply = `
-var MULTI = /\b(apply\s+(?:to\s+this\s+(?:job|position|role)|for\s+this\s+(?:job|position|role)|now|with\s+\S+)|easy\s+apply|quick\s+apply|(?:start|begin)\s+(?:your\s+)?application|1[\s-]click\s+apply|jetzt\s+bewerben|zur\s+bewerbung|bewerbung\s+starten|bewerben\s+sie\s+sich|hier\s+bewerben|online\s+bewerben)\b/i;
+var MULTI = /\b(apply\s+(?:to\s+this\s+(?:job|position|role)|for\s+this\s+(?:job|position|role)|now|with\s+\S+)|easy\s+apply|quick\s+apply|apply\s+(?:here|online)|apply\s+for\s+job|(?:start|begin)\s+(?:your\s+)?application|(?:continue|proceed)\s+to\s+application|submit\s+(?:your\s+)?application|1[\s-]click\s+apply|jetzt\s+bewerben|zur\s+bewerbung|bewerbung\s+starten|bewerben\s+sie\s+sich|hier\s+bewerben|online\s+bewerben)\b/i;
 var BARE  = /^\s*(?:apply|bewerben)\s*$/i;
 var all = Array.from(document.querySelectorAll('button, a[href], [role="button"]'));
 for (var i = 0; i < all.length; i++) {
     var el = all[i];
-    if (el.disabled || el.offsetParent === null) continue;
+    if (el.disabled) continue;
+    // Skip truly hidden elements (display:none ancestor) but keep position:fixed
+    // sticky CTAs (common pattern for ATS "Apply Now" buttons in page headers).
+    if (el.offsetParent === null && window.getComputedStyle(el).position !== 'fixed') continue;
     if (el.closest('nav, footer, [role="navigation"]')) continue;
     var t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
     if (MULTI.test(t) || BARE.test(t)) {
@@ -4056,11 +4613,17 @@ return false;`
 	}
 
 	if clicked {
-		// Wait for application-specific inputs (email / name fields) rather than
-		// any text input.  When Apply opens a modal overlay the underlying page
-		// may already have a search bar that would satisfy formReadySelector
-		// immediately, before the modal's own fields have rendered.
-		waitForElement(ctx, wd, appFormSelector, 12*time.Second)
+		// Wait for application-specific inputs (email / name fields) first.
+		// When Apply opens a modal overlay the underlying page may already have
+		// a search bar that would satisfy formReadySelector immediately, before
+		// the modal's own fields have rendered.
+		// If appFormSelector does not appear within 10 s (multi-step forms,
+		// resume-upload-first forms), fall back to any visible text input so
+		// the pipeline can detect that the form IS loaded without burning the
+		// full 20 s that the downstream check would otherwise spend.
+		if waitForElement(ctx, wd, appFormSelector, 10*time.Second) == nil {
+			waitForElement(ctx, wd, formReadySelector, 3*time.Second)
+		}
 	}
 	return clicked
 }
@@ -4166,7 +4729,7 @@ func tryFillByLabel(wd selenium.WebDriver, labelText, value string) bool {
 // returning true when it clicked something.  Used as a last resort after all
 // CSS/XPath attempts fail.
 const jsSubmit = `
-var WORDS = /\b(submit|apply|send|complete|finish|confirm)\b/i;
+var WORDS = /\b(submit|apply|send|complete|finish|confirm|absenden|abschicken|einreichen|bewerben)\b/i;
 function vis(el){
     if(el.disabled) return false;
     var r=el.getBoundingClientRect();
@@ -4241,14 +4804,37 @@ func trySetInput(wd selenium.WebDriver, selector, value string) bool {
 
 // uploadSelectors are tried in order by uploadResume.
 // Ordered from most specific (known attribute values) to most generic.
+// name* selectors without [type="file"] are intentionally kept loose for the
+// well-known names (resume, cv, attachment) where false-positive risk is low.
+// Broader names (file, upload, document, etc.) are scoped to [type="file"] to
+// avoid accidentally filling a plain text input with a file path.
 var uploadSelectors = []string{
+	// Exact well-known names
 	`input[name="resume"]`,
 	`input[name="cv"]`,
+	// Substring well-known names
 	`input[name*="resume" i]`,
 	`input[name*="cv" i]`,
 	`input[name*="attachment" i]`,
+	// Broader name patterns — scoped to type=file to avoid false positives
+	`input[type="file"][name*="file" i]`,
+	`input[type="file"][name*="upload" i]`,
+	`input[type="file"][name*="document" i]`,
+	`input[type="file"][name*="lebenslauf" i]`, // German: CV/résumé
+	`input[type="file"][name*="unterlagen" i]`, // German: documents
+	`input[type="file"][name*="bewerbung" i]`,  // German: application
+	`input[type="file"][name*="datei" i]`,      // German: file
+	// accept-attribute selectors (platform-agnostic, very reliable)
 	`input[accept*=".pdf" i]`,
 	`input[accept*="pdf" i]`,
+	// data-testid / aria patterns used by modern React/Vue ATS
+	`input[type="file"][data-testid*="upload" i]`,
+	`input[type="file"][data-testid*="file" i]`,
+	`input[type="file"][data-testid*="resume" i]`,
+	`input[type="file"][aria-label*="resume" i]`,
+	`input[type="file"][aria-label*="cv" i]`,
+	`input[type="file"][aria-label*="lebenslauf" i]`,
+	// Broadest fallback
 	`input[type="file"]`,
 }
 
@@ -4337,6 +4923,41 @@ func uploadResume(wd selenium.WebDriver, path string) bool {
 		if found {
 			return true
 		}
+	}
+
+	// Pass 3: click visible upload-zone triggers that lazily create the file input.
+	// Workday (de-DE and other regions) and some generic ATS platforms render a
+	// styled drop-zone or button; the real <input type="file"> only appears in the
+	// DOM after that element is clicked.  Try each trigger candidate, wait for the
+	// DOM to settle, then retry the full selector sweep.
+	uploadTriggers := []string{
+		`[data-automation-id="resumeUpload"]`,
+		`[data-automation-id="sourceUpload_file"]`,
+		`[data-automation-id*="upload" i]:not(input)`,
+		`[data-automation-id*="resume" i]:not(input)`,
+		`button[aria-label*="upload" i]`,
+		`button[aria-label*="lebenslauf" i]`,
+		`button[aria-label*="resume" i]`,
+		`[class*="upload-trigger" i]`,
+		`[class*="uploadTrigger" i]`,
+		`[class*="file-select" i]`,
+		`[class*="fileSelect" i]`,
+		`[class*="upload-btn" i]`,
+		`[class*="uploadBtn" i]`,
+		`[class*="drop-zone" i]:not(input)`,
+		`[class*="dropzone" i]:not(input)`,
+	}
+	for _, sel := range uploadTriggers {
+		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
+		if err != nil || len(els) == 0 {
+			continue
+		}
+		_ = els[0].Click()
+		time.Sleep(600 * time.Millisecond)
+		if tryInCurrentFrame() {
+			return true
+		}
+		break
 	}
 
 	log.Printf("[upload] WARNING: no file input found on page — resume not uploaded")
@@ -4446,8 +5067,10 @@ func submitWithAshbyRetry(ctx context.Context, wd selenium.WebDriver, info Appli
 				fillComboboxByLabel(wd, "nature of your right to work", "unlimited")
 				fillComboboxByLabel(wd, "right to work", authAns)
 
-			case contains(msg, "gender", "ethnicity", "race", "disability", "veteran"):
+			case contains(msg, "gender", "ethnicity", "race", "veteran"):
 				wd.ExecuteScript(jsHandleEEORadios, []interface{}{"decline", "decline"}) //nolint:errcheck
+			case contains(msg, "disability"):
+				wd.ExecuteScript(jsHandleDisabilityForm, nil) //nolint:errcheck
 
 			case contains(msg, "language", "german", "english proficiency", "deutsch"):
 				for _, lbl := range []string{"german language", "level of german", "german proficiency", "deutsch", "english language", "level of english"} {
@@ -4721,6 +5344,56 @@ func clickConfirmationModal(wd selenium.WebDriver) {
 	}
 }
 
+// clickNextStepButton detects and clicks a "Next / Continue / Weiter" step-advance
+// button on multi-step application forms.  It explicitly refuses to click final-
+// submission buttons (submit/apply/send/complete) so the submit logic in
+// FillApplication stays in control of the actual submission.
+//
+// Returns true when a step-advance click was performed, false when no such
+// button is present (caller should attempt submit instead).
+func clickNextStepButton(ctx context.Context, wd selenium.WebDriver) bool {
+	res, err := wd.ExecuteScript(jsClickNextStep, nil)
+	if err != nil {
+		return false
+	}
+	clicked, _ := res.(bool)
+	return clicked
+}
+
+// jsClickNextStep finds and clicks the first visible, enabled step-advance button
+// ("Next", "Continue", "Weiter", "Nächste Seite", etc.) that is NOT a final
+// submit/apply button.  It scrolls the element into view before clicking so
+// below-the-fold buttons are reachable.
+//
+// Returns true when a click was performed.
+const jsClickNextStep = `
+(function(){
+    // Labels that advance to the next form step.
+    var NEXT_RE = /^\s*(next(\s+step)?|continue(\s+to\s+\w+)?|proceed|save\s+and\s+continue|save\s+&\s+continue|save\s+and\s+proceed|nächste(\s+seite)?|nächster\s+schritt|weiter(\s+zur\s+\S+)?|fortfahren|siguiente|suivant|avanti|次へ|volgende)\s*$/i;
+    // Labels that submit the application — never advance with these.
+    var SUBMIT_RE = /\b(submit|apply|send|complete|finish|confirm|absenden|bewerben|bewerbung\s+absenden|bewerbung\s+senden)\b/i;
+
+    var all = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]'));
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+        // Skip hidden elements (but keep position:fixed buttons).
+        if (el.offsetParent === null && window.getComputedStyle(el).position !== 'fixed') continue;
+        var r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        var t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+        if (!t) continue;
+        if (SUBMIT_RE.test(t)) continue;   // never advance via a submit button
+        if (NEXT_RE.test(t)) {
+            el.scrollIntoView({block: 'center'});
+            el.click();
+            return true;
+        }
+    }
+    return false;
+})()
+`
+
 // submitButtonTexts covers the button labels used across ATS platforms.
 // Ordered from most specific to most generic to avoid false positives.
 var submitButtonTexts = []string{
@@ -4728,7 +5401,13 @@ var submitButtonTexts = []string{
 	"complete application", "complete my application",
 	"send application", "send my application",
 	"apply now", "apply for this job", "apply for this position",
+	// German
+	"bewerbung absenden", "bewerbung abschicken", "bewerbung einreichen",
+	"bewerbung senden", "bewerbung abgeben",
+	"jetzt bewerben",
 	"submit", "apply", "send", "complete", "finish", "confirm",
+	// German short forms
+	"absenden", "abschicken", "einreichen", "bewerben",
 }
 
 // clickSubmit tries CSS attribute selectors, XPath text search across all

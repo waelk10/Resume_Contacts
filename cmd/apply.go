@@ -229,6 +229,39 @@ All flags:
 		return
 	}
 
+	// Skip URLs that were already successfully applied to in a previous run.
+	// We read the compact log (written by every run) and build a set of URLs
+	// whose last-recorded status is "applied".  "error", "skipped", and
+	// "dry-run" entries are retried normally.
+	if recs, err := applylog.ReadAll(defaultCompactLogFile); err == nil && len(recs) > 0 {
+		latest := applylog.DeduplicateByURL(recs)
+		alreadyApplied := make(map[string]bool, len(latest))
+		for _, r := range latest {
+			if r.Status == "applied" {
+				alreadyApplied[r.URL] = true
+			}
+		}
+		if len(alreadyApplied) > 0 {
+			filtered := urls[:0]
+			for _, u := range urls {
+				if alreadyApplied[u] {
+					log.Printf("[apply] skipping already-applied URL: %s", u)
+				} else {
+					filtered = append(filtered, u)
+				}
+			}
+			skippedCount := len(urls) - len(filtered)
+			if skippedCount > 0 {
+				fmt.Printf("Skipped %d already-applied URL(s) (found in %s).\n", skippedCount, defaultCompactLogFile)
+			}
+			urls = filtered
+			if len(urls) == 0 {
+				fmt.Println("All URLs were already applied to — nothing to do.")
+				return
+			}
+		}
+	}
+
 	// Load cover letter text from file if supplied.
 	var coverLetterText string
 	if coverLetterPath != "" {

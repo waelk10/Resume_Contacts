@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +23,7 @@ import (
 var platformCooldowns = map[string]time.Duration{
 	"ashby":      60 * time.Second,
 	"greenhouse": 20 * time.Second, // baseline; email-verify forces 65 min
+	"workable":   30 * time.Second, // baseline; captcha forces 10 min
 }
 
 // ApplicantInfo holds the personal details typed into application forms.
@@ -133,8 +133,6 @@ type Applicator struct {
 	browser    *Browser
 	cooldownMu sync.Mutex
 	lastRun    map[string]time.Time // platform → time we last started an application
-	inFlightMu sync.Mutex
-	inFlight   map[string]bool // keys: platform names and "co:<company>" — prevents parallel fills on the same platform/company
 }
 
 // New creates an Applicator and launches the underlying browser.
@@ -185,7 +183,7 @@ func New(cfg Config) (*Applicator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("browser init: %w", err)
 	}
-	return &Applicator{cfg: cfg, browser: b, lastRun: make(map[string]time.Time), inFlight: make(map[string]bool)}, nil
+	return &Applicator{cfg: cfg, browser: b, lastRun: make(map[string]time.Time)}, nil
 }
 
 // enrichFromResume parses the CV PDF and back-fills any ApplicantInfo fields
@@ -239,8 +237,11 @@ func (a *Applicator) Close() { a.browser.Close() }
 // Run processes each URL and returns one Result per URL.
 // Concurrency is capped at cfg.Concurrency (minimum 1).
 //
-// When a platform cooldown is active the URL is re-queued so that other URLs
-// can be processed in the meantime; workers never block idle on a cooldown.
+// URLs are grouped by (platform, company) — the same boundary that determines
+// whether two applications would collide.  Each group is handled by exactly one
+// goroutine that processes its URLs serially, so no two workers ever race on the
+// same platform+company pair and no requeuing is needed.  A shared semaphore
+// caps the total number of in-flight browser pages at cfg.Concurrency.
 func (a *Applicator) Run(ctx context.Context, urls []string) []Result {
 	conc := a.cfg.Concurrency
 	if conc < 1 {
@@ -252,9 +253,21 @@ func (a *Applicator) Run(ctx context.Context, urls []string) []Result {
 		return results
 	}
 
-	// outstanding counts items that have not yet been completed (applied/error/
-	// pending/dry-run).  allDone is closed when it reaches zero — that is the
-	// sole signal for workers to stop.
+	type group struct {
+		platform string
+		indices  []int
+	}
+	groupMap := make(map[string]*group)
+	var groupOrder []string
+	for i, u := range urls {
+		k := groupKey(u)
+		if _, ok := groupMap[k]; !ok {
+			groupMap[k] = &group{platform: detectPlatform(u)}
+			groupOrder = append(groupOrder, k)
+		}
+		groupMap[k].indices = append(groupMap[k].indices, i)
+	}
+
 	var outstanding atomic.Int64
 	outstanding.Store(int64(len(urls)))
 	allDone := make(chan struct{})
@@ -269,103 +282,18 @@ func (a *Applicator) Run(ctx context.Context, urls []string) []Result {
 		}
 	}
 
-	// queue is open (never closed by Run).  Its capacity is len(urls)+conc so
-	// that in-flight re-queues from goroutines never block when workers are busy.
-	// URLs are interleaved by platform/FQDN so that the first N items dequeued
-	// by N workers each come from a different platform, maximising effective
-	// concurrency and minimising immediate re-queues from the inFlight lock.
-	queue := make(chan int, len(urls)+conc)
-	for _, i := range interleavedByPlatform(urls) {
-		queue <- i
-	}
-
+	sem := make(chan struct{}, conc)
 	var wg sync.WaitGroup
-	for w := 0; w < conc; w++ {
+
+	for _, k := range groupOrder {
+		g := groupMap[k]
 		wg.Add(1)
-		go func() {
+		go func(g *group) {
 			defer wg.Done()
-			for {
-				select {
-				case <-allDone:
-					return
-				case idx := <-queue:
-					if ctx.Err() != nil {
-						completeOne(idx, Result{URL: urls[idx], Status: "pending"})
-						continue
-					}
-
-					// Check platform cooldown before consuming this application slot.
-					// If a wait is needed, re-queue the URL and let this worker pick
-					// up another one instead of blocking idle.
-					platform := detectPlatform(urls[idx])
-					if cd, ok := platformCooldowns[platform]; ok {
-						a.cooldownMu.Lock()
-						wait := cd - time.Since(a.lastRun[platform])
-						a.cooldownMu.Unlock()
-						if wait > 0 {
-							// Only log on the first sight of this cooldown (wait ≈ full
-							// cooldown duration) to avoid flooding the log every 500 ms.
-							if wait > cd-2*time.Second {
-								log.Printf("[apply] %s cooldown — re-queuing %s, %.0fs remaining",
-									platform, urls[idx], wait.Seconds())
-							}
-							go func(i int, w time.Duration) {
-								// Back-off capped at 500 ms so other URLs get picked
-								// up quickly; the item will cycle through again until
-								// the cooldown has actually elapsed.
-								sleep := w
-								if sleep > 500*time.Millisecond {
-									sleep = 500 * time.Millisecond
-								}
-								select {
-								case <-ctx.Done():
-									completeOne(i, Result{URL: urls[i], Status: "pending"})
-									return
-								case <-time.After(sleep):
-								}
-								select {
-								case queue <- i:
-								case <-allDone:
-									// Defensive: allDone should not fire while this
-									// item is still outstanding, but handle cleanly.
-									completeOne(i, Result{URL: urls[i], Status: "pending"})
-								}
-							}(idx, wait)
-							continue
-						}
-						// Cooldown elapsed — stamp lastRun before the application starts.
-						a.cooldownMu.Lock()
-						a.lastRun[platform] = time.Now()
-						a.cooldownMu.Unlock()
-					}
-
-					r := a.processOne(ctx, urls[idx])
-					if r.Requeue && ctx.Err() == nil {
-						// Temporary blocker (e.g. email verification cooldown).
-						// Push the URL back onto the queue; the cooldown check
-						// at the top of the loop will delay it until ready.
-						go func(i int) {
-							select {
-							case <-ctx.Done():
-								completeOne(i, Result{URL: urls[i], Status: "pending"})
-								return
-							case <-time.After(500 * time.Millisecond):
-							}
-							select {
-							case queue <- i:
-							case <-allDone:
-								completeOne(i, Result{URL: urls[i], Status: "pending"})
-							}
-						}(idx)
-					} else if r.Requeue {
-						// Context cancelled while requeue was requested.
-						completeOne(idx, Result{URL: urls[idx], Status: "pending"})
-					} else {
-						completeOne(idx, r)
-					}
-				}
+			for _, idx := range g.indices {
+				completeOne(idx, a.runOne(ctx, urls[idx], g.platform, sem))
 			}
-		}()
+		}(g)
 	}
 
 	<-allDone
@@ -373,49 +301,93 @@ func (a *Applicator) Run(ctx context.Context, urls []string) []Result {
 	return results
 }
 
-// interleavedByPlatform returns indices into urls in a round-robin order over
-// detected platforms/FQDNs.  Generic (non-ATS) URLs are bucketed by hostname
-// so different company sites each get their own slot in the rotation.
-func interleavedByPlatform(urls []string) []int {
-	type entry struct {
-		key     string
-		indices []int
-	}
-	groupMap := make(map[string]*entry)
-	var order []string // preserves first-seen key order for determinism
-
-	for i, u := range urls {
-		p := detectPlatform(u)
-		key := p
-		if p == "generic" {
-			if parsed, err := url.Parse(u); err == nil {
-				key = "generic:" + parsed.Hostname()
-			}
+// groupKey returns the scheduling-group key for a URL: the (platform, company)
+// pair that determines whether two applications could collide.  URLs with the
+// same key are always processed serially by a single goroutine.
+func groupKey(rawURL string) string {
+	p := detectPlatform(rawURL)
+	if p == "generic" {
+		u, err := url.Parse(rawURL)
+		if err == nil {
+			return "generic:" + u.Hostname()
 		}
-		if _, exists := groupMap[key]; !exists {
-			groupMap[key] = &entry{key: key}
-			order = append(order, key)
-		}
-		groupMap[key].indices = append(groupMap[key].indices, i)
+		return "generic"
 	}
+	if company := companyFromURL(rawURL); company != "" {
+		return p + ":" + company
+	}
+	return p
+}
 
-	out := make([]int, 0, len(urls))
-	offsets := make(map[string]int, len(order))
+// runOne processes a single URL, blocking on cooldowns and the global
+// concurrency semaphore before calling processOne.  When processOne returns
+// Requeue (email-verification cooldown), runOne loops — processOne has already
+// stamped lastRun with the appropriate offset, so the cooldown wait at the top
+// of the loop sleeps the right duration before retrying.
+//
+// Cooldown keying:
+//   - Per-group key (e.g. "greenhouse:grafanalabs"): rate-limits consecutive
+//     submissions to the same company.  Stamped here after each attempt.
+//   - Platform key (e.g. "greenhouse"): freeze overrides only — set by
+//     processOne on captcha or email-verification events that must block every
+//     company on the same ATS.  Never stamped here, so different companies on
+//     the same platform can run fully in parallel.
+func (a *Applicator) runOne(ctx context.Context, rawURL, platform string, sem chan struct{}) Result {
+	gk := groupKey(rawURL)
 	for {
-		added := 0
-		for _, k := range order {
-			off := offsets[k]
-			if off < len(groupMap[k].indices) {
-				out = append(out, groupMap[k].indices[off])
-				offsets[k]++
-				added++
+		if ctx.Err() != nil {
+			return Result{URL: rawURL, Status: "pending"}
+		}
+
+		if cd, ok := platformCooldowns[platform]; ok {
+			for {
+				a.cooldownMu.Lock()
+				// Per-group: rate-limit this (platform, company) pair.
+				waitGroup := cd - time.Since(a.lastRun[gk])
+				// Platform-wide: catch email-verify / captcha freezes set by
+				// processOne that must stall every company on this ATS.
+				waitPlatform := cd - time.Since(a.lastRun[platform])
+				wait := waitGroup
+				if waitPlatform > wait {
+					wait = waitPlatform
+				}
+				a.cooldownMu.Unlock()
+				if wait <= 0 {
+					break
+				}
+				log.Printf("[apply] %s cooldown — waiting %.0fs before %s", platform, wait.Seconds(), rawURL)
+				select {
+				case <-ctx.Done():
+					return Result{URL: rawURL, Status: "pending"}
+				case <-time.After(wait):
+				}
 			}
 		}
-		if added == 0 {
-			break
+
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return Result{URL: rawURL, Status: "pending"}
 		}
+
+		if _, ok := platformCooldowns[platform]; ok {
+			a.cooldownMu.Lock()
+			a.lastRun[gk] = time.Now() // stamp group key only; platform key reserved for freeze overrides
+			a.cooldownMu.Unlock()
+		}
+
+		r := a.processOne(ctx, rawURL)
+		<-sem
+
+		if !r.Requeue || ctx.Err() != nil {
+			if r.Requeue {
+				return Result{URL: rawURL, Status: "pending"}
+			}
+			return r
+		}
+		// Requeue: processOne set lastRun[platform] with the freeze offset;
+		// loop back so the platform-wide wait fires before retrying.
 	}
-	return out
 }
 
 func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
@@ -430,57 +402,6 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 	}
 	res.Company = job.Company
 	res.Title = job.Title
-
-	// Prevent two workers from filling forms on the same platform or company
-	// simultaneously — either can trigger rate-limiting / duplicate detection.
-	//
-	// For "generic" one-off pages there is no shared platform state, so we
-	// skip the platform key and guard only on the FQDN instead (allowing
-	// parallel fills across different company sites).
-	var platformKey, hostKey string
-	if job.ATSPlatform == "generic" {
-		if u, err2 := url.Parse(rawURL); err2 == nil {
-			hostKey = "host:" + u.Hostname()
-		}
-	} else {
-		platformKey = job.ATSPlatform
-	}
-	companyKey := "co:" + strings.ToLower(strings.TrimSpace(job.Company))
-	acquired := false
-	a.inFlightMu.Lock()
-	platformFree := platformKey == "" || !a.inFlight[platformKey]
-	hostFree := hostKey == "" || !a.inFlight[hostKey]
-	companyFree := job.Company == "" || !a.inFlight[companyKey]
-	if platformFree && hostFree && companyFree {
-		if platformKey != "" {
-			a.inFlight[platformKey] = true
-		}
-		if hostKey != "" {
-			a.inFlight[hostKey] = true
-		}
-		if job.Company != "" {
-			a.inFlight[companyKey] = true
-		}
-		acquired = true
-	}
-	a.inFlightMu.Unlock()
-	if !acquired {
-		log.Printf("[apply] %s/%s already in-flight — re-queuing %s", job.ATSPlatform, job.Company, rawURL)
-		return Result{URL: rawURL, Requeue: true}
-	}
-	defer func() {
-		a.inFlightMu.Lock()
-		if platformKey != "" {
-			delete(a.inFlight, platformKey)
-		}
-		if hostKey != "" {
-			delete(a.inFlight, hostKey)
-		}
-		if job.Company != "" {
-			delete(a.inFlight, companyKey)
-		}
-		a.inFlightMu.Unlock()
-	}()
 
 	log.Printf("[apply] %q @ %s  platform=%s", job.Title, job.Company, job.ATSPlatform)
 
@@ -506,6 +427,13 @@ func (a *Applicator) processOne(ctx context.Context, rawURL string) Result {
 		// treat as pending so it is not written to failed_urls.txt.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return Result{URL: rawURL, Status: "pending"}
+		}
+		if errors.Is(err, ErrNoApplicationForm) {
+			// Permanent: job page has no form (expired, removed, or unsupported
+			// platform).  Skip without writing to failed_urls.txt so the URL is
+			// not retried on every subsequent run.
+			res.Status = "skipped"
+			return res
 		}
 		if errors.Is(err, ErrCaptcha) {
 			// Generic forms are one-off pages from unrelated companies, so a

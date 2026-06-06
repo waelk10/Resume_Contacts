@@ -35,6 +35,10 @@ func ParseJobPage(rawURL string) (*JobInfo, error) {
 		".posting-headline h2",
 		".job-title",
 		".jv-job-detail-header h1",
+		// Xing / onlyfy job detail page
+		`[data-testid="job-title"]`,
+		`[class*="JobTitle"]`,
+		`[class*="job-title"]`,
 		"h1",
 	}, ", "), func(el *colly.HTMLElement) {
 		if info.Title == "" {
@@ -49,6 +53,10 @@ func ParseJobPage(rawURL string) (*JobInfo, error) {
 		".posting-categories .sort-by-team",
 		"[itemprop=hiringOrganization]",
 		".employer-name",
+		// Xing / onlyfy
+		`[data-testid="company-name"]`,
+		`[class*="CompanyName"]`,
+		`[class*="company-name"]`,
 	}, ", "), func(el *colly.HTMLElement) {
 		if info.Company == "" {
 			info.Company = strings.TrimSpace(el.Text)
@@ -118,6 +126,8 @@ func detectPlatform(rawURL string) string {
 		return "breezy"
 	case strings.Contains(h, "jobvite.com"):
 		return "jobvite"
+	case strings.Contains(h, "xing.com") || strings.Contains(h, "onlyfy.com"):
+		return "xing"
 	default:
 		return "generic"
 	}

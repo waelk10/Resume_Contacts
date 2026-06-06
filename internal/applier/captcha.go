@@ -19,6 +19,13 @@ const challengePollInterval = 500 * time.Millisecond
 // signal to apply a longer platform cooldown.
 var ErrCaptcha = fmt.Errorf("captcha detected inside form")
 
+// ErrNoApplicationForm is returned by FillApplication when no recognisable
+// application form was found on the page after all pre-apply clicks and
+// consent-wall dismissals have been attempted.  Unlike transient network errors
+// this is treated as permanent: the URL is not written to failed_urls.txt and
+// will not be retried.
+var ErrNoApplicationForm = fmt.Errorf("no application form found on page (job may be closed or removed)")
+
 // ErrEmailVerification is returned by FillApplication when the ATS (most
 // commonly Greenhouse) has sent a verification code to the applicant's email
 // and is waiting for it to be entered before the application can proceed.
@@ -176,26 +183,55 @@ func tryClickRecaptchaV2(wd selenium.WebDriver) {
 // inFormCaptchaSelectors are DOM selectors that indicate a CAPTCHA widget
 // rendered inside an application form (not a full-page WAF wall).
 // Cloudflare Turnstile and hCaptcha are the two most common on Ashby.
+// Note: [data-sitekey] is handled separately via JS to exclude invisible
+// reCAPTCHA v3 (data-size="invisible"), which fires on Lever forms and has
+// no visual presence — treating it as blocking caused 896 false positives.
 var inFormCaptchaSelectors = []string{
 	`iframe[src*="challenges.cloudflare.com"]`, // Cloudflare Turnstile widget
 	`iframe[src*="hcaptcha.com"]`,              // hCaptcha widget
 	`.cf-turnstile`,                            // Turnstile host element
 	`.h-captcha`,                               // hCaptcha host element
-	`[data-sitekey]`,                           // generic captcha container
 }
 
-// detectInFormCaptcha returns ErrCaptcha when a CAPTCHA widget is present
-// inside the page that is not part of a full-page WAF wall.  It is intentionally
-// distinct from isChallengePage, which targets full-page bot-protection screens.
-func detectInFormCaptcha(wd selenium.WebDriver) error {
+// hasInFormCaptcha returns true when any in-form CAPTCHA widget is visible.
+func hasInFormCaptcha(wd selenium.WebDriver) bool {
 	for _, sel := range inFormCaptchaSelectors {
 		els, err := wd.FindElements(selenium.ByCSSSelector, sel)
 		if err == nil && len(els) > 0 {
-			log.Printf("[captcha] in-form captcha detected (%s) — aborting this URL", sel)
-			return ErrCaptcha
+			return true
 		}
 	}
-	return nil
+	res, _ := wd.ExecuteScript(`
+		var els = document.querySelectorAll('[data-sitekey]:not([data-size="invisible"])');
+		for (var i = 0; i < els.length; i++) {
+			var r = els[i].getBoundingClientRect();
+			if (r.width > 0 && r.height > 0) return true;
+		}
+		return false;`, nil)
+	visible, _ := res.(bool)
+	return visible
+}
+
+// detectInFormCaptcha returns ErrCaptcha when an unsolvable CAPTCHA widget is
+// present inside the page.  Before giving up it attempts the same iframe-click
+// approach used by waitForChallenge, because many Turnstile/hCaptcha widgets
+// inside forms resolve on a single checkbox click — the same action that clears
+// a full-page challenge.
+func detectInFormCaptcha(wd selenium.WebDriver) error {
+	if !hasInFormCaptcha(wd) {
+		return nil
+	}
+	log.Printf("[captcha] in-form captcha detected — attempting auto-click")
+	tryClickTurnstile(wd)
+	tryClickHCaptcha(wd)
+	tryClickRecaptchaV2(wd)
+	time.Sleep(3 * time.Second)
+	if !hasInFormCaptcha(wd) {
+		log.Printf("[captcha] in-form captcha auto-clicked — continuing")
+		return nil
+	}
+	log.Printf("[captcha] in-form captcha still present after auto-click — aborting this URL")
+	return ErrCaptcha
 }
 
 // switchAndClick finds the first iframe matching any selector in iframeSelectors,
