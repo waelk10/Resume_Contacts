@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 
+	"Resume_Contacts_Scraper/internal/applylog"
 	"Resume_Contacts_Scraper/internal/output"
 	"Resume_Contacts_Scraper/internal/scraper"
 )
@@ -42,6 +43,7 @@ func appscan(f runFlags) {
 	cfg.Parallelism = f.concurrency
 	cfg.ExtraSeeds = mustLoadSeeds(f.seedsFile)
 	cfg.Countries = f.countries
+	cfg.IgnoreCountries = f.ignoreCountries
 
 	// Role filter: use the user-supplied list when --roles was explicitly passed,
 	// otherwise fall back to the built-in tech keyword list.
@@ -51,24 +53,48 @@ func appscan(f runFlags) {
 	} else {
 		cfg.Roles = defaultTechRoles
 	}
+	cfg.BlockedDomains = f.blockedDomains
 
 	fmt.Println("Starting Application Page Scanner...")
 	countriesLabel := "all"
 	if len(f.countries) > 0 {
 		countriesLabel = strings.Join(f.countries, ",")
 	}
+	ignoreLabel := "none"
+	if len(f.ignoreCountries) > 0 {
+		ignoreLabel = strings.Join(f.ignoreCountries, ",")
+	}
 	rolesLabel := "off"
 	if len(cfg.Roles) > 0 {
 		rolesLabel = fmt.Sprintf("%d keywords", len(cfg.Roles))
 	}
-	fmt.Printf("Concurrency: %d  |  Extra seeds: %d  |  Countries: %s  |  Role filter: %s  |  Output: %s\n\n",
-		f.concurrency, len(cfg.ExtraSeeds), countriesLabel, rolesLabel, appOutputFile)
+	blockedLabel := "none"
+	if len(cfg.BlockedDomains) > 0 {
+		blockedLabel = fmt.Sprintf("%d domain(s)", len(cfg.BlockedDomains))
+	}
+	fmt.Printf("Concurrency: %d  |  Extra seeds: %d  |  Countries: %s  |  Ignore: %s  |  Role filter: %s  |  Blocked: %s  |  Output: %s\n\n",
+		f.concurrency, len(cfg.ExtraSeeds), countriesLabel, ignoreLabel, rolesLabel, blockedLabel, appOutputFile)
 
 	writer, err := output.NewURLWriter(appOutputFile)
 	if err != nil {
 		log.Fatalf("failed to open output file: %v", err)
 	}
 	defer writer.Close()
+
+	// Pre-seed the seen set with URLs already applied to so the scraper never
+	// adds them back to application_pages.txt.
+	if recs, err := applylog.ReadAll(defaultCompactLogFile); err == nil && len(recs) > 0 {
+		var applied []string
+		for _, r := range applylog.DeduplicateByURL(recs) {
+			if r.Status == "applied" {
+				applied = append(applied, r.URL)
+			}
+		}
+		if len(applied) > 0 {
+			writer.MarkSeen(applied...)
+			fmt.Printf("Excluding %d already-applied URL(s) from output.\n", len(applied))
+		}
+	}
 
 	scanner := scraper.NewAppScanner(cfg, func(u string) {
 		ok, err := writer.Write(u)

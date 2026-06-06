@@ -19,16 +19,21 @@ func discoverSeeds(f runFlags) {
 	cfg := sources.DefaultConfig
 	cfg.Concurrency = f.concurrency
 	cfg.Countries = f.countries
+	cfg.IgnoreCountries = f.ignoreCountries
 	cfg.MaxHops = f.hops
 
 	countriesLabel := "all"
 	if len(f.countries) > 0 {
 		countriesLabel = strings.Join(f.countries, ",")
 	}
+	ignoreLabel := "none"
+	if len(f.ignoreCountries) > 0 {
+		ignoreLabel = strings.Join(f.ignoreCountries, ",")
+	}
 	metaSrcs := cfg.ResolvedMetaSources()
 	fmt.Println("Discovering new seed sources...")
-	fmt.Printf("Concurrency: %d  |  Meta-sources: %d  |  Hops: %d  |  Countries: %s\n\n",
-		cfg.Concurrency, len(metaSrcs), cfg.MaxHops, countriesLabel)
+	fmt.Printf("Concurrency: %d  |  Meta-sources: %d  |  Hops: %d  |  Countries: %s  |  Ignore: %s\n\n",
+		cfg.Concurrency, len(metaSrcs), cfg.MaxHops, countriesLabel, ignoreLabel)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

@@ -24,14 +24,19 @@ func startup(f runFlags) {
 	cfg.Parallelism = f.concurrency
 	cfg.ExtraSeeds = mustLoadSeeds(f.seedsFile)
 	cfg.Countries = f.countries
+	cfg.IgnoreCountries = f.ignoreCountries
 
 	fmt.Println("Starting Resume Contacts Scraper...")
 	countriesLabel := "all"
 	if len(f.countries) > 0 {
 		countriesLabel = strings.Join(f.countries, ",")
 	}
-	fmt.Printf("Concurrency: %d  |  Extra seeds: %d  |  Countries: %s  |  Output: %s/\n\n",
-		f.concurrency, len(cfg.ExtraSeeds), countriesLabel, outputDir)
+	ignoreLabel := "none"
+	if len(f.ignoreCountries) > 0 {
+		ignoreLabel = strings.Join(f.ignoreCountries, ",")
+	}
+	fmt.Printf("Concurrency: %d  |  Extra seeds: %d  |  Countries: %s  |  Ignore: %s  |  Output: %s/\n\n",
+		f.concurrency, len(cfg.ExtraSeeds), countriesLabel, ignoreLabel, outputDir)
 
 	writer, err := output.NewVCFWriter(outputDir)
 	if err != nil {
